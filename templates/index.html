@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="mb-0">買方列表</h3>
+  <a href="{{ url_for('buyer_new') }}" class="btn btn-primary">＋ 新增買方</a>
+</div>
+
+<form class="row g-2 mb-3" method="get">
+  <div class="col-auto">
+    <input type="text" name="q" class="form-control" placeholder="搜尋姓名 / 電話" value="{{ q }}">
+  </div>
+  <div class="col-auto">
+    <button class="btn btn-outline-secondary" type="submit">搜尋</button>
+  </div>
+</form>
+
+<table class="table table-striped table-hover bg-white">
+  <thead>
+    <tr>
+      <th>姓名</th>
+      <th>電話</th>
+      <th>來源</th>
+      <th>建立時間</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for b in buyers %}
+      <tr>
+        <td>{{ b["name"] }}</td>
+        <td>{{ b["phone"] or "-" }}</td>
+        <td>{{ b["source"] or "-" }}</td>
+        <td>{{ b["created_at"][:16] if b["created_at"] else "" }}</td>
+        <td>
+          <a href="{{ url_for('buyer_detail', buyer_id=b['id']) }}"
+             class="btn btn-sm btn-outline-primary">
+            詳細 / 追蹤紀錄
+          </a>
+        </td>
+      </tr>
+    {% else %}
+      <tr>
+        <td colspan="5" class="text-center text-muted">目前沒有資料</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% endblock %}

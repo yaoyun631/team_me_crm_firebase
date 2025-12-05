@@ -1,0 +1,320 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="mb-0">賣方列表</h3>
+  <div>
+    <a href="{{ url_for('download_sellers') }}" class="btn btn-outline-success me-2">下載 CSV</a>
+  </div>
+</div>
+
+<form class="row g-2 mb-3" method="get">
+  <div class="col-12 col-md-auto">
+    <input type="text" name="q" class="form-control" placeholder="搜尋姓名 / 電話" value="{{ q }}">
+  </div>
+
+  <div class="col-6 col-md-auto">
+    <select name="level" class="form-select">
+      <option value="">客戶等級</option>
+      <option value="A" {% if level == "A" %}selected{% endif %}>A（高意願 / 緊急出售）</option>
+      <option value="B" {% if level == "B" %}selected{% endif %}>B（可談 / 觀望）</option>
+      <option value="C" {% if level == "C" %}selected{% endif %}>C（隨緣 / 長期）</option>
+    </select>
+  </div>
+
+  <!-- ⬇ 新增：進程下拉（開發中 / 委託中 / 成交） -->
+  <div class="col-6 col-md-auto">
+    <select name="stage" class="form-select">
+      <option value="">進程</option>
+      <option value="開發中" {% if stage == "開發中" %}selected{% endif %}>開發中</option>
+      <option value="委託中" {% if stage == "委託中" %}selected{% endif %}>委託中</option>
+      <option value="成交" {% if stage == "成交" %}selected{% endif %}>成交</option>
+    </select>
+  </div>
+
+  <div class="col-6 col-md-auto">
+    <select name="sort_by" class="form-select">
+      <option value="created_at_desc" {% if sort_by == "created_at_desc" %}selected{% endif %}>最新在前</option>
+      <option value="created_at_asc" {% if sort_by == "created_at_asc" %}selected{% endif %}>最舊在前</option>
+      <option value="name_asc" {% if sort_by == "name_asc" %}selected{% endif %}>姓名 A→Z</option>
+      <option value="name_desc" {% if sort_by == "name_desc" %}selected{% endif %}>姓名 Z→A</option>
+    </select>
+  </div>
+
+  <div class="col-6 col-md-auto">
+    <button class="btn btn-outline-secondary w-100" type="submit">套用</button>
+  </div>
+</form>
+
+
+<!-- 📱 手機版：新增賣方 卡片（折疊） -->
+<button class="btn btn-primary w-100 d-md-none mb-3"
+        type="button"
+        data-bs-toggle="collapse"
+        data-bs-target="#newSellerCardMobile"
+        aria-expanded="false"
+        aria-controls="newSellerCardMobile">
+  新增賣方
+</button>
+
+<div class="collapse d-md-none mb-3" id="newSellerCardMobile">
+  <div class="card">
+    <div class="card-body">
+      <h5 class="card-title mb-3">新增賣方</h5>
+      <form method="post" action="{{ url_for('sellers_new') }}">
+        <div class="mb-3">
+          <label class="form-label">姓名（必填）</label>
+          <input type="text" name="name" class="form-control" required>
+        </div>
+
+        <div class="row">
+          <div class="col-sm-6 mb-3">
+            <label class="form-label">電話</label>
+            <input type="text" name="phone" class="form-control">
+          </div>
+          <div class="col-sm-6 mb-3">
+            <label class="form-label">LINE ID</label>
+            <input type="text" name="line_id" class="form-control">
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">Email</label>
+          <input type="email" name="email" class="form-control">
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">物件地址</label>
+          <input type="text" name="address" class="form-control">
+        </div>
+
+        <div class="row">
+          <div class="col-sm-6 mb-3">
+            <label class="form-label">產品類型</label>
+            <input type="text" name="property_type" class="form-control"
+                   placeholder="例：華廈、電梯大樓、透天、店面…">
+          </div>
+          <div class="col-sm-6 mb-3">
+            <label class="form-label">客戶等級</label>
+            <select name="level" class="form-select">
+              <option value="">未設定</option>
+              <option value="A">A（高意願 / 經常聯絡）</option>
+              <option value="B">B（可談 / 觀望）</option>
+              <option value="C">C（隨緣 / 長期）</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- 進程：開發中 / 委託中 / 成交 -->
+        <div class="mb-3">
+          <label class="form-label">進程</label>
+          <select name="stage" class="form-select">
+            <option value="">未設定</option>
+            <option value="開發中">開發中</option>
+            <option value="委託中">委託中</option>
+            <option value="成交">成交</option>
+          </select>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">出售原因</label>
+          <textarea name="reason" class="form-control" rows="2"
+                    placeholder="例：換屋、資金需求、移民、繼承…"></textarea>
+        </div>
+
+        <div class="row">
+          <div class="col-sm-6 mb-3">
+            <label class="form-label">期望售價（萬）</label>
+            <input type="number" name="expected_price" class="form-control">
+          </div>
+          <div class="col-sm-6 mb-3">
+            <label class="form-label">可接受底價（萬）</label>
+            <input type="number" name="min_price" class="form-control">
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">預計出售時程</label>
+          <input type="text" name="timeline" class="form-control"
+                 placeholder="例：1 個月內、半年內、沒有時間壓力…">
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">目前使用狀態</label>
+          <input type="text" name="occupancy_status" class="form-control"
+                 placeholder="例：自住、出租中、空屋…">
+        </div>
+
+        <!-- 委託到期日 -->
+        <div class="mb-3">
+          <label class="form-label">委託到期日</label>
+          <input type="date" name="contract_end_date" class="form-control">
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">內部備註</label>
+          <textarea name="note" class="form-control" rows="3"
+                    placeholder="例：價格談判空間、與其他仲介合作情況、屋況重點…"></textarea>
+        </div>
+
+        <button type="submit" class="btn btn-primary w-100">儲存</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <!-- 左：列表 -->
+  <div class="col-md-7">
+    <table class="table table-striped table-hover bg-white">
+      <thead>
+        <tr>
+          <th>姓名</th>
+          <th>電話</th>
+          <th>等級</th>
+          <th>進程</th>
+          <th>委託到期日</th>
+          <th>地址</th>
+          <th>建立者</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in sellers %}
+          <tr>
+            <td>{{ s.name }}</td>
+            <td>{{ s.phone or "-" }}</td>
+            <td>{{ s.level or "-" }}</td>
+            <td>{{ s.stage or "-" }}</td>
+            <td>{{ s.contract_end_date or "-" }}</td>
+            <td>{{ s.address or "-" }}</td>
+            <td>{{ s.created_by_name or "-" }}</td>
+            <td>
+              <a href="{{ url_for('seller_detail', seller_id=s.id) }}"
+                 class="btn btn-sm btn-outline-primary mb-1">
+                詳細 / 追蹤
+              </a>
+              <form method="post"
+                    action="{{ url_for('seller_delete', seller_id=s.id) }}"
+                    style="display:inline;"
+                    onsubmit="return confirm('確定要刪除這位賣方及所有追蹤紀錄嗎？');">
+                <button type="submit" class="btn btn-sm btn-outline-danger mb-1">
+                  刪除
+                </button>
+              </form>
+            </td>
+          </tr>
+        {% else %}
+          <tr>
+            <td colspan="8" class="text-center text-muted">目前沒有賣方資料</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 右：桌機版表單（手機隱藏） -->
+  <div class="col-md-5 d-none d-md-block">
+    <h4 class="mb-3">新增賣方</h4>
+    <form method="post" action="{{ url_for('sellers_new') }}">
+      <div class="mb-3">
+        <label class="form-label">姓名（必填）</label>
+        <input type="text" name="name" class="form-control" required>
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">電話</label>
+          <input type="text" name="phone" class="form-control">
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">LINE ID</label>
+          <input type="text" name="line_id" class="form-control">
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">Email</label>
+        <input type="email" name="email" class="form-control">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">物件地址</label>
+        <input type="text" name="address" class="form-control">
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">產品類型</label>
+          <input type="text" name="property_type" class="form-control"
+                 placeholder="例：華廈、電梯大樓、透天、店面…">
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">客戶等級</label>
+          <select name="level" class="form-select">
+            <option value="">未設定</option>
+            <option value="A">A（高意願 / 經常聯絡）</option>
+            <option value="B">B（可談 / 觀望）</option>
+            <option value="C">C（隨緣 / 長期）</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- 桌機版進程 -->
+      <div class="mb-3">
+        <label class="form-label">進程</label>
+        <select name="stage" class="form-select">
+          <option value="">未設定</option>
+          <option value="開發中">開發中</option>
+          <option value="委託中">委託中</option>
+          <option value="成交">成交</option>
+        </select>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">出售原因</label>
+        <textarea name="reason" class="form-control" rows="2"
+                  placeholder="例：換屋、資金需求、移民、繼承…"></textarea>
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">期望售價（萬）</label>
+          <input type="number" name="expected_price" class="form-control">
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">可接受底價（萬）</label>
+          <input type="number" name="min_price" class="form-control">
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">預計出售時程</label>
+        <input type="text" name="timeline" class="form-control"
+               placeholder="例：1 個月內、半年內、沒有時間壓力…">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">目前使用狀態</label>
+        <input type="text" name="occupancy_status" class="form-control"
+               placeholder="例：自住、出租中、空屋…">
+      </div>
+
+      <!-- 桌機版委託到期日 -->
+      <div class="mb-3">
+        <label class="form-label">委託到期日</label>
+        <input type="date" name="contract_end_date" class="form-control">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">內部備註</label>
+        <textarea name="note" class="form-control" rows="3"
+                  placeholder="例：價格談判空間、與其他仲介合作情況、屋況重點…"></textarea>
+      </div>
+
+      <button type="submit" class="btn btn-primary w-100">儲存</button>
+    </form>
+  </div>
+</div>
+
+{% endblock %}

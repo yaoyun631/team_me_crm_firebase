@@ -1,0 +1,16 @@
+# Firebase 金鑰
+serviceAccountKey.json
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# 系統檔
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

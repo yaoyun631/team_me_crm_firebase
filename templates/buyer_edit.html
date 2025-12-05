@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block content %}
+
+<h3 class="mb-3">編輯買方資料</h3>
+
+<div class="card">
+  <div class="card-body">
+    <form method="post">
+      <div class="mb-3">
+        <label class="form-label">姓名（必填）</label>
+        <input type="text" name="name" class="form-control" value="{{ buyer.name }}" required>
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">電話</label>
+          <input type="text" name="phone" class="form-control" value="{{ buyer.phone }}">
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">LINE ID</label>
+          <input type="text" name="line_id" class="form-control" value="{{ buyer.line_id }}">
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">Email</label>
+        <input type="email" name="email" class="form-control" value="{{ buyer.email }}">
+      </div>
+
+      <div class="row">
+        <div class="col-md-4 mb-3">
+          <label class="form-label">客源來源</label>
+          <input type="text" name="source" class="form-control"
+                 placeholder="例：591、IG、朋友介紹"
+                 value="{{ buyer.source }}">
+        </div>
+        <div class="col-md-4 mb-3">
+          <label class="form-label">客戶等級</label>
+          <select name="level" class="form-select">
+            <option value="" {% if not buyer.level %}selected{% endif %}>未設定</option>
+            <option value="A" {% if buyer.level == "A" %}selected{% endif %}>A（熱度最高）</option>
+            <option value="B" {% if buyer.level == "B" %}selected{% endif %}>B（持續追蹤）</option>
+            <option value="C" {% if buyer.level == "C" %}selected{% endif %}>C（暫時觀望）</option>
+          </select>
+        </div>
+        <div class="col-md-4 mb-3">
+          <label class="form-label">進程</label>
+          <select name="stage" class="form-select">
+            <option value="" {% if not buyer.stage %}selected{% endif %}>未設定</option>
+            <option value="接觸" {% if buyer.stage == "接觸" %}selected{% endif %}>接觸</option>
+            <option value="帶看" {% if buyer.stage == "帶看" %}selected{% endif %}>帶看</option>
+            <option value="斡旋" {% if buyer.stage == "斡旋" %}selected{% endif %}>斡旋</option>
+            <option value="成交" {% if buyer.stage == "成交" %}selected{% endif %}>成交</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">需求類型</label>
+        <select name="intent_type" class="form-select">
+          <option value="" {% if not buyer.intent_type %}selected{% endif %}>未選擇</option>
+          <option value="buy" {% if buyer.intent_type == "buy" %}selected{% endif %}>買房</option>
+          <option value="rent" {% if buyer.intent_type == "rent" %}selected{% endif %}>租屋</option>
+          <option value="both" {% if buyer.intent_type == "both" %}selected{% endif %}>租 / 買皆可</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">預算範圍（買）</label>
+          <div class="input-group">
+            <input type="number" name="budget_min" class="form-control"
+                   placeholder="最低（萬）" value="{{ buyer.budget_min }}">
+            <span class="input-group-text">~</span>
+            <input type="number" name="budget_max" class="form-control"
+                   placeholder="最高（萬）" value="{{ buyer.budget_max }}">
+          </div>
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">租金範圍</label>
+          <div class="input-group">
+            <input type="number" name="rent_min" class="form-control"
+                   placeholder="最低" value="{{ buyer.rent_min }}">
+            <span class="input-group-text">~</span>
+            <input type="number" name="rent_max" class="form-control"
+                   placeholder="最高" value="{{ buyer.rent_max }}">
+          </div>
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">偏好區域</label>
+        <input type="text" name="preferred_areas" class="form-control"
+               placeholder="例：沙鹿、梧棲、清水"
+               value="{{ buyer.preferred_areas }}">
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">偏好產品類型</label>
+          <input type="text" name="property_type" class="form-control"
+                 placeholder="例：電梯大樓、透天、店面"
+                 value="{{ buyer.property_type }}">
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">房數需求</label>
+          <input type="text" name="room_range" class="form-control"
+                 placeholder="例：2~3房"
+                 value="{{ buyer.room_range }}">
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">車位需求</label>
+        <select name="car_need" class="form-select">
+          <option value="" {% if not buyer.car_need %}selected{% endif %}>未設定</option>
+          <option value="必須要車位" {% if buyer.car_need == "必須要車位" %}selected{% endif %}>必須要車位</option>
+          <option value="可以沒有車位" {% if buyer.car_need == "可以沒有車位" %}selected{% endif %}>可以沒有車位</option>
+          <option value="至少一個機車位" {% if buyer.car_need == "至少一個機車位" %}selected{% endif %}>至少一個機車位</option>
+        </select>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">職業 / 收入資訊</label>
+        <input type="text" name="job" class="form-control"
+               placeholder="例：工程師、老師、家庭收入級距…"
+               value="{{ buyer.job }}">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">家庭成員 / 生活型態</label>
+        <textarea name="family_info" class="form-control" rows="2"
+                  placeholder="例：小家庭 / 有小孩需要學區 / 有長輩要電梯…">{{ buyer.family_info }}</textarea>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">必備條件（Must have）</label>
+        <textarea name="requirement_must" class="form-control" rows="2"
+                  placeholder="一定要有：電梯、平面車位、屋齡 20 年內…">{{ buyer.requirement_must }}</textarea>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">加分條件（Nice to have）</label>
+        <textarea name="requirement_nice" class="form-control" rows="2"
+                  placeholder="有更好：頂樓露台、社區有游泳池…">{{ buyer.requirement_nice }}</textarea>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">背景補充 / 其他</label>
+        <textarea name="other_background" class="form-control" rows="2"
+                  placeholder="客戶個性、顧慮點、之前看過哪些物件…">{{ buyer.other_background }}</textarea>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">內部備註</label>
+        <textarea name="note" class="form-control" rows="3">{{ buyer.note }}</textarea>
+      </div>
+
+      <div class="mb-3 text-muted">
+        <small>
+          建立時間：{{ buyer.created_at or "-" }}
+          {% if buyer.created_by_name %}｜建立者：{{ buyer.created_by_name }}{% endif %}
+        </small><br>
+        {% if buyer.updated_at %}
+          <small>
+            最後編輯時間：{{ buyer.updated_at }}
+            {% if buyer.updated_by_name %}｜編輯者：{{ buyer.updated_by_name }}{% endif %}
+          </small>
+        {% endif %}
+      </div>
+
+      <button type="submit" class="btn btn-primary">儲存變更</button>
+      <a href="{{ url_for('buyer_detail', buyer_id=buyer.id) }}" class="btn btn-secondary">取消</a>
+    </form>
+  </div>
+</div>
+
+{% endblock %}

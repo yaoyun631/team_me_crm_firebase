@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block content %}
+
+<h3 class="mb-3">編輯賣方資料</h3>
+
+<div class="card">
+  <div class="card-body">
+    <form method="post">
+      <div class="mb-3">
+        <label class="form-label">姓名（必填）</label>
+        <input type="text" name="name" class="form-control" value="{{ seller.name }}" required>
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">電話</label>
+          <input type="text" name="phone" class="form-control" value="{{ seller.phone }}">
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">LINE ID</label>
+          <input type="text" name="line_id" class="form-control" value="{{ seller.line_id }}">
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">Email</label>
+        <input type="email" name="email" class="form-control" value="{{ seller.email }}">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">物件地址</label>
+        <input type="text" name="address" class="form-control" value="{{ seller.address }}">
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">產品類型</label>
+          <input type="text" name="property_type" class="form-control" value="{{ seller.property_type }}">
+        </div>
+        <div class="col-md-3 mb-3">
+          <label class="form-label">客戶等級</label>
+          <select name="level" class="form-select">
+            <option value="" {% if not seller.level %}selected{% endif %}>未設定</option>
+            <option value="A" {% if seller.level == "A" %}selected{% endif %}>A（高意願 / 經常聯絡）</option>
+            <option value="B" {% if seller.level == "B" %}selected{% endif %}>B（可談 / 觀望）</option>
+            <option value="C" {% if seller.level == "C" %}selected{% endif %}>C（隨緣 / 長期）</option>
+          </select>
+        </div>
+        <div class="col-md-3 mb-3">
+          <label class="form-label">進程</label>
+          <select name="stage" class="form-select">
+            <option value="" {% if not seller.stage %}selected{% endif %}>未設定</option>
+            <option value="開發中" {% if seller.stage == "開發中" %}selected{% endif %}>開發中</option>
+            <option value="委託中" {% if seller.stage == "委託中" %}selected{% endif %}>委託中</option>
+            <option value="成交" {% if seller.stage == "成交" %}selected{% endif %}>成交</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">出售原因</label>
+        <textarea name="reason" class="form-control" rows="2">{{ seller.reason }}</textarea>
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">期望售價（萬）</label>
+          <input type="number" name="expected_price" class="form-control" value="{{ seller.expected_price }}">
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">可接受底價（萬）</label>
+          <input type="number" name="min_price" class="form-control" value="{{ seller.min_price }}">
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">預計出售時程</label>
+        <input type="text" name="timeline" class="form-control" value="{{ seller.timeline }}">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">目前使用狀態</label>
+        <input type="text" name="occupancy_status" class="form-control" value="{{ seller.occupancy_status }}">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">委託到期日</label>
+        <input type="date" name="contract_end_date" class="form-control"
+               value="{{ seller.contract_end_date }}">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">內部備註</label>
+        <textarea name="note" class="form-control" rows="3">{{ seller.note }}</textarea>
+      </div>
+
+      <div class="mb-3 text-muted">
+        <small>
+          建立時間：{{ seller.created_at or "-" }}
+          {% if seller.created_by_name %}｜建立者：{{ seller.created_by_name }}{% endif %}
+        </small><br>
+        {% if seller.updated_at %}
+          <small>
+            最後編輯時間：{{ seller.updated_at }}
+            {% if seller.updated_by_name %}｜編輯者：{{ seller.updated_by_name }}{% endif %}
+          </small>
+        {% endif %}
+      </div>
+
+      <button type="submit" class="btn btn-primary">儲存變更</button>
+      <a href="{{ url_for('seller_detail', seller_id=seller.id) }}" class="btn btn-secondary">取消</a>
+    </form>
+  </div>
+</div>
+
+{% endblock %}

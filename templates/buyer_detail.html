@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="mb-0">買方詳細資料</h3>
+  <div>
+    <a href="{{ url_for('buyer_edit', buyer_id=buyer.id) }}" class="btn btn-warning me-2">編輯資料</a>
+    <a href="{{ url_for('buyers') }}" class="btn btn-secondary">返回列表</a>
+  </div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-body">
+    <h5 class="card-title mb-3">
+      {{ buyer.name }}
+      {% if buyer.level %}
+        <span class="badge bg-primary ms-2">等級 {{ buyer.level }}</span>
+      {% endif %}
+    </h5>
+
+    <div class="row mb-2">
+      <div class="col-md-6">
+        <p class="mb-1"><strong>電話：</strong>{{ buyer.phone or "-" }}</p>
+        <p class="mb-1"><strong>LINE ID：</strong>{{ buyer.line_id or "-" }}</p>
+        <p class="mb-1"><strong>Email：</strong>{{ buyer.email or "-" }}</p>
+        <p class="mb-1"><strong>客源來源：</strong>{{ buyer.source or "-" }}</p>
+      </div>
+      <div class="col-md-6">
+        <p class="mb-1">
+          <strong>需求類型：</strong>
+          {% if buyer.intent_type == "buy" %}買房
+          {% elif buyer.intent_type == "rent" %}租屋
+          {% elif buyer.intent_type == "both" %}租 / 買皆可
+          {% else %}-{% endif %}
+        </p>
+        <p class="mb-1">
+          <strong>預算（買）：</strong>
+          {% if buyer.budget_min or buyer.budget_max %}
+            {{ buyer.budget_min or "?" }} ~ {{ buyer.budget_max or "?" }} 萬
+          {% else %}-{% endif %}
+        </p>
+        <p class="mb-1">
+          <strong>租金範圍：</strong>
+          {% if buyer.rent_min or buyer.rent_max %}
+            {{ buyer.rent_min or "?" }} ~ {{ buyer.rent_max or "?" }}
+          {% else %}-{% endif %}
+        </p>
+        <p class="mb-1"><strong>偏好區域：</strong>{{ buyer.preferred_areas or "-" }}</p>
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="row">
+      <div class="col-md-6">
+        <p class="mb-1"><strong>產品類型：</strong>{{ buyer.property_type or "-" }}</p>
+        <p class="mb-1"><strong>房數需求：</strong>{{ buyer.room_range or "-" }}</p>
+        <p class="mb-1"><strong>車位需求：</strong>{{ buyer.car_need or "-" }}</p>
+      </div>
+      <div class="col-md-6">
+        <p class="mb-1"><strong>職業 / 收入：</strong>{{ buyer.job or "-" }}</p>
+        <p class="mb-1"><strong>家庭 / 生活型態：</strong>{{ buyer.family_info or "-" }}</p>
+      </div>
+    </div>
+
+    <hr>
+
+    <p class="mb-1"><strong>必備條件：</strong>{{ buyer.requirement_must or "-" }}</p>
+    <p class="mb-1"><strong>加分條件：</strong>{{ buyer.requirement_nice or "-" }}</p>
+    <p class="mb-1"><strong>背景補充：</strong>{{ buyer.other_background or "-" }}</p>
+    <p class="mb-1"><strong>內部備註：</strong>{{ buyer.note or "-" }}</p>
+
+    <p class="mb-0 text-muted mt-2">
+      <small>
+        建立時間：{{ buyer.created_at or "-" }}
+        {% if buyer.created_by_name %}｜建立者：{{ buyer.created_by_name }}{% endif %}
+      </small>
+    </p>
+    {% if buyer.updated_at %}
+      <p class="mb-0 text-muted">
+        <small>
+          最後編輯時間：{{ buyer.updated_at }}
+          {% if buyer.updated_by_name %}｜編輯者：{{ buyer.updated_by_name }}{% endif %}
+        </small>
+      </p>
+    {% endif %}
+
+  </div>
+</div>
+
+<div class="row">
+  <div class="col-md-6 mb-4">
+    <h4 class="mb-3">新增追蹤紀錄</h4>
+    <form method="post" action="{{ url_for('add_buyer_followup', buyer_id=buyer.id) }}">
+      <div class="mb-3">
+        <label class="form-label">聯絡時間（不填則用現在）</label>
+        <input type="datetime-local" name="contact_time" class="form-control">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">聯絡方式</label>
+        <input type="text" name="channel" class="form-control"
+               placeholder="電話 / LINE / 簡訊 / 現場…">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">聯絡內容紀錄</label>
+        <textarea name="content" class="form-control" rows="3"
+                  placeholder="聊了什麼？客戶反應如何？"></textarea>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">下一步怎麼做？</label>
+        <textarea name="next_action" class="form-control" rows="2"
+                  placeholder="例：三天後再傳物件、確認貸款成數…"></textarea>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">下次聯絡日期（選填）</label>
+        <input type="date" name="next_contact_date" class="form-control">
+      </div>
+
+      <button type="submit" class="btn btn-primary">新增紀錄</button>
+    </form>
+  </div>
+
+  <div class="col-md-6 mb-4">
+    <h4 class="mb-3">追蹤紀錄列表</h4>
+    {% if followups %}
+      <div class="list-group">
+        {% for f in followups %}
+          <div class="list-group-item">
+            <div class="d-flex justify-content-between align-items-center">
+              <div>
+                <strong>{{ f.contact_time }}</strong>
+                {% if f.channel %}
+                  <span class="badge bg-secondary ms-2">{{ f.channel }}</span>
+                {% endif %}
+              </div>
+              <div class="text-end">
+                <small class="text-muted d-block mb-1">
+                  建立者：{{ f.created_by_name or "-" }}
+                </small>
+                <a href="{{ url_for('buyer_followup_edit', buyer_id=buyer.id, followup_id=f.id) }}"
+                  class="btn btn-sm btn-outline-secondary me-1">
+                  編輯
+                </a>
+                <form method="post"
+                      action="{{ url_for('buyer_followup_delete', buyer_id=buyer.id, followup_id=f.id) }}"
+                      style="display:inline;"
+                      onsubmit="return confirm('確定要刪除這筆追蹤紀錄嗎？');">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
+                </form>
+              </div>
+            </div>
+
+
+            {% if f.content %}
+              <p class="mt-2 mb-1"><strong>內容：</strong>{{ f.content }}</p>
+            {% endif %}
+            {% if f.next_action %}
+              <p class="mb-1"><strong>下一步：</strong>{{ f.next_action }}</p>
+            {% endif %}
+            {% if f.next_contact_date %}
+              <p class="mb-0 text-muted">
+                <small>預計下次聯絡日期：{{ f.next_contact_date }}</small>
+              </p>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="text-muted">尚無追蹤紀錄，可以左邊新增一筆。</p>
+    {% endif %}
+  </div>
+</div>
+
+{% endblock %}
