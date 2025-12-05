@@ -3,37 +3,48 @@ from flask import (
     url_for, flash, session, Response
 )
 import os
+import json
 from datetime import datetime
-import io
 import csv
 from io import StringIO
-from flask import Response
-
 
 import firebase_admin
 from firebase_admin import credentials, firestore
 from werkzeug.security import generate_password_hash, check_password_hash
-import firebase_admin
-from firebase_admin import credentials, firestore
-import os, json
 
+
+# ========= Firestore 初始化（Render + 本機皆可用） =========
 def init_firestore():
-    if not firebase_admin._apps:
-        cred = None
+    # 如果已初始化過，就直接回傳 client
+    if firebase_admin._apps:
+        return firestore.client()
 
-        cred_json = os.environ.get("FIREBASE_CREDENTIALS")
-        if cred_json:
-            cred = credentials.Certificate(json.loads(cred_json))
-        elif os.path.exists("serviceAccountKey.json"):
-            cred = credentials.Certificate("serviceAccountKey.json")
+    cred = None
 
-        if not cred:
-            raise RuntimeError("找不到 Firestore 憑證")
+    # 1️⃣ 先試著從環境變數讀（給 Render / 伺服器用）
+    cred_json = os.environ.get("FIREBASE_CREDENTIALS")
+    if cred_json:
+        try:
+            cred_dict = json.loads(cred_json)
+            cred = credentials.Certificate(cred_dict)
+            print("✅ 使用 FIREBASE_CREDENTIALS 初始化 Firestore")
+        except Exception as e:
+            print("⚠️ 解析 FIREBASE_CREDENTIALS 失敗：", e)
 
-        firebase_admin.initialize_app(cred)
+    # 2️⃣ 如果環境變數沒有或失敗，再退回用本機檔案（給你自己電腦用）
+    if not cred and os.path.exists("serviceAccountKey.json"):
+        cred = credentials.Certificate("serviceAccountKey.json")
+        print("✅ 使用本機 serviceAccountKey.json 初始化 Firestore")
 
+    # 3️⃣ 兩種都沒有，就丟錯
+    if not cred:
+        raise RuntimeError("找不到 Firestore 憑證：請設定環境變數 FIREBASE_CREDENTIALS 或放 serviceAccountKey.json")
+
+    firebase_admin.initialize_app(cred)
     return firestore.client()
 
+
+# 全域 Firestore client
 db = init_firestore()
 
 
@@ -43,19 +54,6 @@ app.secret_key = "team_me_super_secret"  # 可以自行修改
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
-# ========= Firestore 初始化 =========
-def init_firestore():
-    key_path = os.path.join(BASE_DIR, "serviceAccountKey.json")
-    if not os.path.exists(key_path):
-        raise RuntimeError("找不到 serviceAccountKey.json，請確認檔案有放在專案資料夾")
-
-    cred = credentials.Certificate(key_path)
-    firebase_admin.initialize_app(cred)
-    return firestore.client()
-
-
-db = init_firestore()
 
 
 # ========= 小工具 =========
