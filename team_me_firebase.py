@@ -13,6 +13,28 @@ from flask import Response
 import firebase_admin
 from firebase_admin import credentials, firestore
 from werkzeug.security import generate_password_hash, check_password_hash
+import firebase_admin
+from firebase_admin import credentials, firestore
+import os, json
+
+def init_firestore():
+    if not firebase_admin._apps:
+        cred = None
+
+        cred_json = os.environ.get("FIREBASE_CREDENTIALS")
+        if cred_json:
+            cred = credentials.Certificate(json.loads(cred_json))
+        elif os.path.exists("serviceAccountKey.json"):
+            cred = credentials.Certificate("serviceAccountKey.json")
+
+        if not cred:
+            raise RuntimeError("找不到 Firestore 憑證")
+
+        firebase_admin.initialize_app(cred)
+
+    return firestore.client()
+
+db = init_firestore()
 
 
 # ========= Flask 基本設定 =========
