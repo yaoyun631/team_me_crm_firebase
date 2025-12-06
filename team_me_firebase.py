@@ -50,8 +50,6 @@ db = init_firestore()
 
 
 
-
-# ========= Flask 基本設定 =========
 # ========= Flask 基本設定 =========
 app = Flask(__name__)
 app.secret_key = "team_me_super_secret" 

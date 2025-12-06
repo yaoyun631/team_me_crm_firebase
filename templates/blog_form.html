@@ -1,74 +1,194 @@
 {% extends "base.html" %}
+
+{% block title %}
+  部落格｜{{ "新增文章" if mode == "new" else "編輯文章" }}
+{% endblock %}
+
 {% block content %}
+<div class="container-fluid py-3">
+  <!-- ⭐ 把整個 row 都放在同一個 form 裡 ⭐ -->
+  <form method="post">
+    <div class="row">
+      <!-- 左側：主內容 -->
+      <div class="col-lg-9 mb-3">
+        <div class="card shadow-sm">
+          <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">
+              {{ "新增文章" if mode == "new" else "編輯文章" }}
+            </h5>
+            <div>
+              <a href="{{ url_for('blog.blog_index') }}" class="btn btn-sm btn-outline-secondary">
+                回列表
+              </a>
+              {% if mode == 'edit' and post %}
+                <a href="{{ url_for('blog.blog_detail', post_id=post.id) }}" class="btn btn-sm btn-outline-primary">
+                  查看文章
+                </a>
+              {% endif %}
+            </div>
+          </div>
 
-<h3 class="mb-3">
-  {% if mode == "edit" %}編輯文章{% else %}新增文章{% endif %}
-</h3>
+          <div class="card-body">
+            <!-- 標題 -->
+            <div class="mb-3">
+              <label class="form-label">標題<span class="text-danger">*</span></label>
+              <input
+                type="text"
+                name="title"
+                class="form-control"
+                placeholder="請輸入文章標題"
+                value="{{ post.title if post else '' }}"
+                required
+              >
+            </div>
 
-<div class="card">
-  <div class="card-body">
-    <form method="post">
-      <div class="mb-3">
-        <label class="form-label">標題（必填）</label>
-        <input type="text" name="title" class="form-control"
-               value="{{ post.title if post else '' }}" required>
+            <!-- 專案名稱 -->
+            <div class="mb-3">
+              <label class="form-label">專案名稱 / 主題</label>
+              <input
+                type="text"
+                name="project"
+                class="form-control"
+                placeholder="例如：沙鹿開發計畫、Team M.E 系統更新"
+                value="{{ post.project if post else '' }}"
+              >
+            </div>
+
+            <!-- 內容（TinyMCE） -->
+            <div class="mb-3">
+              <label class="form-label">內容</label>
+              <textarea
+                id="content"
+                name="content"
+                rows="15"
+              >{{ post.content|safe if post else '' }}</textarea>
+            </div>
+
+            <!-- 標籤 -->
+            <div class="mb-3">
+              <label class="form-label">標籤（Tags）</label>
+              <input
+                type="text"
+                name="tags"
+                class="form-control"
+                placeholder="例如：海線房市, 系統開發, 客戶經營（用逗號分隔）"
+                value="{{ post.tags if post else '' }}"
+              >
+            </div>
+
+            <!-- 進度狀態 -->
+            <div class="mb-3">
+              <label class="form-label">進度狀態</label>
+              {% set current_status = post.status if post else "" %}
+              <select name="status" class="form-select">
+                <option value="">（未設定）</option>
+                <option value="構想中"   {% if current_status == "構想中" %}selected{% endif %}>構想中</option>
+                <option value="進行中"   {% if current_status == "進行中" %}selected{% endif %}>進行中</option>
+                <option value="已完成"   {% if current_status == "已完成" %}selected{% endif %}>已完成</option>
+                <option value="暫停"     {% if current_status == "暫停" %}selected{% endif %}>暫停</option>
+              </select>
+              <div class="form-text">
+                可以用來標記這篇記錄屬於「發想中、正在做、已完成、暫停」等狀態。
+              </div>
+            </div>
+
+            <!-- 編輯資訊 -->
+            {% if mode == 'edit' and post %}
+              <div class="mb-3 small text-muted">
+                最後編輯時間：
+                {{ post.updated_at if post.updated_at else post.created_at }}
+                / 編輯者：{{ post.updated_by_name if post.updated_by_name else post.created_by_name }}
+              </div>
+            {% endif %}
+          </div>
+        </div>
       </div>
 
-      <div class="row">
-        <div class="col-md-4 mb-3">
-          <label class="form-label">分類</label>
-          <input type="text" name="category" class="form-control"
-                 placeholder="例：房產筆記 / 系統開發 / 案件紀錄"
-                 value="{{ post.category if post else '' }}">
+      <!-- 右側：分類 & 設定 -->
+      <div class="col-lg-3 mb-3">
+        <div class="card shadow-sm mb-3">
+          <div class="card-header">
+            <strong>分類</strong>
+          </div>
+          <div class="card-body">
+            {% set selected_categories = [] %}
+            {% if post and post.categories is defined and post.categories %}
+              {% set selected_categories = post.categories %}
+            {% endif %}
+
+            {% if all_categories and all_categories|length > 0 %}
+              <div class="mb-2 small text-muted">
+                勾選這篇文章要歸類到哪些分類：
+              </div>
+              <div class="mb-3" style="max-height: 220px; overflow-y: auto;">
+                {% for c in all_categories %}
+                  <div class="form-check mb-1">
+                    <input
+                      class="form-check-input"
+                      type="checkbox"
+                      name="categories"
+                      value="{{ c }}"
+                      id="cat_{{ loop.index }}"
+                      {% if c in selected_categories %}checked{% endif %}
+                    >
+                    <label class="form-check-label" for="cat_{{ loop.index }}">
+                      {{ c }}
+                    </label>
+                  </div>
+                {% endfor %}
+              </div>
+            {% else %}
+              <div class="mb-3 text-muted small">
+                目前還沒有任何分類，你可以先從下方「新增分類」開始建立。
+              </div>
+            {% endif %}
+
+            <div class="mb-2">
+              <label class="form-label">新增分類</label>
+              <input
+                type="text"
+                name="new_categories"
+                class="form-control"
+                placeholder="例：房產筆記, 系統開發"
+              >
+              <div class="form-text">
+                可一次輸入多個，用逗號分隔，會自動加入並勾選。
+              </div>
+            </div>
+          </div>
         </div>
-        <div class="col-md-4 mb-3">
-          <label class="form-label">專案 / 主題</label>
-          <input type="text" name="project" class="form-control"
-                 placeholder="例：Team M.E CRM V1 / 某個委託專案"
-                 value="{{ post.project if post else '' }}">
-        </div>
-        <div class="col-md-4 mb-3">
-          <label class="form-label">進度狀態</label>
-          <select name="status" class="form-select">
-            {% set current = post.status if post else '' %}
-            <option value="" {% if not current %}selected{% endif %}>未設定</option>
-            <option value="構想中" {% if current == "構想中" %}selected{% endif %}>構想中</option>
-            <option value="進行中" {% if current == "進行中" %}selected{% endif %}>進行中</option>
-            <option value="已發布" {% if current == "已發布" %}selected{% endif %}>已發布</option>
-            <option value="已完成紀錄" {% if current == "已完成紀錄" %}selected{% endif %}>已完成紀錄</option>
-          </select>
+
+        <div class="card shadow-sm">
+          <div class="card-header">
+            <strong>小提醒</strong>
+          </div>
+          <div class="card-body small text-muted">
+            <ul class="mb-0 ps-3">
+              <li>「專案名稱」可以對應你現在在做的案子或計畫。</li>
+              <li>分類可以當作：房產知識、系統開發、行銷企劃、客戶心得…</li>
+              <li>標籤（Tags）適合用來做更細的搜尋。</li>
+            </ul>
+          </div>
         </div>
       </div>
 
-      <div class="mb-3">
-        <label class="form-label">標籤（用逗號分隔）</label>
-        <input type="text" name="tags" class="form-control"
-               placeholder="例：房產, 海線, 系統開發"
-               value="{{ post.tags if post else '' }}">
-      </div>
-
-      <div class="mb-3">
-        <label class="form-label">內容</label>
-        <textarea id="content" name="content" class="form-control" rows="12">
-{{ post.content|safe if post else "" }}
-        </textarea>
-        <div class="form-text">
-          可貼上文字、插入圖片網址、超連結等。
+      <!-- 底部送出按鈕（跨兩欄） -->
+      <div class="col-12 mt-2">
+        <div class="d-flex justify-content-between">
+          <a href="{{ url_for('blog.blog_index') }}" class="btn btn-outline-secondary">
+            取消
+          </a>
+          <button type="submit" class="btn btn-primary">
+            {{ "建立文章" if mode == "new" else "更新文章" }}
+          </button>
         </div>
       </div>
-
-      <button type="submit" class="btn btn-primary">
-        {% if mode == "edit" %}儲存變更{% else %}新增文章{% endif %}
-      </button>
-      <a href="{{ url_for('blog.blog_index') }}" class="btn btn-secondary">取消</a>
-    </form>
-  </div>
+    </div>
+  </form>
 </div>
 
-<!-- TinyMCE（不需要 API key 的版本） -->
-
+<!-- TinyMCE（無需 API Key 的版本） -->
 <script src="https://cdn.jsdelivr.net/npm/tinymce@6/tinymce.min.js"></script>
-
 <script>
 tinymce.init({
   selector: '#content',
@@ -78,37 +198,8 @@ tinymce.init({
   toolbar:
     'undo redo | bold italic underline | alignleft aligncenter alignright | bullist numlist | link image | code',
   branding: false,
-  convert_urls: false,
-
-  /* ⭐ 啟用本機圖片上傳 */
-  images_upload_url: '/blog/upload_image',
-
-  /* ⭐ 自訂圖片上傳處理 */
-  images_upload_handler: function (blobInfo, progress) {
-    return new Promise(function (resolve, reject) {
-      const formData = new FormData();
-      formData.append('file', blobInfo.blob(), blobInfo.filename());
-
-      fetch('/blog/upload_image', {
-        method: 'POST',
-        body: formData
-      })
-      .then(r => r.json())
-      .then(result => {
-        if (result.error) {
-          reject(result.error);
-        } else {
-          resolve(result.url); // TinyMCE 自動插入圖片
-        }
-      })
-      .catch(() => {
-        reject('無法上傳圖片');
-      });
-    });
-  }
+  convert_urls: false
+  // 如果之後你有實作 /blog/upload_image，可以把 images_upload_handler 打開
 });
 </script>
-
-
-
 {% endblock %}
