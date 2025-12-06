@@ -11,7 +11,8 @@ from io import StringIO
 import firebase_admin
 from firebase_admin import credentials, firestore
 from werkzeug.security import generate_password_hash, check_password_hash
-from blog import blog_bp
+import os
+print("Working directory:", os.getcwd())
 
 # ========= Firestore 初始化（Render + 本機皆可用） =========
 def init_firestore():
@@ -51,12 +52,13 @@ db = init_firestore()
 
 
 # ========= Flask 基本設定 =========
+# ========= Flask 基本設定 =========
 app = Flask(__name__)
-app.secret_key = "team_me_super_secret"  # 可以自行修改
+app.secret_key = "team_me_super_secret" 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-from blog import blog_bp
+from blog import blog_bp        
 app.register_blueprint(blog_bp)
 
 # ========= 小工具 =========

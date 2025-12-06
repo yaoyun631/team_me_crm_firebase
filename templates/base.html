@@ -20,6 +20,7 @@
         <span class="navbar-text text-white me-3">
           👤 {{ session["user_name"] }}
         </span>
+        <a href="{{ url_for('blog.blog_index') }}" class="btn btn-sm btn-outline-light me-2">專案/部落格</a>
         <a href="{{ url_for('buyers') }}" class="btn btn-sm btn-outline-light me-2">買方</a>
         <a href="{{ url_for('sellers') }}" class="btn btn-sm btn-outline-light me-2">賣方</a>
         <a href="{{ url_for('logout') }}" class="btn btn-sm btn-warning">登出</a>
