@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block content %}
+
+<h3 class="mb-3">
+  {% if mode == "edit" %}編輯文章{% else %}新增文章{% endif %}
+</h3>
+
+<div class="card">
+  <div class="card-body">
+    <form method="post">
+      <div class="mb-3">
+        <label class="form-label">標題（必填）</label>
+        <input type="text" name="title" class="form-control"
+               value="{{ post.title if post else '' }}" required>
+      </div>
+
+      <div class="row">
+        <div class="col-md-4 mb-3">
+          <label class="form-label">分類</label>
+          <input type="text" name="category" class="form-control"
+                 placeholder="例：房產筆記 / 系統開發 / 案件紀錄"
+                 value="{{ post.category if post else '' }}">
+        </div>
+        <div class="col-md-4 mb-3">
+          <label class="form-label">專案 / 主題</label>
+          <input type="text" name="project" class="form-control"
+                 placeholder="例：Team M.E CRM V1 / 某個委託專案"
+                 value="{{ post.project if post else '' }}">
+        </div>
+        <div class="col-md-4 mb-3">
+          <label class="form-label">進度狀態</label>
+          <select name="status" class="form-select">
+            {% set current = post.status if post else '' %}
+            <option value="" {% if not current %}selected{% endif %}>未設定</option>
+            <option value="構想中" {% if current == "構想中" %}selected{% endif %}>構想中</option>
+            <option value="進行中" {% if current == "進行中" %}selected{% endif %}>進行中</option>
+            <option value="已發布" {% if current == "已發布" %}selected{% endif %}>已發布</option>
+            <option value="已完成紀錄" {% if current == "已完成紀錄" %}selected{% endif %}>已完成紀錄</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">標籤（用逗號分隔）</label>
+        <input type="text" name="tags" class="form-control"
+               placeholder="例：房產, 海線, 系統開發"
+               value="{{ post.tags if post else '' }}">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">內容</label>
+        <textarea id="content" name="content" class="form-control" rows="12">
+{{ post.content|safe if post else "" }}
+        </textarea>
+        <div class="form-text">
+          可貼上文字、插入圖片網址、超連結等。
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-primary">
+        {% if mode == "edit" %}儲存變更{% else %}新增文章{% endif %}
+      </button>
+      <a href="{{ url_for('blog.blog_index') }}" class="btn btn-secondary">取消</a>
+    </form>
+  </div>
+</div>
+
+<!-- TinyMCE（不需要 API key 的版本） -->
+
+<script src="https://cdn.jsdelivr.net/npm/tinymce@6/tinymce.min.js"></script>
+
+<script>
+tinymce.init({
+  selector: '#content',
+  height: 500,
+  menubar: false,
+  plugins: 'image link lists code',
+  toolbar:
+    'undo redo | bold italic underline | alignleft aligncenter alignright | bullist numlist | link image | code',
+  branding: false,
+  convert_urls: false,
+
+  /* ⭐ 啟用本機圖片上傳 */
+  images_upload_url: '/blog/upload_image',
+
+  /* ⭐ 自訂圖片上傳處理 */
+  images_upload_handler: function (blobInfo, progress) {
+    return new Promise(function (resolve, reject) {
+      const formData = new FormData();
+      formData.append('file', blobInfo.blob(), blobInfo.filename());
+
+      fetch('/blog/upload_image', {
+        method: 'POST',
+        body: formData
+      })
+      .then(r => r.json())
+      .then(result => {
+        if (result.error) {
+          reject(result.error);
+        } else {
+          resolve(result.url); // TinyMCE 自動插入圖片
+        }
+      })
+      .catch(() => {
+        reject('無法上傳圖片');
+      });
+    });
+  }
+});
+</script>
+
+
+
+{% endblock %}

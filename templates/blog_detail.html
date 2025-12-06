@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2 class="mb-1">{{ post.title }}</h2>
+    <div class="text-muted small">
+      {% if post.category %}分類：{{ post.category }}　{% endif %}
+      {% if post.project %}專案：{{ post.project }}　{% endif %}
+      {% if post.status %}進度：{{ post.status }}{% endif %}
+      <br>
+      建立：{{ post.created_at or '' }}
+      {% if post.created_by_name %}｜建立者：{{ post.created_by_name }}{% endif %}
+      {% if post.updated_at %}
+        <br>最後更新：{{ post.updated_at }}
+        {% if post.updated_by_name %}｜更新者：{{ post.updated_by_name }}{% endif %}
+      {% endif %}
+    </div>
+    {% if post.tags %}
+      <div class="mt-1 small text-muted">
+        標籤：{{ post.tags }}
+      </div>
+    {% endif %}
+  </div>
+
+  <div class="text-end">
+    <a href="{{ url_for('blog.blog_edit', post_id=post.id) }}" class="btn btn-outline-primary btn-sm mb-1">編輯</a>
+    <form method="post" action="{{ url_for('blog.blog_delete', post_id=post.id) }}" style="display:inline;"
+          onsubmit="return confirm('確定要刪除這篇文章嗎？');">
+      <button type="submit" class="btn btn-outline-danger btn-sm mb-1">刪除</button>
+    </form>
+    <br>
+    <a href="{{ url_for('blog.blog_index') }}" class="btn btn-link btn-sm">回列表</a>
+  </div>
+</div>
+
+<hr>
+
+<div class="mb-4">
+  <!-- 文章內容是 HTML，要用 safe -->
+  {{ post.content|safe }}
+</div>
+
+{% endblock %}

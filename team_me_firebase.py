@@ -1,6 +1,6 @@
 from flask import (
     Flask, render_template, request, redirect,
-    url_for, flash, session, Response
+    url_for, flash, session, Response, Blueprint
 )
 import os
 import json
@@ -11,7 +11,7 @@ from io import StringIO
 import firebase_admin
 from firebase_admin import credentials, firestore
 from werkzeug.security import generate_password_hash, check_password_hash
-
+from blog import blog_bp
 
 # ========= Firestore 初始化（Render + 本機皆可用） =========
 def init_firestore():
@@ -48,13 +48,16 @@ def init_firestore():
 db = init_firestore()
 
 
+
+
 # ========= Flask 基本設定 =========
 app = Flask(__name__)
 app.secret_key = "team_me_super_secret"  # 可以自行修改
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
+from blog import blog_bp
+app.register_blueprint(blog_bp)
 
 # ========= 小工具 =========
 def doc_to_dict(doc):
@@ -728,6 +731,75 @@ def seller_followup_delete(seller_id, followup_id):
     return redirect(url_for("seller_detail", seller_id=seller_id))
 
 
+
+
+# ========= CSV：賣方 =========
+@app.route("/sellers/download")
+@login_required
+def download_sellers():
+    # 從 Firestore 抓全部賣方資料
+    docs = db.collection("sellers").stream()
+    sellers_list = [doc_to_dict(d) for d in docs]
+
+    si = StringIO()
+    writer = csv.writer(si)
+
+    # 表頭（有進程 + 委託到期日）
+    writer.writerow([
+        "id",
+        "姓名",
+        "電話",
+        "Email",
+        "LINE ID",
+        "物件地址",
+        "產品類型",
+        "客戶等級",
+        "進程",              # 開發中 / 委託中 / 成交
+        "出售原因",
+        "期望售價(萬)",
+        "可接受底價(萬)",
+        "預計出售時程",
+        "目前使用狀態",
+        "委託到期日",
+        "內部備註",
+        "建立時間",
+        "建立者",
+        "最後編輯時間",
+        "最後編輯者",
+    ])
+
+    for s in sellers_list:
+        writer.writerow([
+            s.get("id", ""),
+            s.get("name", ""),
+            s.get("phone", ""),
+            s.get("email", ""),
+            s.get("line_id", ""),
+            s.get("address", ""),
+            s.get("property_type", ""),
+            s.get("level", ""),
+            s.get("stage", ""),                # 開發中 / 委託中 / 成交
+            s.get("reason", ""),
+            s.get("expected_price", ""),
+            s.get("min_price", ""),
+            s.get("timeline", ""),
+            s.get("occupancy_status", ""),
+            s.get("contract_end_date", ""),    # 委託到期日
+            s.get("note", ""),
+            s.get("created_at", ""),
+            s.get("created_by_name", ""),
+            s.get("updated_at", ""),
+            s.get("updated_by_name", ""),
+        ])
+
+    csv_data = si.getvalue()
+    csv_data = '\ufeff' + csv_data  # UTF-8 BOM
+
+    filename = f"sellers.csv"
+    response = Response(csv_data, mimetype="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    return response
+
 # ========= CSV：買方 =========
 @app.route("/buyers/download")
 @login_required
@@ -811,76 +883,6 @@ def download_buyers():
     response = Response(csv_data, mimetype="text/csv; charset=utf-8")
     response.headers["Content-Disposition"] = f"attachment; filename={filename}"
     return response
-
-
-# ========= CSV：賣方 =========
-@app.route("/sellers/download")
-@login_required
-def download_sellers():
-    # 從 Firestore 抓全部賣方資料
-    docs = db.collection("sellers").stream()
-    sellers_list = [doc_to_dict(d) for d in docs]
-
-    si = StringIO()
-    writer = csv.writer(si)
-
-    # 表頭（有進程 + 委託到期日）
-    writer.writerow([
-        "id",
-        "姓名",
-        "電話",
-        "Email",
-        "LINE ID",
-        "物件地址",
-        "產品類型",
-        "客戶等級",
-        "進程",              # 開發中 / 委託中 / 成交
-        "出售原因",
-        "期望售價(萬)",
-        "可接受底價(萬)",
-        "預計出售時程",
-        "目前使用狀態",
-        "委託到期日",
-        "內部備註",
-        "建立時間",
-        "建立者",
-        "最後編輯時間",
-        "最後編輯者",
-    ])
-
-    for s in sellers_list:
-        writer.writerow([
-            s.get("id", ""),
-            s.get("name", ""),
-            s.get("phone", ""),
-            s.get("email", ""),
-            s.get("line_id", ""),
-            s.get("address", ""),
-            s.get("property_type", ""),
-            s.get("level", ""),
-            s.get("stage", ""),                # 開發中 / 委託中 / 成交
-            s.get("reason", ""),
-            s.get("expected_price", ""),
-            s.get("min_price", ""),
-            s.get("timeline", ""),
-            s.get("occupancy_status", ""),
-            s.get("contract_end_date", ""),    # 委託到期日
-            s.get("note", ""),
-            s.get("created_at", ""),
-            s.get("created_by_name", ""),
-            s.get("updated_at", ""),
-            s.get("updated_by_name", ""),
-        ])
-
-    csv_data = si.getvalue()
-    csv_data = '\ufeff' + csv_data  # UTF-8 BOM
-
-    filename = f"sellers.csv"
-    response = Response(csv_data, mimetype="text/csv; charset=utf-8")
-    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
-    return response
-
-
 # ========= CLI：建立後台使用者 =========
 @app.cli.command("create-user")
 def create_user_cmd():

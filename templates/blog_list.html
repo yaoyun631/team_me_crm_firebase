@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="mb-0">部落格 / 專案筆記</h3>
+  <a href="{{ url_for('blog.blog_new') }}" class="btn btn-primary">新增文章</a>
+</div>
+
+<form class="row g-2 mb-3" method="get">
+  <div class="col-12 col-md-4">
+    <input type="text" name="q" class="form-control"
+           placeholder="搜尋標題 / 內容 / 標籤"
+           value="{{ q }}">
+  </div>
+
+  <div class="col-6 col-md-3">
+    <select name="category" class="form-select">
+      <option value="">分類</option>
+      {% for c in all_categories %}
+        <option value="{{ c }}" {% if category == c %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="col-6 col-md-3">
+    <select name="status" class="form-select">
+      <option value="">進度</option>
+      {% for s in all_statuses %}
+        <option value="{{ s }}" {% if status == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="col-6 col-md-2">
+    <select name="sort_by" class="form-select">
+      <option value="created_at_desc" {% if sort_by == "created_at_desc" %}selected{% endif %}>最新在前</option>
+      <option value="created_at_asc" {% if sort_by == "created_at_asc" %}selected{% endif %}>最舊在前</option>
+    </select>
+  </div>
+
+  <div class="col-6 col-md-auto">
+    <button class="btn btn-outline-secondary w-100" type="submit">套用</button>
+  </div>
+</form>
+
+{% if posts %}
+  <div class="list-group">
+    {% for p in posts %}
+      <a href="{{ url_for('blog.blog_detail', post_id=p.id) }}"
+         class="list-group-item list-group-item-action">
+        <div class="d-flex w-100 justify-content-between">
+          <h5 class="mb-1">{{ p.title }}</h5>
+          <small class="text-muted">
+            {{ p.created_at or '' }}
+          </small>
+        </div>
+        <p class="mb-1 text-muted small">
+          {% if p.category %}分類：{{ p.category }}　{% endif %}
+          {% if p.status %}進度：{{ p.status }}　{% endif %}
+          {% if p.project %}專案：{{ p.project }}{% endif %}
+        </p>
+        {% if p.tags %}
+          <small class="text-muted">標籤：{{ p.tags }}</small>
+        {% endif %}
+      </a>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="text-muted">目前還沒有任何文章，可以先新增一篇 😄</p>
+{% endif %}
+
+{% endblock %}
