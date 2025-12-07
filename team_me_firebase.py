@@ -9,55 +9,62 @@ import csv
 from io import StringIO
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, storage   # ⬅ 多了 storage
 from werkzeug.security import generate_password_hash, check_password_hash
-import os
+
 print("Working directory:", os.getcwd())
 
-# ========= Firestore 初始化（Render + 本機皆可用） =========
-def init_firestore():
-    # 如果已初始化過，就直接回傳 client
+# ========= Firestore + Storage 初始化（Render + 本機皆可用） =========
+def init_firebase():
+    """
+    初始化 Firebase：
+    - Firestore
+    - Storage（bucket: team-me-98acf.firebasestorage.app）
+    """
+    # 如果已初始化過，就直接回傳 Firestore client
     if firebase_admin._apps:
         return firestore.client()
 
     cred = None
 
-    # 1️⃣ 先試著從環境變數讀（給 Render / 伺服器用）
+    # 1️⃣ Render / 伺服器：從環境變數讀 FIREBASE_CREDENTIALS
     cred_json = os.environ.get("FIREBASE_CREDENTIALS")
     if cred_json:
         try:
             cred_dict = json.loads(cred_json)
             cred = credentials.Certificate(cred_dict)
-            print("✅ 使用 FIREBASE_CREDENTIALS 初始化 Firestore")
+            print("✅ 使用 FIREBASE_CREDENTIALS 初始化 Firebase")
         except Exception as e:
             print("⚠️ 解析 FIREBASE_CREDENTIALS 失敗：", e)
 
-    # 2️⃣ 如果環境變數沒有或失敗，再退回用本機檔案（給你自己電腦用）
+    # 2️⃣ 本機：讀 serviceAccountKey.json
     if not cred and os.path.exists("serviceAccountKey.json"):
         cred = credentials.Certificate("serviceAccountKey.json")
-        print("✅ 使用本機 serviceAccountKey.json 初始化 Firestore")
+        print("✅ 使用本機 serviceAccountKey.json 初始化 Firebase")
 
-    # 3️⃣ 兩種都沒有，就丟錯
     if not cred:
-        raise RuntimeError("找不到 Firestore 憑證：請設定環境變數 FIREBASE_CREDENTIALS 或放 serviceAccountKey.json")
+        raise RuntimeError("找不到 Firebase 憑證：請設定 FIREBASE_CREDENTIALS 或放 serviceAccountKey.json")
 
-    firebase_admin.initialize_app(cred)
+    # ⭐ 這裡同時指定 Storage bucket
+    firebase_admin.initialize_app(cred, {
+        "storageBucket": "team-me-98acf.firebasestorage.app"
+    })
+
     return firestore.client()
 
 
 # 全域 Firestore client
-db = init_firestore()
-
-
+db = init_firebase()
 
 # ========= Flask 基本設定 =========
 app = Flask(__name__)
-app.secret_key = "team_me_super_secret" 
+app.secret_key = "team_me_super_secret"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-from blog import blog_bp        
+from blog import blog_bp
 app.register_blueprint(blog_bp)
+
 
 # ========= 小工具 =========
 def doc_to_dict(doc):

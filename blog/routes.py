@@ -1,6 +1,7 @@
 from flask import Blueprint, render_template, request, redirect, url_for, flash, session
 from datetime import datetime
-from firebase_admin import firestore
+from firebase_admin import firestore, storage
+import uuid
 
 blog_bp = Blueprint("blog", __name__, url_prefix="/blog")
 
@@ -319,3 +320,31 @@ def blog_delete(post_id):
     db.collection("blog_posts").document(post_id).delete()
     flash("已刪除文章", "info")
     return redirect(url_for("blog.blog_index"))
+
+# ========= 上傳圖片 =========
+@blog_bp.route("/upload_image", methods=["POST"])
+def upload_image():
+    file = request.files.get("file")
+    if not file:
+        return {"error": "沒有收到圖片"}, 400
+
+    # 取得預設 bucket（就是你在 initialize_app 設的 team-me-98acf.firebasestorage.app）
+    bucket = storage.bucket()
+
+    # 產生唯一檔名，放在 blog_images/ 底下
+    ext = file.filename.rsplit(".", 1)[-1].lower()
+    filename = f"blog_images/{uuid.uuid4()}.{ext}"
+
+    blob = bucket.blob(filename)
+    blob.upload_from_string(
+        file.read(),
+        content_type=file.content_type
+    )
+
+    # 設定為公開讀取（任何人可看圖片）
+    blob.make_public()
+
+    # 這個網址就可以直接給 <img src="...">
+    image_url = blob.public_url
+
+    return {"url": image_url}
