@@ -5,7 +5,7 @@
 
 <div class="card">
   <div class="card-body">
-    <form method="post">
+    <form method="post" enctype="multipart/form-data">
       <div class="mb-3">
         <label class="form-label">姓名（必填）</label>
         <input type="text" name="name" class="form-control" value="{{ buyer.name }}" required>
@@ -21,6 +21,52 @@
           <input type="text" name="line_id" class="form-control" value="{{ buyer.line_id }}">
         </div>
       </div>
+
+      {# ====== 圖片區塊：多張縮圖 + 勾選刪除 + 多選上傳 ====== #}
+      {% set photos = [] %}
+      {% if buyer.photo_urls is defined and buyer.photo_urls %}
+        {% set photos = buyer.photo_urls %}
+      {% elif buyer.photo_url %}
+        {% set photos = [buyer.photo_url] %}
+      {% endif %}
+
+      <div class="mb-3">
+        <label class="form-label">客戶 / 相關圖片</label>
+
+        {% if photos %}
+          <div class="row g-3 mb-2">
+            {% for url in photos %}
+              <div class="col-4 col-md-3 position-relative">
+                <img src="{{ url }}"
+                     alt="客戶圖片 {{ loop.index }}"
+                     class="img-fluid rounded"
+                     style="width: 100%; height: auto; object-fit: cover;">
+
+                <!-- 右上角刪除勾選 -->
+                <div class="form-check position-absolute top-0 end-0 bg-light bg-opacity-75 rounded-start px-1">
+                  <input class="form-check-input"
+                         type="checkbox"
+                         name="delete_photos"
+                         value="{{ loop.index0 }}"
+                         id="del_photo_{{ loop.index0 }}">
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+          <small class="text-muted d-block mb-2">
+            勾選右上角方框後按下「儲存變更」，即可刪除選擇的圖片。
+          </small>
+        {% else %}
+          <p class="text-muted">目前尚未上傳任何圖片。</p>
+        {% endif %}
+
+        <!-- 多選上傳 -->
+        <input type="file" name="photos" class="form-control" multiple>
+        <small class="text-muted">
+          可一次選擇多張圖片，上傳後會自動壓縮成適合手機寬度（約 1080px），支援 jpg / jpeg / png / gif / webp。
+        </small>
+      </div>
+      {# ====== 圖片區塊結束 ====== #}
 
       <div class="mb-3">
         <label class="form-label">Email</label>

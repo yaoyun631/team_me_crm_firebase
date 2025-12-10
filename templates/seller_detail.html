@@ -9,6 +9,14 @@
   </div>
 </div>
 
+{# 統一處理圖片列表：優先使用 photo_urls，沒有就用舊版 photo_url #}
+{% set photos = [] %}
+{% if seller.photo_urls is defined and seller.photo_urls %}
+  {% set photos = seller.photo_urls %}
+{% elif seller.photo_url %}
+  {% set photos = [seller.photo_url] %}
+{% endif %}
+
 <div class="card mb-4">
   <div class="card-body">
     <h5 class="card-title mb-3">
@@ -17,6 +25,15 @@
         <span class="badge bg-primary ms-2">等級 {{ seller.level }}</span>
       {% endif %}
     </h5>
+
+    {# 有圖片就顯示一行文字，點擊後展開大圖輪播 #}
+    {% if photos %}
+      <p class="mb-3">
+        <a href="#" data-bs-toggle="modal" data-bs-target="#sellerPhotoModal">
+          查看物件圖片（共 {{ photos|length }} 張）
+        </a>
+      </p>
+    {% endif %}
 
     <div class="row mb-2">
       <div class="col-md-6">
@@ -66,14 +83,14 @@
         {% if seller.created_by_name %}｜建立者：{{ seller.created_by_name }}{% endif %}
       </small>
     </p>
-      {% if seller.updated_at %}
-    <p class="mb-0 text-muted">
-      <small>
-        最後編輯時間：{{ seller.updated_at }}
-        {% if seller.updated_by_name %}｜編輯者：{{ seller.updated_by_name }}{% endif %}
-      </small>
-    </p>
-  {% endif %}
+    {% if seller.updated_at %}
+      <p class="mb-0 text-muted">
+        <small>
+          最後編輯時間：{{ seller.updated_at }}
+          {% if seller.updated_by_name %}｜編輯者：{{ seller.updated_by_name }}{% endif %}
+        </small>
+      </p>
+    {% endif %}
 
   </div>
 </div>
@@ -132,7 +149,7 @@
                   建立者：{{ f.created_by_name or "-" }}
                 </small>
                 <a href="{{ url_for('seller_followup_edit', seller_id=seller.id, followup_id=f.id) }}"
-                  class="btn btn-sm btn-outline-secondary me-1">
+                   class="btn btn-sm btn-outline-secondary me-1">
                   編輯
                 </a>
                 <form method="post"
@@ -143,7 +160,6 @@
                 </form>
               </div>
             </div>
-
 
             {% if f.content %}
               <p class="mt-2 mb-1"><strong>內容：</strong>{{ f.content }}</p>
@@ -164,5 +180,46 @@
     {% endif %}
   </div>
 </div>
+
+{# ===== 圖片 Modal + Carousel：點文字後展開，左右可滑 ===== #}
+{% if photos %}
+<div class="modal fade" id="sellerPhotoModal" tabindex="-1" aria-labelledby="sellerPhotoModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-lg">
+    <div class="modal-content bg-dark">
+      <div class="modal-header border-0">
+        <h5 class="modal-title text-white" id="sellerPhotoModalLabel">物件圖片</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body p-0">
+
+        <div id="sellerPhotoCarousel" class="carousel slide" data-bs-ride="carousel" data-bs-touch="true">
+          <div class="carousel-inner">
+            {% for url in photos %}
+              <div class="carousel-item {% if loop.first %}active{% endif %}">
+                <img src="{{ url }}"
+                     class="d-block w-100"
+                     style="max-height: 80vh; object-fit: contain;"
+                     alt="物件照片 {{ loop.index }}">
+              </div>
+            {% endfor %}
+          </div>
+
+          {% if photos|length > 1 %}
+          <button class="carousel-control-prev" type="button" data-bs-target="#sellerPhotoCarousel" data-bs-slide="prev">
+            <span class="carousel-control-prev-icon" aria-hidden="true"></span>
+            <span class="visually-hidden">Previous</span>
+          </button>
+          <button class="carousel-control-next" type="button" data-bs-target="#sellerPhotoCarousel" data-bs-slide="next">
+            <span class="carousel-control-next-icon" aria-hidden="true"></span>
+            <span class="visually-hidden">Next</span>
+          </button>
+          {% endif %}
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
 
 {% endblock %}

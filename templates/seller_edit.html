@@ -5,7 +5,7 @@
 
 <div class="card">
   <div class="card-body">
-    <form method="post">
+    <form method="post" enctype="multipart/form-data">
       <div class="mb-3">
         <label class="form-label">姓名（必填）</label>
         <input type="text" name="name" class="form-control" value="{{ seller.name }}" required>
@@ -22,6 +22,52 @@
         </div>
       </div>
 
+      {# ====== 圖片區塊：多張縮圖 + 勾選刪除 + 多選上傳 ====== #}
+      {% set photos = [] %}
+      {% if seller.photo_urls is defined and seller.photo_urls %}
+        {% set photos = seller.photo_urls %}
+      {% elif seller.photo_url %}
+        {% set photos = [seller.photo_url] %}
+      {% endif %}
+
+      <div class="mb-3">
+        <label class="form-label">物件照片 / 圖片</label>
+
+        {% if photos %}
+          <div class="row g-3 mb-2">
+            {% for url in photos %}
+              <div class="col-4 col-md-3 position-relative">
+                <img src="{{ url }}"
+                     alt="物件照片 {{ loop.index }}"
+                     class="img-fluid rounded"
+                     style="width: 100%; height: auto; object-fit: cover;">
+
+                <!-- 右上角刪除勾選 -->
+                <div class="form-check position-absolute top-0 end-0 bg-light bg-opacity-75 rounded-start px-1">
+                  <input class="form-check-input"
+                         type="checkbox"
+                         name="delete_photos"
+                         value="{{ loop.index0 }}"
+                         id="del_photo_{{ loop.index0 }}">
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+          <small class="text-muted d-block mb-2">
+            勾選右上角方框後按下「儲存變更」，即可刪除選擇的照片。
+          </small>
+        {% else %}
+          <p class="text-muted">目前尚未上傳任何圖片。</p>
+        {% endif %}
+
+        <!-- 多選上傳 -->
+        <input type="file" name="photos" class="form-control" multiple>
+        <small class="text-muted">
+          可一次選擇多張圖片，上傳後會自動壓縮成適合手機寬度（約 1080px），支援 jpg / jpeg / png / gif / webp。
+        </small>
+      </div>
+      {# ====== 圖片區塊結束 ====== #}
+
       <div class="mb-3">
         <label class="form-label">Email</label>
         <input type="email" name="email" class="form-control" value="{{ seller.email }}">
@@ -33,20 +79,20 @@
       </div>
 
       <div class="row">
-        <div class="col-md-6 mb-3">
+        <div class="col-md-4 mb-3">
           <label class="form-label">產品類型</label>
           <input type="text" name="property_type" class="form-control" value="{{ seller.property_type }}">
         </div>
-        <div class="col-md-3 mb-3">
+        <div class="col-md-4 mb-3">
           <label class="form-label">客戶等級</label>
           <select name="level" class="form-select">
             <option value="" {% if not seller.level %}selected{% endif %}>未設定</option>
-            <option value="A" {% if seller.level == "A" %}selected{% endif %}>A（高意願 / 經常聯絡）</option>
-            <option value="B" {% if seller.level == "B" %}selected{% endif %}>B（可談 / 觀望）</option>
-            <option value="C" {% if seller.level == "C" %}selected{% endif %}>C（隨緣 / 長期）</option>
+            <option value="A" {% if seller.level == "A" %}selected{% endif %}>A（放在第一順位銷售）</option>
+            <option value="B" {% if seller.level == "B" %}selected{% endif %}>B（一般追蹤）</option>
+            <option value="C" {% if seller.level == "C" %}selected{% endif %}>C（暫時觀望）</option>
           </select>
         </div>
-        <div class="col-md-3 mb-3">
+        <div class="col-md-4 mb-3">
           <label class="form-label">進程</label>
           <select name="stage" class="form-select">
             <option value="" {% if not seller.stage %}selected{% endif %}>未設定</option>
@@ -59,34 +105,34 @@
 
       <div class="mb-3">
         <label class="form-label">出售原因</label>
-        <textarea name="reason" class="form-control" rows="2">{{ seller.reason }}</textarea>
+        <input type="text" name="reason" class="form-control" value="{{ seller.reason }}">
       </div>
 
       <div class="row">
         <div class="col-md-6 mb-3">
-          <label class="form-label">期望售價（萬）</label>
+          <label class="form-label">期望售價(萬)</label>
           <input type="number" name="expected_price" class="form-control" value="{{ seller.expected_price }}">
         </div>
         <div class="col-md-6 mb-3">
-          <label class="form-label">可接受底價（萬）</label>
+          <label class="form-label">可接受底價(萬)</label>
           <input type="number" name="min_price" class="form-control" value="{{ seller.min_price }}">
         </div>
       </div>
 
-      <div class="mb-3">
-        <label class="form-label">預計出售時程</label>
-        <input type="text" name="timeline" class="form-control" value="{{ seller.timeline }}">
-      </div>
-
-      <div class="mb-3">
-        <label class="form-label">目前使用狀態</label>
-        <input type="text" name="occupancy_status" class="form-control" value="{{ seller.occupancy_status }}">
+      <div class="row">
+        <div class="col-md-6 mb-3">
+          <label class="form-label">預計出售時程</label>
+          <input type="text" name="timeline" class="form-control" value="{{ seller.timeline }}">
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">目前使用狀態</label>
+          <input type="text" name="occupancy_status" class="form-control" value="{{ seller.occupancy_status }}">
+        </div>
       </div>
 
       <div class="mb-3">
         <label class="form-label">委託到期日</label>
-        <input type="date" name="contract_end_date" class="form-control"
-               value="{{ seller.contract_end_date }}">
+        <input type="date" name="contract_end_date" class="form-control" value="{{ seller.contract_end_date }}">
       </div>
 
       <div class="mb-3">

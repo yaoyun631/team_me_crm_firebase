@@ -22,7 +22,7 @@
     </select>
   </div>
 
-  <!-- ⬇ 新增：進程下拉（開發中 / 委託中 / 成交） -->
+  <!-- 進程下拉（開發中 / 委託中 / 成交） -->
   <div class="col-6 col-md-auto">
     <select name="stage" class="form-select">
       <option value="">進程</option>
@@ -46,7 +46,6 @@
   </div>
 </form>
 
-
 <!-- 📱 手機版：新增賣方 卡片（折疊） -->
 <button class="btn btn-primary w-100 d-md-none mb-3"
         type="button"
@@ -61,7 +60,9 @@
   <div class="card">
     <div class="card-body">
       <h5 class="card-title mb-3">新增賣方</h5>
-      <form method="post" action="{{ url_for('sellers_new') }}">
+      <form method="post"
+            action="{{ url_for('sellers_new') }}"
+            enctype="multipart/form-data">
         <div class="mb-3">
           <label class="form-label">姓名（必填）</label>
           <input type="text" name="name" class="form-control" required>
@@ -151,6 +152,15 @@
           <input type="date" name="contract_end_date" class="form-control">
         </div>
 
+        <!-- 📸 物件圖片上傳（手機） -->
+        <div class="mb-3">
+          <label class="form-label">物件圖片（可多張）</label>
+          <input type="file" name="photos" class="form-control" multiple>
+          <small class="text-muted">
+            可一次選擇多張圖片，上傳後可以在賣方詳細頁查看與左右滑動。
+          </small>
+        </div>
+
         <div class="mb-3">
           <label class="form-label">內部備註</label>
           <textarea name="note" class="form-control" rows="3"
@@ -216,7 +226,9 @@
   <!-- 右：桌機版表單（手機隱藏） -->
   <div class="col-md-5 d-none d-md-block">
     <h4 class="mb-3">新增賣方</h4>
-    <form method="post" action="{{ url_for('sellers_new') }}">
+    <form method="post"
+          action="{{ url_for('sellers_new') }}"
+          enctype="multipart/form-data">
       <div class="mb-3">
         <label class="form-label">姓名（必填）</label>
         <input type="text" name="name" class="form-control" required>
@@ -304,6 +316,15 @@
       <div class="mb-3">
         <label class="form-label">委託到期日</label>
         <input type="date" name="contract_end_date" class="form-control">
+      </div>
+
+      <!-- 📸 物件圖片上傳（桌機） -->
+      <div class="mb-3">
+        <label class="form-label">物件圖片（可多張）</label>
+        <input type="file" name="photos" class="form-control" multiple>
+        <small class="text-muted">
+          可一次選擇多張圖片，上傳後可以在賣方詳細頁查看與左右滑動。
+        </small>
       </div>
 
       <div class="mb-3">

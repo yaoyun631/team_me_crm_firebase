@@ -6,11 +6,16 @@ import os
 import json
 from datetime import datetime
 import csv
-from io import StringIO
+from io import StringIO, BytesIO
+from PIL import Image
+from uuid import uuid4
+
 
 import firebase_admin
-from firebase_admin import credentials, firestore, storage   # ⬅ 多了 storage
+from firebase_admin import credentials, firestore, storage  
 from werkzeug.security import generate_password_hash, check_password_hash
+from urllib.parse import urlparse, unquote
+
 
 print("Working directory:", os.getcwd())
 
@@ -56,6 +61,91 @@ def init_firebase():
 # 全域 Firestore client
 db = init_firebase()
 
+# ========= 圖片上傳相關設定 =========
+ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
+
+def allowed_image(filename: str) -> bool:
+    if not filename:
+        return False
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
+
+
+def upload_image_to_storage(file, folder: str, object_id: str, max_width: int = 1080):
+    """
+    上傳圖片到 Firebase Storage，並自動等比例縮到手機適合寬度（預設 1080px）
+    - file: request.files[...] 拿到的 FileStorage
+    - folder: "buyers" / "sellers" 等
+    - object_id: Firestore 文件 id（用作檔名前綴）
+    回傳：公開網址（str）或 None
+    """
+    if not file or not file.filename:
+        return None
+
+    filename = file.filename
+    if "." not in filename:
+        print("❌ 檔名沒有副檔名：", filename)
+        return None
+
+    ext = filename.rsplit(".", 1)[-1].lower()
+
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
+        print("❌ 不支援的圖片格式：", ext)
+        return None
+
+    bucket = storage.bucket()
+
+    # 用 uuid 避免檔名互相覆蓋，例如：sellers/<id>_<uuid>.jpg
+    unique_suffix = uuid4().hex[:8]
+    blob_path = f"{folder}/{object_id}_{unique_suffix}.{ext}"
+    blob = bucket.blob(blob_path)
+
+    # 1️⃣ 用 Pillow 讀入圖片
+    img = Image.open(file.stream)
+    img = img.convert("RGB")   # 避免有 alpha 造成問題
+
+    # 2️⃣ 如果寬度超過 max_width，就等比例縮小
+    w, h = img.size
+    if w > max_width:
+        new_h = int(h * max_width / w)
+        img = img.resize((max_width, new_h), Image.LANCZOS)
+
+    # 3️⃣ 存到記憶體 buffer
+    buf = BytesIO()
+    save_format = "JPEG" if ext in ["jpg", "jpeg"] else ext.upper()
+    img.save(buf, format=save_format, quality=85)
+    buf.seek(0)  # 🔑 重點：讓 stream 從開頭開始
+
+    # 4️⃣ 上傳至 Firebase Storage
+    content_type = file.mimetype or "image/jpeg"
+    blob.upload_from_file(buf, content_type=content_type)
+    blob.make_public()
+
+    print("✅ 上傳圖片完成：", blob.public_url)
+    return blob.public_url
+
+
+def delete_image_from_storage(folder: str, object_id: str):
+    """
+    刪除 Firebase Storage 裡這個 buyer/seller 的圖片
+    - folder: "buyers" / "sellers"
+    - object_id: Firestore 文件 id
+    這裡會嘗試所有常見副檔名，有存在就刪掉。
+    """
+    try:
+        bucket = storage.bucket()
+        for ext in ALLOWED_IMAGE_EXTENSIONS:
+            blob_path = f"{folder}/{object_id}.{ext}"
+            blob = bucket.blob(blob_path)
+            # 避免亂砍，先檢查有沒有存在
+            if blob.exists():
+                blob.delete()
+                print("🗑️ 已刪除圖片：", blob_path)
+    except Exception as e:
+        print("⚠️ 刪除圖片時發生錯誤：", e)
+        
+
+
+
 # ========= Flask 基本設定 =========
 app = Flask(__name__)
 app.secret_key = "team_me_super_secret"
@@ -65,6 +155,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 from blog import blog_bp
 app.register_blueprint(blog_bp)
 
+# 限制單一請求最大 5MB（可依需求調整）
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 # ========= 小工具 =========
 def doc_to_dict(doc):
@@ -83,6 +175,9 @@ def delete_by_field(collection_name, field_name, field_value):
     docs = list(ref.stream())
     for d in docs:
         d.reference.delete()
+
+
+
 
 
 # ========= 登入保護 =========
@@ -214,6 +309,7 @@ def buyers():
 @login_required
 def buyers_new():
     form = request.form
+    file = request.files.get("photo")   # ⭐ 新增：抓圖片
 
     name = form.get("name", "").strip()
     phone = form.get("phone", "").strip()
@@ -243,34 +339,46 @@ def buyers_new():
 
     now = datetime.now().isoformat()
 
-    db.collection("buyers").add(
-        {
-            "name": name,
-            "phone": phone,
-            "email": email,
-            "line_id": line_id,
-            "source": source,
-            "level": level,
-            "intent_type": intent_type,
-            "rent_min": rent_min,
-            "rent_max": rent_max,
-            "budget_min": budget_min,
-            "budget_max": budget_max,
-            "preferred_areas": preferred_areas,
-            "property_type": property_type,
-            "room_range": room_range,
-            "car_need": car_need,
-            "job": job,
-            "family_info": family_info,
-            "requirement_must": requirement_must,
-            "requirement_nice": requirement_nice,
-            "other_background": other_background,
-            "note": note,
-            "created_at": now,
-            "created_by_id": session.get("user_id"),
-            "created_by_name": session.get("user_name"),
-        }
-    )
+    # ⭐ 先建立一個空的 document，拿到 id
+    doc_ref = db.collection("buyers").document()
+    buyer_id = doc_ref.id
+
+    # ⭐ 如果有上傳圖片，就丟到 Storage
+    photo_url = None
+    if file and file.filename:
+        photo_url = upload_image_to_storage(file, folder="buyers", object_id=buyer_id)
+
+    data = {
+        "name": name,
+        "phone": phone,
+        "email": email,
+        "line_id": line_id,
+        "source": source,
+        "level": level,
+        "intent_type": intent_type,
+        "rent_min": rent_min,
+        "rent_max": rent_max,
+        "budget_min": budget_min,
+        "budget_max": budget_max,
+        "preferred_areas": preferred_areas,
+        "property_type": property_type,
+        "room_range": room_range,
+        "car_need": car_need,
+        "job": job,
+        "family_info": family_info,
+        "requirement_must": requirement_must,
+        "requirement_nice": requirement_nice,
+        "other_background": other_background,
+        "note": note,
+        "created_at": now,
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+    }
+
+    if photo_url:
+        data["photo_url"] = photo_url   # ⭐ 存圖片網址
+
+    doc_ref.set(data)
 
     flash("已新增買方", "success")
     return redirect(url_for("buyers"))
@@ -348,12 +456,11 @@ def buyer_edit(buyer_id):
     if request.method == "POST":
         form = request.form
 
-        # ⭐ 如果你有必填欄位，可以在這裡檢查
+        # ⭐ 必填姓名檢查
         name = form.get("name", "").strip()
         if not name:
             flash("姓名為必填", "danger")
-            # 重新渲染同一頁，帶回原本資料 + 表單內容
-            # 這裡 buyer 也一起更新成使用者剛填的內容，避免重新打
+            # 更新 buyer 物件，讓表單保留剛剛輸入的東西
             buyer.update({
                 "name": name,
                 "phone": form.get("phone", "").strip(),
@@ -380,7 +487,7 @@ def buyer_edit(buyer_id):
             })
             return render_template("buyer_edit.html", buyer=buyer)
 
-        # ✅ 正常更新資料
+        # ✅ 先處理一般文字欄位
         updated = {
             "name": name,
             "phone": form.get("phone", "").strip(),
@@ -404,19 +511,66 @@ def buyer_edit(buyer_id):
             "other_background": form.get("other_background", "").strip(),
             "note": form.get("note", "").strip(),
             "stage": form.get("stage", "").strip(),  # 接觸/帶看/斡旋/成交
-            # 最後編輯資訊
             "updated_at": datetime.now().isoformat(),
             "updated_by_id": session.get("user_id"),
             "updated_by_name": session.get("user_name"),
         }
 
+        # ====== 圖片處理：多張刪除 + 多張新增 ======
+
+        # 現在 Firestore 中的圖片列表：優先用 photo_urls，舊資料就用 photo_url
+        current_photos = buyer.get("photo_urls") or []
+        if not current_photos and buyer.get("photo_url"):
+            current_photos = [buyer["photo_url"]]
+
+        # 1️⃣ 要刪除的 index（來自 checkbox name="delete_photos"）
+        delete_indexes_raw = form.getlist("delete_photos")
+        delete_indexes = set()
+        for idx in delete_indexes_raw:
+            try:
+                delete_indexes.add(int(idx))
+            except ValueError:
+                pass
+
+        # 🔥 先記錄「要被刪除的 URL」（拿來刪 Storage）
+        deleted_urls = [
+            url for i, url in enumerate(current_photos)
+            if i in delete_indexes
+        ]
+
+        # 保留沒勾選刪除的圖片
+        new_photos = [
+            url for i, url in enumerate(current_photos)
+            if i not in delete_indexes
+        ]
+
+        # 2️⃣ 多張上傳：input name="photos" multiple
+        files = request.files.getlist("photos")
+        for f in files:
+            if f and f.filename:
+                photo_url = upload_image_to_storage(f, folder="buyers", object_id=buyer_id)
+                if photo_url:
+                    new_photos.append(photo_url)
+
+        # 3️⃣ 寫回 Firestore：主要用 photo_urls，photo_url 當第一張給舊版用
+        updated["photo_urls"] = new_photos
+        if new_photos:
+            updated["photo_url"] = new_photos[0]
+        else:
+            updated["photo_url"] = ""
+
+        # ✅ 先更新 Firestore
         doc_ref.update(updated)
+
+        # ✅ 再刪除 Firebase Storage 檔案
+        if deleted_urls:
+            delete_storage_files(deleted_urls)
+
         flash("已更新買方資料", "success")
         return redirect(url_for("buyer_detail", buyer_id=buyer_id))
 
-    # GET：第一次進來編輯頁（還沒送出表單）
+    # GET：第一次進來編輯頁
     return render_template("buyer_edit.html", buyer=buyer)
-
 
 # ========= 刪除買方（含追蹤） =========
 @app.route("/buyers/<buyer_id>/delete", methods=["POST"])
@@ -542,13 +696,13 @@ def sellers_new():
     address = form.get("address", "").strip()
     property_type = form.get("property_type", "").strip()
     level = form.get("level", "").strip()
-    stage = form.get("stage", "").strip()  # ⬅ 進程
+    stage = form.get("stage", "").strip()  # 進程
     reason = form.get("reason", "").strip()
     expected_price = form.get("expected_price", "").strip()
     min_price = form.get("min_price", "").strip()
     timeline = form.get("timeline", "").strip()
     occupancy_status = form.get("occupancy_status", "").strip()
-    contract_end_date = form.get("contract_end_date", "").strip()  # ⬅ 新：委託到期日
+    contract_end_date = form.get("contract_end_date", "").strip()
     note = form.get("note", "").strip()
 
     if not name:
@@ -557,31 +711,57 @@ def sellers_new():
 
     now = datetime.now().isoformat()
 
-    db.collection("sellers").add(
-        {
-            "name": name,
-            "phone": phone,
-            "email": email,
-            "line_id": line_id,
-            "address": address,
-            "property_type": property_type,
-            "level": level,
-            "stage": stage,  # ⬅ 進程
-            "reason": reason,
-            "expected_price": expected_price,
-            "min_price": min_price,
-            "timeline": timeline,
-            "occupancy_status": occupancy_status,
-            "contract_end_date": contract_end_date,  # ⬅ 新：委託到期日
-            "note": note,
-            "created_at": now,
-            "created_by_id": session.get("user_id"),
-            "created_by_name": session.get("user_name"),
-        }
-    )
+    # 先準備好一個新的 document id，讓圖片可以用這個 id 當資料夾
+    sellers_collection = db.collection("sellers")
+    doc_ref = sellers_collection.document()  # 預先產生 id
+    seller_id = doc_ref.id
+
+    # ===== 圖片處理：多張上傳 =====
+    photo_urls = []
+    files = request.files.getlist("photos")  # 前端 input name="photos"
+
+    for f in files:
+        if f and f.filename:
+            url = upload_image_to_storage(f, folder="sellers", object_id=seller_id)
+            if url:
+                photo_urls.append(url)
+
+    # 組成要寫進 Firestore 的資料
+    data = {
+        "name": name,
+        "phone": phone,
+        "email": email,
+        "line_id": line_id,
+        "address": address,
+        "property_type": property_type,
+        "level": level,
+        "stage": stage,  # 進程
+        "reason": reason,
+        "expected_price": expected_price,
+        "min_price": min_price,
+        "timeline": timeline,
+        "occupancy_status": occupancy_status,
+        "contract_end_date": contract_end_date,
+        "note": note,
+        "created_at": now,
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+    }
+
+    # 如果有上傳圖片，就一起寫入 photo_urls / photo_url
+    if photo_urls:
+        data["photo_urls"] = photo_urls
+        data["photo_url"] = photo_urls[0]
+    else:
+        data["photo_urls"] = []
+        data["photo_url"] = ""
+
+    # 寫入 Firestore
+    doc_ref.set(data)
 
     flash("已新增賣方", "success")
     return redirect(url_for("sellers"))
+
 
 
 
@@ -659,27 +839,139 @@ def seller_edit(seller_id):
             "address": form.get("address", "").strip(),
             "property_type": form.get("property_type", "").strip(),
             "level": form.get("level", "").strip(),
-            "stage": form.get("stage", "").strip(),  # ⬅ 進程
+            "stage": form.get("stage", "").strip(),  # 開發中 / 委託中 / 成交
             "reason": form.get("reason", "").strip(),
             "expected_price": form.get("expected_price", "").strip(),
             "min_price": form.get("min_price", "").strip(),
             "timeline": form.get("timeline", "").strip(),
             "occupancy_status": form.get("occupancy_status", "").strip(),
-            "contract_end_date": form.get("contract_end_date", "").strip(),  # ⬅ 委託到期日
+            "contract_end_date": form.get("contract_end_date", "").strip(),  # 委託到期日
             "note": form.get("note", "").strip(),
             "updated_at": datetime.now().isoformat(),
             "updated_by_id": session.get("user_id"),
             "updated_by_name": session.get("user_name"),
         }
 
+        # ====== 圖片處理：多張刪除 + 多張新增 ======
+
+        # 目前 Firestore 中的圖片列表（支援舊欄位 photo_url）
+        current_photos = seller.get("photo_urls") or []
+        if not current_photos and seller.get("photo_url"):
+            current_photos = [seller["photo_url"]]
+
+        # 1️⃣ 取得要刪除的 index（來自 checkbox）
+        delete_indexes_raw = form.getlist("delete_photos")  # name="delete_photos"
+        delete_indexes = set()
+        for idx in delete_indexes_raw:
+            try:
+                delete_indexes.add(int(idx))
+            except ValueError:
+                pass
+
+        # 🔥 要刪除哪些 URL（拿來刪掉 Storage 檔案）
+        deleted_urls = [
+            url for i, url in enumerate(current_photos)
+            if i in delete_indexes
+        ]
+
+        # 把沒勾選的留下來
+        new_photos = [
+            url for i, url in enumerate(current_photos)
+            if i not in delete_indexes
+        ]
+
+        # 2️⃣ 多張上傳：input name="photos" multiple
+        files = request.files.getlist("photos")
+        for f in files:
+            if f and f.filename:
+                photo_url = upload_image_to_storage(f, folder="sellers", object_id=seller_id)
+                if photo_url:
+                    new_photos.append(photo_url)
+
+        # 3️⃣ 寫回 Firestore（主要用 photo_urls，photo_url 當第一張方便舊版使用）
+        updated["photo_urls"] = new_photos
+        if new_photos:
+            updated["photo_url"] = new_photos[0]
+        else:
+            updated["photo_url"] = ""
+
+        # ✅ 先更新 Firestore
         doc_ref.update(updated)
+
+        # ✅ 再刪除 Firebase Storage 檔案
+        if deleted_urls:
+            delete_storage_files(deleted_urls)
+
         flash("已更新賣方資料", "success")
         return redirect(url_for("seller_detail", seller_id=seller_id))
 
+    # GET：首次載入編輯頁
     return render_template("seller_edit.html", seller=seller)
 
 
 
+def delete_storage_file_by_url(url: str):
+    """
+    傳入 Firebase Storage 的檔案 URL（支援三種常見格式）：
+    1) https://firebasestorage.googleapis.com/v0/b/<bucket>/o/<encoded_path>?...
+    2) https://storage.googleapis.com/<bucket>/<path>
+    3) gs://<bucket>/<path>
+    自動解析出 bucket 與 blob path 並刪除。
+    """
+    if not url:
+        return
+
+    try:
+        bucket = None
+        blob_path = None
+
+        # --- 格式 3：gs://bucket/path/to/file ---
+        if url.startswith("gs://"):
+            no_scheme = url[len("gs://"):]      # bucket/path/to/file
+            parts = no_scheme.split("/", 1)
+            bucket_name = parts[0]
+            blob_path = parts[1] if len(parts) > 1 else ""
+            bucket = storage.bucket(bucket_name)
+
+        else:
+            parsed = urlparse(url)
+            netloc = parsed.netloc
+            path = parsed.path  # e.g. /team-me-98acf.firebassestorage.app/sellers/xxx.jpg
+
+            # --- 格式 1：firebasestorage.googleapis.com/v0/b/<bucket>/o/<encoded_path> ---
+            if "firebasestorage.googleapis.com" in netloc and "/o/" in path:
+                # 通常用預設 bucket 即可
+                bucket = storage.bucket()
+                encoded_blob_path = path.split("/o/", 1)[1]   # buyers%2Fabc%2Fxxx.jpg
+                blob_path = unquote(encoded_blob_path)        # buyers/abc/xxx.jpg
+
+            # --- 格式 2：storage.googleapis.com/<bucket>/<path> ---
+            elif "storage.googleapis.com" in netloc:
+                # path: /<bucket>/<blob_path>
+                segments = path.lstrip("/").split("/", 1)
+                if len(segments) == 2:
+                    bucket_name, blob_path = segments
+                    bucket = storage.bucket(bucket_name)
+
+        if not bucket or not blob_path:
+            print("⚠️ 無法解析 Storage URL：", url)
+            return
+
+        blob = bucket.blob(blob_path)
+        if blob.exists():
+            blob.delete()
+            print(f"🔥 已刪除 Storage 檔案：{bucket.name}/{blob_path}")
+        else:
+            print(f"⚠️ 找不到 Storage 檔案：{bucket.name}/{blob_path}")
+
+    except Exception as e:
+        print("⚠️ 刪除 Storage 檔案發生錯誤：", e)
+
+
+def delete_storage_files(urls: list):
+    """一次刪多個 URL 對應的 Storage 檔案"""
+    for url in urls:
+        delete_storage_file_by_url(url)
 # ========= 刪除賣方（含追蹤） =========
 @app.route("/sellers/<seller_id>/delete", methods=["POST"])
 @login_required
