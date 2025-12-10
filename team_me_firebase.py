@@ -7,7 +7,6 @@ import json
 from datetime import datetime
 import csv
 from io import StringIO, BytesIO
-from PIL import Image
 from uuid import uuid4
 
 
@@ -245,61 +244,76 @@ def index():
 
 
 # ========= 買方列表 + 篩選 / 排序 =========
+# ========= 買方列表 =========
 @app.route("/buyers")
 @login_required
 def buyers():
-    q = request.args.get("q", "").strip()
-    level = request.args.get("level", "").strip()
-    intent_type = request.args.get("intent_type", "").strip()
-    stage = request.args.get("stage", "").strip()  # ⬅ 進程：接觸/帶看/斡旋/成交
-    sort_by = request.args.get("sort_by", "created_at_desc")
+    # 取得查詢參數
+    q = request.args.get("q", "").strip()              # 關鍵字（姓名 / 電話）
+    level = request.args.get("level", "").strip()      # 客戶等級 A/B/C
+    intent_type = request.args.get("intent_type", "").strip()  # 需求類型 buy/rent/both
+    stage = request.args.get("stage", "").strip()      # 進程：接觸 / 帶看 / 斡旋 / 成交
+    source = request.args.get("source", "").strip()    # ⭐ 客源來源（591 / IG / 朋友介紹...）
+    sort_by = request.args.get("sort_by", "created_at_desc")  # 排序方式
 
+    # 讀取 Firestore 全部買方
     docs = db.collection("buyers").stream()
     buyers_list = [doc_to_dict(d) for d in docs]
 
-    # 關鍵字搜尋（姓名 / 電話）
+    # ===== 篩選條件 =====
+
+    # 1️⃣ 關鍵字搜尋（姓名 / 電話）
     if q:
         buyers_list = [
             b for b in buyers_list
             if q in (b.get("name") or "") or q in (b.get("phone") or "")
         ]
 
-    # 等級篩選
+    # 2️⃣ 客戶等級篩選
     if level:
         buyers_list = [b for b in buyers_list if b.get("level") == level]
 
-    # 需求類型篩選（租/買/都可以）
+    # 3️⃣ 需求類型篩選（租 / 買 / 都可以）
     if intent_type:
         buyers_list = [b for b in buyers_list if b.get("intent_type") == intent_type]
 
-    # 進程篩選
+    # 4️⃣ 進程篩選（接觸 / 帶看 / 斡旋 / 成交）
     if stage:
         buyers_list = [b for b in buyers_list if b.get("stage") == stage]
 
-    # 排序
-    reverse = True
+    # 5️⃣ 客源來源篩選（部分比對：打 "IG" 就抓到 source 字串內含 IG 的）
+    if source:
+        buyers_list = [
+            b for b in buyers_list
+            if source in (b.get("source") or "")
+        ]
+
+    # ===== 排序 =====
+    def parse_created_at(b):
+        # created_at 可能是 isoformat 文字，也可能沒有
+        v = b.get("created_at")
+        if not v:
+            return ""
+        return v  # 你如果都是 isoformat 字串，直接用字串排序即可
+
     if sort_by == "created_at_asc":
-        reverse = False
-        key_func = lambda x: x.get("created_at", "")
+        buyers_list.sort(key=parse_created_at)
+    elif sort_by == "created_at_desc":
+        buyers_list.sort(key=parse_created_at, reverse=True)
     elif sort_by == "name_asc":
-        reverse = False
-        key_func = lambda x: x.get("name", "")
+        buyers_list.sort(key=lambda b: (b.get("name") or ""))
     elif sort_by == "name_desc":
-        reverse = True
-        key_func = lambda x: x.get("name", "")
-    else:  # created_at_desc
-        reverse = True
-        key_func = lambda x: x.get("created_at", "")
+        buyers_list.sort(key=lambda b: (b.get("name") or ""), reverse=True)
 
-    buyers_list.sort(key=key_func, reverse=reverse)
-
+    # 丟參數給模板
     return render_template(
         "buyers.html",
         buyers=buyers_list,
         q=q,
         level=level,
         intent_type=intent_type,
-        stage=stage,          # ⬅ 記得一起丟給模板
+        stage=stage,
+        source=source,          # ⭐ 新增：客源來源欄位
         sort_by=sort_by,
     )
 
@@ -633,52 +647,69 @@ def buyer_followup_delete(buyer_id, followup_id):
 
 
 # ========= 賣方列表 + 篩選 / 排序 =========
+# ========= 賣方列表 =========
 @app.route("/sellers")
 @login_required
 def sellers():
-    q = request.args.get("q", "").strip()
-    level = request.args.get("level", "").strip()
-    stage = request.args.get("stage", "").strip()  # ⬅ 進程：開發中/委託中/成交
+    # 取得查詢參數
+    q = request.args.get("q", "").strip()              # 關鍵字（姓名 / 電話）
+    level = request.args.get("level", "").strip()      # 客戶等級 A/B/C
+    stage = request.args.get("stage", "").strip()      # 進程：開發中 / 委託中 / 成交
+    source = request.args.get("source", "").strip()    # ⭐ 開發來源 / 客戶來源
     sort_by = request.args.get("sort_by", "created_at_desc")
 
+    # 讀取 Firestore 全部賣方
     docs = db.collection("sellers").stream()
     sellers_list = [doc_to_dict(d) for d in docs]
 
+    # ===== 篩選條件 =====
+
+    # 1️⃣ 關鍵字搜尋（姓名 / 電話）
     if q:
         sellers_list = [
             s for s in sellers_list
             if q in (s.get("name") or "") or q in (s.get("phone") or "")
         ]
 
+    # 2️⃣ 客戶等級篩選
     if level:
         sellers_list = [s for s in sellers_list if s.get("level") == level]
 
+    # 3️⃣ 進程篩選（開發中 / 委託中 / 成交）
     if stage:
         sellers_list = [s for s in sellers_list if s.get("stage") == stage]
 
-    # 排序
-    reverse = True
-    if sort_by == "created_at_asc":
-        reverse = False
-        key_func = lambda x: x.get("created_at", "")
-    elif sort_by == "name_asc":
-        reverse = False
-        key_func = lambda x: x.get("name", "")
-    elif sort_by == "name_desc":
-        reverse = True
-        key_func = lambda x: x.get("name", "")
-    else:  # created_at_desc
-        reverse = True
-        key_func = lambda x: x.get("created_at", "")
+    # 4️⃣ 開發來源 / 客戶來源篩選
+    # 這裡使用部分比對：輸入 "591" 就抓到 source 中包含 591 的
+    if source:
+        sellers_list = [
+            s for s in sellers_list
+            if source in (s.get("source") or "")
+        ]
 
-    sellers_list.sort(key=key_func, reverse=reverse)
+    # ===== 排序 =====
+    def parse_created_at(s):
+        v = s.get("created_at")
+        if not v:
+            return ""
+        return v
+
+    if sort_by == "created_at_asc":
+        sellers_list.sort(key=parse_created_at)
+    elif sort_by == "created_at_desc":
+        sellers_list.sort(key=parse_created_at, reverse=True)
+    elif sort_by == "name_asc":
+        sellers_list.sort(key=lambda s: (s.get("name") or ""))
+    elif sort_by == "name_desc":
+        sellers_list.sort(key=lambda s: (s.get("name") or ""), reverse=True)
 
     return render_template(
         "sellers.html",
         sellers=sellers_list,
         q=q,
         level=level,
-        stage=stage,      # ⬅ 一樣丟給模板
+        stage=stage,
+        source=source,      # ⭐ 新增：讓前端可以接到來源欄位
         sort_by=sort_by,
     )
 
