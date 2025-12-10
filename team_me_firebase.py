@@ -8,7 +8,7 @@ from datetime import datetime
 import csv
 from io import StringIO, BytesIO
 from uuid import uuid4
-
+from PIL import Image
 
 import firebase_admin
 from firebase_admin import credentials, firestore, storage  
@@ -249,16 +249,27 @@ def index():
 @login_required
 def buyers():
     # 取得查詢參數
-    q = request.args.get("q", "").strip()              # 關鍵字（姓名 / 電話）
-    level = request.args.get("level", "").strip()      # 客戶等級 A/B/C
+    q = request.args.get("q", "").strip()                  # 關鍵字（姓名 / 電話）
+    level = request.args.get("level", "").strip()          # 客戶等級 A/B/C
     intent_type = request.args.get("intent_type", "").strip()  # 需求類型 buy/rent/both
-    stage = request.args.get("stage", "").strip()      # 進程：接觸 / 帶看 / 斡旋 / 成交
-    source = request.args.get("source", "").strip()    # ⭐ 客源來源（591 / IG / 朋友介紹...）
-    sort_by = request.args.get("sort_by", "created_at_desc")  # 排序方式
+    stage = request.args.get("stage", "").strip()          # 進程：接觸 / 帶看 / 斡旋 / 成交
+    source = request.args.get("source", "").strip()        # 客源來源（下拉選單選到的值）
+    sort_by = request.args.get("sort_by", "created_at_desc")
 
-    # 讀取 Firestore 全部買方
+    # 先抓全部買方
     docs = db.collection("buyers").stream()
-    buyers_list = [doc_to_dict(d) for d in docs]
+    all_buyers = [doc_to_dict(d) for d in docs]
+
+    # ⭐ 從現有資料裡整理出「不重複的來源」做成下拉選單用
+    source_set = set()
+    for b in all_buyers:
+        s = (b.get("source") or "").strip()
+        if s:
+            source_set.add(s)
+    source_options = sorted(source_set)   # 給模板用的清單
+
+    # 實際要被篩選 / 顯示的列表
+    buyers_list = list(all_buyers)
 
     # ===== 篩選條件 =====
 
@@ -269,32 +280,28 @@ def buyers():
             if q in (b.get("name") or "") or q in (b.get("phone") or "")
         ]
 
-    # 2️⃣ 客戶等級篩選
+    # 2️⃣ 客戶等級
     if level:
         buyers_list = [b for b in buyers_list if b.get("level") == level]
 
-    # 3️⃣ 需求類型篩選（租 / 買 / 都可以）
+    # 3️⃣ 需求類型
     if intent_type:
         buyers_list = [b for b in buyers_list if b.get("intent_type") == intent_type]
 
-    # 4️⃣ 進程篩選（接觸 / 帶看 / 斡旋 / 成交）
+    # 4️⃣ 進程
     if stage:
         buyers_list = [b for b in buyers_list if b.get("stage") == stage]
 
-    # 5️⃣ 客源來源篩選（部分比對：打 "IG" 就抓到 source 字串內含 IG 的）
+    # 5️⃣ 客源來源（這裡是「完全比對」，因為是從下拉選單選出來的值）
     if source:
-        buyers_list = [
-            b for b in buyers_list
-            if source in (b.get("source") or "")
-        ]
+        buyers_list = [b for b in buyers_list if (b.get("source") or "") == source]
 
     # ===== 排序 =====
     def parse_created_at(b):
-        # created_at 可能是 isoformat 文字，也可能沒有
         v = b.get("created_at")
         if not v:
             return ""
-        return v  # 你如果都是 isoformat 字串，直接用字串排序即可
+        return v  # 你現在都是 isoformat 字串，直接拿來比大小就好
 
     if sort_by == "created_at_asc":
         buyers_list.sort(key=parse_created_at)
@@ -305,7 +312,6 @@ def buyers():
     elif sort_by == "name_desc":
         buyers_list.sort(key=lambda b: (b.get("name") or ""), reverse=True)
 
-    # 丟參數給模板
     return render_template(
         "buyers.html",
         buyers=buyers_list,
@@ -313,9 +319,11 @@ def buyers():
         level=level,
         intent_type=intent_type,
         stage=stage,
-        source=source,          # ⭐ 新增：客源來源欄位
+        source=source,                # 目前選到的來源
+        source_options=source_options,  # ⭐ 給前端畫下拉選單
         sort_by=sort_by,
     )
+
 
 
 # ========= 新增買方 =========
@@ -651,41 +659,48 @@ def buyer_followup_delete(buyer_id, followup_id):
 @app.route("/sellers")
 @login_required
 def sellers():
-    # 取得查詢參數
+    # 查詢參數
     q = request.args.get("q", "").strip()              # 關鍵字（姓名 / 電話）
-    level = request.args.get("level", "").strip()      # 客戶等級 A/B/C
+    level = request.args.get("level", "").strip()      # 客戶等級
     stage = request.args.get("stage", "").strip()      # 進程：開發中 / 委託中 / 成交
-    source = request.args.get("source", "").strip()    # ⭐ 開發來源 / 客戶來源
+    source = request.args.get("source", "").strip()    # 開發來源 / 客戶來源（下拉選單）
     sort_by = request.args.get("sort_by", "created_at_desc")
 
-    # 讀取 Firestore 全部賣方
+    # 先抓全部賣方
     docs = db.collection("sellers").stream()
-    sellers_list = [doc_to_dict(d) for d in docs]
+    all_sellers = [doc_to_dict(d) for d in docs]
 
-    # ===== 篩選條件 =====
+    # ⭐ 從現有資料整理出「來源清單」
+    source_set = set()
+    for s in all_sellers:
+        val = (s.get("source") or "").strip()
+        if val:
+            source_set.add(val)
+    source_options = sorted(source_set)
 
-    # 1️⃣ 關鍵字搜尋（姓名 / 電話）
+    # 操作中的列表
+    sellers_list = list(all_sellers)
+
+    # ===== 篩選 =====
+
+    # 1️⃣ 關鍵字（姓名 / 電話）
     if q:
         sellers_list = [
             s for s in sellers_list
             if q in (s.get("name") or "") or q in (s.get("phone") or "")
         ]
 
-    # 2️⃣ 客戶等級篩選
+    # 2️⃣ 等級
     if level:
         sellers_list = [s for s in sellers_list if s.get("level") == level]
 
-    # 3️⃣ 進程篩選（開發中 / 委託中 / 成交）
+    # 3️⃣ 進程
     if stage:
         sellers_list = [s for s in sellers_list if s.get("stage") == stage]
 
-    # 4️⃣ 開發來源 / 客戶來源篩選
-    # 這裡使用部分比對：輸入 "591" 就抓到 source 中包含 591 的
+    # 4️⃣ 來源（完全比對，下拉選單）
     if source:
-        sellers_list = [
-            s for s in sellers_list
-            if source in (s.get("source") or "")
-        ]
+        sellers_list = [s for s in sellers_list if (s.get("source") or "") == source]
 
     # ===== 排序 =====
     def parse_created_at(s):
@@ -709,7 +724,8 @@ def sellers():
         q=q,
         level=level,
         stage=stage,
-        source=source,      # ⭐ 新增：讓前端可以接到來源欄位
+        source=source,                  # 當前選中的來源
+        source_options=source_options,  # ⭐ 給模板畫下拉
         sort_by=sort_by,
     )
 
@@ -727,7 +743,7 @@ def sellers_new():
     address = form.get("address", "").strip()
     property_type = form.get("property_type", "").strip()
     level = form.get("level", "").strip()
-    stage = form.get("stage", "").strip()  # 進程
+    stage = form.get("stage", "").strip()   # 進程
     reason = form.get("reason", "").strip()
     expected_price = form.get("expected_price", "").strip()
     min_price = form.get("min_price", "").strip()
@@ -736,20 +752,23 @@ def sellers_new():
     contract_end_date = form.get("contract_end_date", "").strip()
     note = form.get("note", "").strip()
 
+    # ⭐ 加上“來源 source”
+    source = form.get("source", "").strip()
+
     if not name:
         flash("賣方姓名必填", "danger")
         return redirect(url_for("sellers"))
 
     now = datetime.now().isoformat()
 
-    # 先準備好一個新的 document id，讓圖片可以用這個 id 當資料夾
+    # 先產生一個 document id → 用來放圖片
     sellers_collection = db.collection("sellers")
-    doc_ref = sellers_collection.document()  # 預先產生 id
+    doc_ref = sellers_collection.document()
     seller_id = doc_ref.id
 
-    # ===== 圖片處理：多張上傳 =====
+    # ========== 圖片（多張上傳） ==========
     photo_urls = []
-    files = request.files.getlist("photos")  # 前端 input name="photos"
+    files = request.files.getlist("photos")   # <input name="photos" multiple>
 
     for f in files:
         if f and f.filename:
@@ -757,7 +776,7 @@ def sellers_new():
             if url:
                 photo_urls.append(url)
 
-    # 組成要寫進 Firestore 的資料
+    # ========== Firestore 要存的資料 ==========
     data = {
         "name": name,
         "phone": phone,
@@ -766,7 +785,7 @@ def sellers_new():
         "address": address,
         "property_type": property_type,
         "level": level,
-        "stage": stage,  # 進程
+        "stage": stage,
         "reason": reason,
         "expected_price": expected_price,
         "min_price": min_price,
@@ -774,12 +793,13 @@ def sellers_new():
         "occupancy_status": occupancy_status,
         "contract_end_date": contract_end_date,
         "note": note,
+        "source": source,               # ⭐ 加進 Firestore
         "created_at": now,
         "created_by_id": session.get("user_id"),
         "created_by_name": session.get("user_name"),
     }
 
-    # 如果有上傳圖片，就一起寫入 photo_urls / photo_url
+    # 如果有圖片就寫入，沒有就給空
     if photo_urls:
         data["photo_urls"] = photo_urls
         data["photo_url"] = photo_urls[0]
@@ -878,6 +898,8 @@ def seller_edit(seller_id):
             "occupancy_status": form.get("occupancy_status", "").strip(),
             "contract_end_date": form.get("contract_end_date", "").strip(),  # 委託到期日
             "note": form.get("note", "").strip(),
+            # ⭐ 新增：客源來源
+            "source": form.get("source", "").strip(),
             "updated_at": datetime.now().isoformat(),
             "updated_by_id": session.get("user_id"),
             "updated_by_name": session.get("user_name"),
@@ -898,12 +920,6 @@ def seller_edit(seller_id):
                 delete_indexes.add(int(idx))
             except ValueError:
                 pass
-
-        # 🔥 要刪除哪些 URL（拿來刪掉 Storage 檔案）
-        deleted_urls = [
-            url for i, url in enumerate(current_photos)
-            if i in delete_indexes
-        ]
 
         # 把沒勾選的留下來
         new_photos = [
@@ -926,19 +942,12 @@ def seller_edit(seller_id):
         else:
             updated["photo_url"] = ""
 
-        # ✅ 先更新 Firestore
         doc_ref.update(updated)
-
-        # ✅ 再刪除 Firebase Storage 檔案
-        if deleted_urls:
-            delete_storage_files(deleted_urls)
-
         flash("已更新賣方資料", "success")
         return redirect(url_for("seller_detail", seller_id=seller_id))
 
     # GET：首次載入編輯頁
     return render_template("seller_edit.html", seller=seller)
-
 
 
 def delete_storage_file_by_url(url: str):

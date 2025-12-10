@@ -32,6 +32,16 @@
     </select>
   </div>
 
+  <div class="col-6 col-md-auto">
+    <select name="source" class="form-select">
+      <option value="">客源來源（全部）</option>
+      {% for s in source_options %}
+        <option value="{{ s }}" {% if source == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+
   <!-- 進程下拉（接觸 / 帶看 / 斡旋 / 成交） -->
   <div class="col-6 col-md-auto">
     <select name="stage" class="form-select">

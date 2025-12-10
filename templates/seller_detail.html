@@ -40,6 +40,8 @@
         <p class="mb-1"><strong>電話：</strong>{{ seller.phone or "-" }}</p>
         <p class="mb-1"><strong>LINE ID：</strong>{{ seller.line_id or "-" }}</p>
         <p class="mb-1"><strong>Email：</strong>{{ seller.email or "-" }}</p>
+        <!-- ⭐ 顯示客源來源 -->
+        <p class="mb-1"><strong>客源來源：</strong>{{ seller.source or "-" }}</p>
       </div>
       <div class="col-md-6">
         <p class="mb-1"><strong>物件地址：</strong>{{ seller.address or "-" }}</p>

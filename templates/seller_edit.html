@@ -22,6 +22,19 @@
         </div>
       </div>
 
+      <div class="mb-3">
+        <label class="form-label">Email</label>
+        <input type="email" name="email" class="form-control" value="{{ seller.email }}">
+      </div>
+
+      <!-- ⭐ 新增：客源來源（手動輸入） -->
+      <div class="mb-3">
+        <label class="form-label">客源來源</label>
+        <input type="text" name="source" class="form-control"
+               placeholder="例：591、IG、朋友介紹"
+               value="{{ seller.source }}">
+      </div>
+
       {# ====== 圖片區塊：多張縮圖 + 勾選刪除 + 多選上傳 ====== #}
       {% set photos = [] %}
       {% if seller.photo_urls is defined and seller.photo_urls %}
@@ -67,11 +80,6 @@
         </small>
       </div>
       {# ====== 圖片區塊結束 ====== #}
-
-      <div class="mb-3">
-        <label class="form-label">Email</label>
-        <input type="email" name="email" class="form-control" value="{{ seller.email }}">
-      </div>
 
       <div class="mb-3">
         <label class="form-label">物件地址</label>
