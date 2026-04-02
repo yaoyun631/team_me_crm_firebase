@@ -979,21 +979,9 @@ def format_record_timeline(target_type: str, doc_snapshot, limit=10):
             "text": item.get("content", ""),
         })
 
-    logs = []
-    query = db.collection("line_logs").where("target_id", "==", record_id).stream()
-    for d in query:
-        item = d.to_dict() or {}
-        txt = item.get("raw_text", "")
-        sender = item.get("sender_display_name", "")
-        if sender:
-            txt = f"{sender}\n{txt}"
-        logs.append({
-            "time": item.get("created_at") or "",
-            "type": "LINE原始紀錄",
-            "text": txt.strip(),
-        })
-
-    merged = note_blocks + followups + logs
+    # 查詢紀錄只顯示後台主檔備註 + 後台追蹤紀錄
+    # 不顯示 line_logs 的 LINE 原始訊息內容
+    merged = note_blocks + followups
     merged.sort(key=lambda x: x.get("time", ""), reverse=True)
 
     header = [
@@ -1071,12 +1059,14 @@ def process_quote_context_message(event):
         return {"handled": True, "ok": False, "reply_text": "未寫入：引用的客戶資料不存在"}
 
     labels = dedupe_keep_order(["LINE紀錄", "群組回覆註記"])
-    summary_text = build_line_summary(raw_text, event)
+    # 引用/回覆型註記只記錄「新的回覆內容」；
+    # 發話者姓名會由 note 的 source_label 與 followup 的 sender_display_name 另行保留。
+    reply_only_text = raw_text
 
     update_customer_note_and_labels(
         target_type=target_type,
         doc_ref=doc_ref,
-        content=summary_text,
+        content=reply_only_text,
         labels=labels,
         source="LINE",
         event=event,
@@ -1084,7 +1074,7 @@ def process_quote_context_message(event):
     add_customer_followup(
         target_type=target_type,
         customer_id=target_id,
-        content=summary_text,
+        content=reply_only_text,
         labels=labels,
         line_event=event,
     )
