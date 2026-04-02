@@ -167,8 +167,15 @@ app.secret_key = "team_me_super_secret"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-from blog import blog_bp
-app.register_blueprint(blog_bp)
+# blog Blueprint 改成可選；如果專案裡沒有 blog.py，也能正常啟動
+try:
+    from blog import blog_bp
+    app.register_blueprint(blog_bp)
+    print("✅ blog blueprint 已載入")
+except ModuleNotFoundError:
+    print("ℹ️ 找不到 blog.py，略過 blog blueprint 載入")
+except Exception as e:
+    print(f"⚠️ blog blueprint 載入失敗：{e}")
 
 # 限制單一請求最大 5MB（可依需求調整）
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
@@ -180,7 +187,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").stri
 
 DEFAULT_LABEL_OPTIONS = [
     "開發紀錄",
-    "掃街",
+    "插街",
     "待盤點客戶",
     "售-客戶需求",
     "租-客戶需求",
@@ -1646,9 +1653,27 @@ def line_ping():
 
 @app.route("/line/webhook", methods=["POST"])
 def line_webhook():
-    app.logger.warning("LINE webhook hit")
-    app.logger.warning("Headers: %s", dict(request.headers))
-    app.logger.warning("Body: %s", request.get_data(as_text=True))
+    raw_body = request.get_data(cache=False, as_text=False)
+    signature = request.headers.get("x-line-signature", "")
+
+    if not verify_line_signature(raw_body, signature):
+        return "Invalid signature", 400
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception as e:
+        print("⚠️ LINE webhook JSON 解析失敗：", e)
+        return "Bad Request", 400
+
+    events = payload.get("events", [])
+    for event in events:
+        try:
+            ok, message = process_line_message_event(event)
+            if event.get("replyToken"):
+                reply_line_text(event["replyToken"], message if ok else f"未寫入：{message}")
+        except Exception as e:
+            print("⚠️ 處理 LINE event 發生錯誤：", e)
+
     return "OK", 200
 
 # ========= CLI：建立後台使用者 =========
