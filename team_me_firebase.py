@@ -180,7 +180,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").stri
 
 DEFAULT_LABEL_OPTIONS = [
     "開發紀錄",
-    "插街",
+    "掃街",
     "待盤點客戶",
     "售-客戶需求",
     "租-客戶需求",
@@ -1646,27 +1646,9 @@ def line_ping():
 
 @app.route("/line/webhook", methods=["POST"])
 def line_webhook():
-    raw_body = request.get_data(cache=False, as_text=False)
-    signature = request.headers.get("x-line-signature", "")
-
-    if not verify_line_signature(raw_body, signature):
-        return "Invalid signature", 400
-
-    try:
-        payload = json.loads(raw_body.decode("utf-8"))
-    except Exception as e:
-        print("⚠️ LINE webhook JSON 解析失敗：", e)
-        return "Bad Request", 400
-
-    events = payload.get("events", [])
-    for event in events:
-        try:
-            ok, message = process_line_message_event(event)
-            if event.get("replyToken"):
-                reply_line_text(event["replyToken"], message if ok else f"未寫入：{message}")
-        except Exception as e:
-            print("⚠️ 處理 LINE event 發生錯誤：", e)
-
+    app.logger.warning("LINE webhook hit")
+    app.logger.warning("Headers: %s", dict(request.headers))
+    app.logger.warning("Body: %s", request.get_data(as_text=True))
     return "OK", 200
 
 # ========= CLI：建立後台使用者 =========
