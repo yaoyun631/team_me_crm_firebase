@@ -7,6 +7,10 @@ import json
 from datetime import datetime
 import csv
 from io import StringIO, BytesIO
+import hmac
+import hashlib
+import base64
+import re
 from uuid import uuid4
 from PIL import Image
 
@@ -14,7 +18,8 @@ import firebase_admin
 from firebase_admin import credentials, firestore, storage  
 from werkzeug.security import generate_password_hash, check_password_hash
 from urllib.parse import urlparse, unquote
-
+import time
+from werkzeug.utils import secure_filename
 
 print("Working directory:", os.getcwd())
 
@@ -69,58 +74,69 @@ def allowed_image(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
 
 
-def upload_image_to_storage(file, folder: str, object_id: str, max_width: int = 1080):
+# 後端統一壓縮設定
+MAX_WIDTH = 1600
+MAX_HEIGHT = 1600
+MAX_BYTES = 800 * 1024   # 800 KB 以內（約 5 張 ~ 4MB 左右）
+QUALITY_STEPS = [80, 70, 60, 50]   # 逐步降品質直到符合大小
+
+
+def upload_image_to_storage(file, folder: str, object_id: str):
     """
-    上傳圖片到 Firebase Storage，並自動等比例縮到手機適合寬度（預設 1080px）
-    - file: request.files[...] 拿到的 FileStorage
-    - folder: "buyers" / "sellers" 等
-    - object_id: Firestore 文件 id（用作檔名前綴）
-    回傳：公開網址（str）或 None
+    前端已壓縮一次，後端再保險壓縮一次，避免超肥圖炸 Render / Storage。
+    回傳公開網址，失敗回傳 None。
     """
     if not file or not file.filename:
         return None
 
-    filename = file.filename
-    if "." not in filename:
-        print("❌ 檔名沒有副檔名：", filename)
+    try:
+        # 讀入圖片
+        img = Image.open(file.stream)
+
+        # 統一轉成 RGB，避免 PNG / HEIC 等模式出問題
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+
+        # 等比縮圖：不超過 1600x1600
+        img.thumbnail((MAX_WIDTH, MAX_HEIGHT))
+
+        best_buf = None
+        best_size = None
+
+        # 依序嘗試不同品質，挑一個 <= MAX_BYTES 或最後一個
+        for q in QUALITY_STEPS:
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=q, optimize=True)
+            size = buf.tell()
+
+            # 先記住（以防全部都 > MAX_BYTES，也至少有一個）
+            if best_buf is None or size < best_size:
+                best_buf = buf
+                best_size = size
+
+            if size <= MAX_BYTES:
+                break
+
+        # 使用選到的 buffer
+        best_buf.seek(0)
+
+        # 產生檔名
+        base_name = secure_filename(file.filename.rsplit(".", 1)[0]) or "image"
+        filename = f"{base_name}_{int(time.time())}.jpg"
+        blob_path = f"{folder}/{object_id}_{filename}"
+
+        bucket = storage.bucket()
+        blob = bucket.blob(blob_path)
+
+        # 上傳
+        blob.upload_from_file(best_buf, content_type="image/jpeg")
+        # 如果你原本有用 make_public，就保留；沒有就用 token 方式
+        blob.make_public()
+        return blob.public_url
+
+    except Exception as e:
+        print("❌ 上傳圖片至 Storage 時發生錯誤：", e)
         return None
-
-    ext = filename.rsplit(".", 1)[-1].lower()
-
-    if ext not in ALLOWED_IMAGE_EXTENSIONS:
-        print("❌ 不支援的圖片格式：", ext)
-        return None
-
-    bucket = storage.bucket()
-
-    # 用 uuid 避免檔名互相覆蓋，例如：sellers/<id>_<uuid>.jpg
-    unique_suffix = uuid4().hex[:8]
-    blob_path = f"{folder}/{object_id}_{unique_suffix}.{ext}"
-    blob = bucket.blob(blob_path)
-
-    # 1️⃣ 用 Pillow 讀入圖片
-    img = Image.open(file.stream)
-    img = img.convert("RGB")   # 避免有 alpha 造成問題
-
-    # 2️⃣ 如果寬度超過 max_width，就等比例縮小
-    w, h = img.size
-    if w > max_width:
-        new_h = int(h * max_width / w)
-        img = img.resize((max_width, new_h), Image.LANCZOS)
-
-    # 3️⃣ 存到記憶體 buffer
-    buf = BytesIO()
-    save_format = "JPEG" if ext in ["jpg", "jpeg"] else ext.upper()
-    img.save(buf, format=save_format, quality=85)
-    buf.seek(0)  # 🔑 重點：讓 stream 從開頭開始
-
-    # 4️⃣ 上傳至 Firebase Storage
-    content_type = file.mimetype or "image/jpeg"
-    blob.upload_from_file(buf, content_type=content_type)
-    blob.make_public()
-
-    print("✅ 上傳圖片完成：", blob.public_url)
-    return blob.public_url
 
 
 def delete_image_from_storage(folder: str, object_id: str):
@@ -157,6 +173,24 @@ app.register_blueprint(blog_bp)
 # 限制單一請求最大 5MB（可依需求調整）
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
+
+# ========= LINE Webhook / 分類設定 =========
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "").strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+
+DEFAULT_LABEL_OPTIONS = [
+    "開發紀錄",
+    "插街",
+    "待盤點客戶",
+    "售-客戶需求",
+    "租-客戶需求",
+    "廣告",
+    "影片待剪/排程",
+    "影片上架",
+    "LINE紀錄",
+]
+
+
 # ========= 小工具 =========
 def doc_to_dict(doc):
     """把 Firestore Document 轉成 dict 並加上 id 欄位"""
@@ -174,6 +208,378 @@ def delete_by_field(collection_name, field_name, field_value):
     docs = list(ref.stream())
     for d in docs:
         d.reference.delete()
+
+
+
+def ensure_list(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def parse_label_csv(text_value: str):
+    if not text_value:
+        return []
+    parts = re.split(r"[，,、\n]+", text_value)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def dedupe_keep_order(items):
+    seen = set()
+    result = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def normalize_phone(phone: str) -> str:
+    return re.sub(r"\D", "", phone or "")
+
+
+def get_request_labels(form):
+    labels = []
+    labels.extend(form.getlist("labels"))
+    labels.extend(parse_label_csv(form.get("labels_csv", "").strip()))
+    return dedupe_keep_order([x.strip() for x in labels if x and str(x).strip()])
+
+
+def get_label_options_from_docs(docs):
+    label_set = set(DEFAULT_LABEL_OPTIONS)
+    for item in docs:
+        for label in ensure_list(item.get("labels")):
+            if label:
+                label_set.add(label)
+    return sorted(label_set)
+
+
+def append_note_block(old_note: str, content: str, source_label: str = "LINE"):
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    block = f"[{stamp}][{source_label}] {content}".strip()
+    if old_note and old_note.strip():
+        return old_note.rstrip() + "\n\n" + block
+    return block
+
+
+def verify_line_signature(raw_body: bytes, signature: str) -> bool:
+    if not LINE_CHANNEL_SECRET or not signature:
+        return False
+    digest = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256
+    ).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+
+def line_api_headers():
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+    }
+
+
+def reply_line_text(reply_token: str, text_message: str):
+    if not LINE_CHANNEL_ACCESS_TOKEN or not reply_token:
+        return
+
+    payload = {
+        "replyToken": reply_token,
+        "messages": [
+            {"type": "text", "text": text_message[:5000]}
+        ],
+    }
+
+    try:
+        import requests
+        res = requests.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers=line_api_headers(),
+            json=payload,
+            timeout=8,
+        )
+        print("LINE reply status:", res.status_code, res.text[:300])
+    except Exception as e:
+        print("⚠️ LINE reply 發生錯誤：", e)
+
+
+def normalize_line_key(key: str) -> str:
+    k = (key or "").strip().replace(" ", "")
+    mapping = {
+        "對象": "target_type",
+        "類型": "target_type",
+        "目標": "target_type",
+        "客戶類型": "target_type",
+        "電話": "phone",
+        "手機": "phone",
+        "電話號碼": "phone",
+        "姓名": "name",
+        "客戶": "name",
+        "買方": "name",
+        "賣方": "name",
+        "ID": "record_id",
+        "客戶ID": "record_id",
+        "buyer_id": "record_id",
+        "seller_id": "record_id",
+        "內容": "content",
+        "紀錄": "content",
+        "備註": "content",
+        "說明": "content",
+        "進度內容": "content",
+        "進程": "stage",
+        "階段": "stage",
+        "狀態": "stage",
+        "來源": "source",
+        "標籤": "labels",
+        "分類": "labels",
+        "labels": "labels",
+        "下一步": "next_action",
+        "下次行動": "next_action",
+        "next_action": "next_action",
+        "下次聯絡日": "next_contact_date",
+        "下次聯絡日期": "next_contact_date",
+        "next_contact_date": "next_contact_date",
+        "地址": "address",
+        "物件": "address",
+        "案名": "address",
+        "總價": "price",
+        "價格": "price",
+    }
+    return mapping.get(k, k)
+
+
+def parse_line_formatted_message(text: str):
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    first = lines[0]
+    if not first.startswith("#"):
+        return None
+
+    tag = first.lstrip("#").strip()
+    tag_map = {
+        "買方追蹤": "buyer_followup",
+        "賣方追蹤": "seller_followup",
+        "客戶分類": "classify",
+        "帶看": "buyer_followup",
+        "成交": "buyer_followup",
+        "委託": "seller_followup",
+        "紀錄": "generic_note",
+    }
+    action = tag_map.get(tag)
+    if not action:
+        return None
+
+    fields = {}
+    for line in lines[1:]:
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.+)$", line)
+        if not m:
+            continue
+        key = normalize_line_key(m.group(1))
+        value = m.group(2).strip()
+        if key == "labels":
+            fields[key] = parse_label_csv(value)
+        else:
+            fields[key] = value
+
+    if tag in ("買方追蹤", "帶看", "成交") and not fields.get("target_type"):
+        fields["target_type"] = "buyer"
+    if tag in ("賣方追蹤", "委託") and not fields.get("target_type"):
+        fields["target_type"] = "seller"
+
+    if action in ("buyer_followup", "seller_followup", "classify"):
+        if not (fields.get("record_id") or fields.get("phone") or fields.get("name")):
+            return None
+
+    return {
+        "tag": tag,
+        "action": action,
+        "fields": fields,
+        "raw_text": text,
+    }
+
+
+def find_customer_record(target_type: str, record_id: str = "", phone: str = "", name: str = ""):
+    collection_name = "buyers" if target_type == "buyer" else "sellers"
+
+    if record_id:
+        doc = db.collection(collection_name).document(record_id).get()
+        if doc.exists:
+            return doc
+
+    normalized_phone = normalize_phone(phone)
+    if normalized_phone:
+        matches = []
+        for doc in db.collection(collection_name).stream():
+            data = doc.to_dict() or {}
+            if normalize_phone(data.get("phone", "")) == normalized_phone:
+                matches.append(doc)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return None
+
+    if name:
+        docs = list(db.collection(collection_name).where("name", "==", name.strip()).limit(2).stream())
+        if len(docs) == 1:
+            return docs[0]
+
+    return None
+
+
+def update_customer_note_and_labels(target_type: str, doc_ref, content: str, labels=None, stage="", source="LINE"):
+    labels = dedupe_keep_order(["LINE紀錄"] + ensure_list(labels))
+    snapshot = doc_ref.get()
+    current = snapshot.to_dict() or {}
+    old_note = current.get("note", "")
+
+    updates = {
+        "note": append_note_block(old_note, content, "LINE"),
+        "labels": firestore.ArrayUnion(labels),
+        "updated_at": datetime.now().isoformat(),
+        "updated_by_id": "line_bot",
+        "updated_by_name": "LINE Bot",
+    }
+    if stage:
+        updates["stage"] = stage
+    if source and not current.get("source"):
+        updates["source"] = source
+
+    doc_ref.update(updates)
+
+
+def add_customer_followup(target_type: str, customer_id: str, content: str, next_action="", next_contact_date="", labels=None, line_event=None):
+    collection_name = "buyer_followups" if target_type == "buyer" else "seller_followups"
+    key_name = "buyer_id" if target_type == "buyer" else "seller_id"
+
+    data = {
+        key_name: customer_id,
+        "contact_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "channel": "LINE",
+        "content": content,
+        "next_action": next_action,
+        "next_contact_date": next_contact_date,
+        "labels": dedupe_keep_order(["LINE紀錄"] + ensure_list(labels)),
+        "created_at": datetime.now().isoformat(),
+        "created_by_id": "line_bot",
+        "created_by_name": "LINE Bot",
+    }
+
+    if line_event:
+        source = line_event.get("source", {})
+        data["line_group_id"] = source.get("groupId", "")
+        data["line_room_id"] = source.get("roomId", "")
+        data["line_user_id"] = source.get("userId", "")
+
+    db.collection(collection_name).add(data)
+
+
+def save_line_log(parsed, event, status, target_type="", target_id="", note=""):
+    source = event.get("source", {})
+    db.collection("line_logs").add({
+        "tag": parsed.get("tag", ""),
+        "action": parsed.get("action", ""),
+        "fields": parsed.get("fields", {}),
+        "raw_text": parsed.get("raw_text", ""),
+        "status": status,
+        "target_type": target_type,
+        "target_id": target_id,
+        "note": note,
+        "line_group_id": source.get("groupId", ""),
+        "line_room_id": source.get("roomId", ""),
+        "line_user_id": source.get("userId", ""),
+        "message_id": (event.get("message") or {}).get("id", ""),
+        "webhook_event_id": event.get("webhookEventId", ""),
+        "created_at": datetime.now().isoformat(),
+    })
+
+
+def process_line_message_event(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return False, "不是文字訊息"
+
+    parsed = parse_line_formatted_message(message.get("text", ""))
+    if not parsed:
+        return False, "格式不符合"
+
+    fields = parsed["fields"]
+    action = parsed["action"]
+
+    if action == "generic_note":
+        save_line_log(parsed, event, "ignored", note="generic_note 暫未綁定資料")
+        return True, "已收到紀錄"
+
+    target_type = fields.get("target_type", "")
+    if action == "buyer_followup":
+        target_type = "buyer"
+    elif action == "seller_followup":
+        target_type = "seller"
+
+    if target_type not in ("buyer", "seller"):
+        save_line_log(parsed, event, "failed", note="缺少 target_type")
+        return False, "請提供對象：買方 或 賣方"
+
+    doc = find_customer_record(
+        target_type=target_type,
+        record_id=fields.get("record_id", ""),
+        phone=fields.get("phone", ""),
+        name=fields.get("name", ""),
+    )
+    if not doc:
+        save_line_log(parsed, event, "failed", target_type=target_type, note="找不到唯一客戶")
+        return False, "找不到唯一客戶，請補客戶ID或正確電話"
+
+    doc_ref = db.collection("buyers" if target_type == "buyer" else "sellers").document(doc.id)
+    labels = dedupe_keep_order(["LINE紀錄"] + ensure_list(fields.get("labels")))
+
+    summary_parts = []
+    if fields.get("content"):
+        summary_parts.append(fields["content"])
+    if fields.get("address"):
+        summary_parts.append(f"地址/物件：{fields['address']}")
+    if fields.get("price"):
+        summary_parts.append(f"價格：{fields['price']}")
+    summary_text = "；".join(summary_parts).strip() or "LINE 更新"
+
+    update_customer_note_and_labels(
+        target_type=target_type,
+        doc_ref=doc_ref,
+        content=summary_text,
+        labels=labels,
+        stage=fields.get("stage", ""),
+        source=fields.get("source", "LINE"),
+    )
+
+    if action in ("buyer_followup", "seller_followup"):
+        add_customer_followup(
+            target_type=target_type,
+            customer_id=doc.id,
+            content=summary_text,
+            next_action=fields.get("next_action", ""),
+            next_contact_date=fields.get("next_contact_date", ""),
+            labels=labels,
+            line_event=event,
+        )
+
+    save_line_log(parsed, event, "success", target_type=target_type, target_id=doc.id)
+    return True, f"已寫入{'買方' if target_type == 'buyer' else '賣方'}：{(doc.to_dict() or {}).get('name', '')}"
+
+
+def build_label_options(*doc_lists):
+    label_set = set(DEFAULT_LABEL_OPTIONS)
+    for docs in doc_lists:
+        for item in docs:
+            for label in ensure_list(item.get("labels")):
+                label_set.add(label)
+    return sorted(label_set)
+
+
 
 
 
@@ -248,60 +654,53 @@ def index():
 @app.route("/buyers")
 @login_required
 def buyers():
-    # 取得查詢參數
-    q = request.args.get("q", "").strip()                  # 關鍵字（姓名 / 電話）
-    level = request.args.get("level", "").strip()          # 客戶等級 A/B/C
-    intent_type = request.args.get("intent_type", "").strip()  # 需求類型 buy/rent/both
-    stage = request.args.get("stage", "").strip()          # 進程：接觸 / 帶看 / 斡旋 / 成交
-    source = request.args.get("source", "").strip()        # 客源來源（下拉選單選到的值）
+    q = request.args.get("q", "").strip()
+    level = request.args.get("level", "").strip()
+    intent_type = request.args.get("intent_type", "").strip()
+    stage = request.args.get("stage", "").strip()
+    source = request.args.get("source", "").strip()
+    label = request.args.get("label", "").strip()
     sort_by = request.args.get("sort_by", "created_at_desc")
 
-    # 先抓全部買方
     docs = db.collection("buyers").stream()
     all_buyers = [doc_to_dict(d) for d in docs]
 
-    # ⭐ 從現有資料裡整理出「不重複的來源」做成下拉選單用
     source_set = set()
     for b in all_buyers:
         s = (b.get("source") or "").strip()
         if s:
             source_set.add(s)
-    source_options = sorted(source_set)   # 給模板用的清單
+    source_options = sorted(source_set)
+    label_options = build_label_options(all_buyers)
 
-    # 實際要被篩選 / 顯示的列表
     buyers_list = list(all_buyers)
 
-    # ===== 篩選條件 =====
-
-    # 1️⃣ 關鍵字搜尋（姓名 / 電話）
     if q:
         buyers_list = [
             b for b in buyers_list
             if q in (b.get("name") or "") or q in (b.get("phone") or "")
         ]
 
-    # 2️⃣ 客戶等級
     if level:
         buyers_list = [b for b in buyers_list if b.get("level") == level]
 
-    # 3️⃣ 需求類型
     if intent_type:
         buyers_list = [b for b in buyers_list if b.get("intent_type") == intent_type]
 
-    # 4️⃣ 進程
     if stage:
         buyers_list = [b for b in buyers_list if b.get("stage") == stage]
 
-    # 5️⃣ 客源來源（這裡是「完全比對」，因為是從下拉選單選出來的值）
     if source:
         buyers_list = [b for b in buyers_list if (b.get("source") or "") == source]
 
-    # ===== 排序 =====
+    if label:
+        buyers_list = [b for b in buyers_list if label in ensure_list(b.get("labels"))]
+
     def parse_created_at(b):
         v = b.get("created_at")
         if not v:
             return ""
-        return v  # 你現在都是 isoformat 字串，直接拿來比大小就好
+        return v
 
     if sort_by == "created_at_asc":
         buyers_list.sort(key=parse_created_at)
@@ -319,8 +718,10 @@ def buyers():
         level=level,
         intent_type=intent_type,
         stage=stage,
-        source=source,                # 目前選到的來源
-        source_options=source_options,  # ⭐ 給前端畫下拉選單
+        source=source,
+        source_options=source_options,
+        label=label,
+        label_options=label_options,
         sort_by=sort_by,
     )
 
@@ -354,6 +755,7 @@ def buyers_new():
     requirement_nice = form.get("requirement_nice", "").strip()
     other_background = form.get("other_background", "").strip()
     note = form.get("note", "").strip()
+    labels = get_request_labels(form)
 
     if not name:
         flash("買方姓名必填", "danger")
@@ -392,6 +794,7 @@ def buyers_new():
         "requirement_nice": requirement_nice,
         "other_background": other_background,
         "note": note,
+        "labels": labels,
         "created_at": now,
         "created_by_id": session.get("user_id"),
         "created_by_name": session.get("user_name"),
@@ -506,10 +909,13 @@ def buyer_edit(buyer_id):
                 "other_background": form.get("other_background", "").strip(),
                 "note": form.get("note", "").strip(),
                 "stage": form.get("stage", "").strip(),
+                "labels": get_request_labels(form),
             })
             return render_template("buyer_edit.html", buyer=buyer)
 
         # ✅ 先處理一般文字欄位
+        labels = get_request_labels(form)
+
         updated = {
             "name": name,
             "phone": form.get("phone", "").strip(),
@@ -532,6 +938,7 @@ def buyer_edit(buyer_id):
             "requirement_nice": form.get("requirement_nice", "").strip(),
             "other_background": form.get("other_background", "").strip(),
             "note": form.get("note", "").strip(),
+            "labels": labels,
             "stage": form.get("stage", "").strip(),  # 接觸/帶看/斡旋/成交
             "updated_at": datetime.now().isoformat(),
             "updated_by_id": session.get("user_id"),
@@ -659,50 +1066,44 @@ def buyer_followup_delete(buyer_id, followup_id):
 @app.route("/sellers")
 @login_required
 def sellers():
-    # 查詢參數
-    q = request.args.get("q", "").strip()              # 關鍵字（姓名 / 電話）
-    level = request.args.get("level", "").strip()      # 客戶等級
-    stage = request.args.get("stage", "").strip()      # 進程：開發中 / 委託中 / 成交
-    source = request.args.get("source", "").strip()    # 開發來源 / 客戶來源（下拉選單）
+    q = request.args.get("q", "").strip()
+    level = request.args.get("level", "").strip()
+    stage = request.args.get("stage", "").strip()
+    source = request.args.get("source", "").strip()
+    label = request.args.get("label", "").strip()
     sort_by = request.args.get("sort_by", "created_at_desc")
 
-    # 先抓全部賣方
     docs = db.collection("sellers").stream()
     all_sellers = [doc_to_dict(d) for d in docs]
 
-    # ⭐ 從現有資料整理出「來源清單」
     source_set = set()
     for s in all_sellers:
         val = (s.get("source") or "").strip()
         if val:
             source_set.add(val)
     source_options = sorted(source_set)
+    label_options = build_label_options(all_sellers)
 
-    # 操作中的列表
     sellers_list = list(all_sellers)
 
-    # ===== 篩選 =====
-
-    # 1️⃣ 關鍵字（姓名 / 電話）
     if q:
         sellers_list = [
             s for s in sellers_list
             if q in (s.get("name") or "") or q in (s.get("phone") or "")
         ]
 
-    # 2️⃣ 等級
     if level:
         sellers_list = [s for s in sellers_list if s.get("level") == level]
 
-    # 3️⃣ 進程
     if stage:
         sellers_list = [s for s in sellers_list if s.get("stage") == stage]
 
-    # 4️⃣ 來源（完全比對，下拉選單）
     if source:
         sellers_list = [s for s in sellers_list if (s.get("source") or "") == source]
 
-    # ===== 排序 =====
+    if label:
+        sellers_list = [s for s in sellers_list if label in ensure_list(s.get("labels"))]
+
     def parse_created_at(s):
         v = s.get("created_at")
         if not v:
@@ -724,8 +1125,10 @@ def sellers():
         q=q,
         level=level,
         stage=stage,
-        source=source,                  # 當前選中的來源
-        source_options=source_options,  # ⭐ 給模板畫下拉
+        source=source,
+        source_options=source_options,
+        label=label,
+        label_options=label_options,
         sort_by=sort_by,
     )
 
@@ -751,6 +1154,7 @@ def sellers_new():
     occupancy_status = form.get("occupancy_status", "").strip()
     contract_end_date = form.get("contract_end_date", "").strip()
     note = form.get("note", "").strip()
+    labels = get_request_labels(form)
 
     # ⭐ 加上“來源 source”
     source = form.get("source", "").strip()
@@ -776,6 +1180,7 @@ def sellers_new():
             if url:
                 photo_urls.append(url)
 
+
     # ========== Firestore 要存的資料 ==========
     data = {
         "name": name,
@@ -793,6 +1198,7 @@ def sellers_new():
         "occupancy_status": occupancy_status,
         "contract_end_date": contract_end_date,
         "note": note,
+        "labels": labels,
         "source": source,               # ⭐ 加進 Firestore
         "created_at": now,
         "created_by_id": session.get("user_id"),
@@ -812,6 +1218,7 @@ def sellers_new():
 
     flash("已新增賣方", "success")
     return redirect(url_for("sellers"))
+
 
 
 
@@ -882,6 +1289,8 @@ def seller_edit(seller_id):
     if request.method == "POST":
         form = request.form
 
+        labels = get_request_labels(form)
+
         updated = {
             "name": form.get("name", "").strip(),
             "phone": form.get("phone", "").strip(),
@@ -898,6 +1307,7 @@ def seller_edit(seller_id):
             "occupancy_status": form.get("occupancy_status", "").strip(),
             "contract_end_date": form.get("contract_end_date", "").strip(),  # 委託到期日
             "note": form.get("note", "").strip(),
+            "labels": labels,
             # ⭐ 新增：客源來源
             "source": form.get("source", "").strip(),
             "updated_at": datetime.now().isoformat(),
@@ -1101,6 +1511,7 @@ def download_sellers():
         "目前使用狀態",
         "委託到期日",
         "內部備註",
+        "分類標籤",
         "建立時間",
         "建立者",
         "最後編輯時間",
@@ -1125,6 +1536,7 @@ def download_sellers():
             s.get("occupancy_status", ""),
             s.get("contract_end_date", ""),    # 委託到期日
             s.get("note", ""),
+            "、".join(ensure_list(s.get("labels"))),
             s.get("created_at", ""),
             s.get("created_by_name", ""),
             s.get("updated_at", ""),
@@ -1176,6 +1588,7 @@ def download_buyers():
         "加分條件(Nice to Have)",
         "背景補充",
         "內部備註",
+        "分類標籤",
         "建立時間",
         "建立者",
         "最後編輯時間",
@@ -1207,6 +1620,7 @@ def download_buyers():
             b.get("requirement_nice", ""),
             b.get("other_background", ""),
             b.get("note", ""),
+            "、".join(ensure_list(b.get("labels"))),
             b.get("created_at", ""),
             b.get("created_by_name", ""),
             b.get("updated_at", ""),
@@ -1222,6 +1636,39 @@ def download_buyers():
     response = Response(csv_data, mimetype="text/csv; charset=utf-8")
     response.headers["Content-Disposition"] = f"attachment; filename={filename}"
     return response
+
+
+# ========= LINE Webhook =========
+@app.route("/line/ping")
+def line_ping():
+    return {"ok": True, "message": "line webhook ready"}, 200
+
+
+@app.route("/line/webhook", methods=["POST"])
+def line_webhook():
+    raw_body = request.get_data(cache=False, as_text=False)
+    signature = request.headers.get("x-line-signature", "")
+
+    if not verify_line_signature(raw_body, signature):
+        return "Invalid signature", 400
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception as e:
+        print("⚠️ LINE webhook JSON 解析失敗：", e)
+        return "Bad Request", 400
+
+    events = payload.get("events", [])
+    for event in events:
+        try:
+            ok, message = process_line_message_event(event)
+            if event.get("replyToken"):
+                reply_line_text(event["replyToken"], message if ok else f"未寫入：{message}")
+        except Exception as e:
+            print("⚠️ 處理 LINE event 發生錯誤：", e)
+
+    return "OK", 200
+
 # ========= CLI：建立後台使用者 =========
 @app.cli.command("create-user")
 def create_user_cmd():

@@ -23,7 +23,7 @@
     </select>
   </div>
 
-  <!-- 來源篩選（使用後端給的 source_options） -->
+  <!-- ⭐ 來源篩選（使用後端給的 source_options） -->
   <div class="col-6 col-md-auto">
     <select name="source" class="form-select">
       <option value="">來源（全部）</option>
@@ -173,7 +173,7 @@
         <!-- 📸 賣方圖片（可多張） -->
         <div class="mb-3">
           <label class="form-label">圖片（可多張）</label>
-          <input type="file" name="photos" class="form-control" multiple>
+          <input type="file" name="photos" class="form-control photo-input" multiple>
           <small class="text-muted">
             可一次選擇多張圖片，上傳後會在賣方詳細頁顯示縮圖並可左右滑動。
           </small>
@@ -194,53 +194,121 @@
 <div class="row">
   <!-- 🧾 左邊：列表 -->
   <div class="col-md-7">
-    <table class="table table-striped table-hover bg-white">
-      <thead>
-        <tr>
-          <th>姓名</th>
-          <th>電話</th>
-          <th>等級</th>
-          <th>進程</th>
-          <th>來源</th>
-          <th>委託到期日</th>
-          <th>地址</th>
-          <th>建立者</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
+
+    {# 🖥️ 桌機版：表格 #}
+    <div class="d-none d-md-block">
+      <table class="table table-striped table-hover bg-white">
+        <thead>
+          <tr>
+            <th>姓名</th>
+            <th>電話</th>
+            <th>等級</th>
+            <th>進程</th>
+            <th>來源</th>
+            <th>委託到期日</th>
+            <th>地址</th>
+            <th>建立者</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in sellers %}
+            <tr>
+              <td>{{ s.name }}</td>
+              <td>{{ s.phone or "-" }}</td>
+              <td>{{ s.level or "-" }}</td>
+              <td>{{ s.stage or "-" }}</td>
+              <td>{{ s.source or "-" }}</td>
+              <td>{{ s.contract_end_date or "-" }}</td>
+              <td>{{ s.address or "-" }}</td>
+              <td>{{ s.created_by_name or "-" }}</td>
+              <td>
+                <a href="{{ url_for('seller_detail', seller_id=s.id) }}"
+                   class="btn btn-sm btn-outline-primary mb-1">
+                  詳細 / 追蹤
+                </a>
+                <form method="post"
+                      action="{{ url_for('seller_delete', seller_id=s.id) }}"
+                      style="display:inline;"
+                      onsubmit="return confirm('確定要刪除這位賣方及所有追蹤紀錄嗎？');">
+                  <button type="submit" class="btn btn-sm btn-outline-danger mb-1">
+                    刪除
+                  </button>
+                </form>
+              </td>
+            </tr>
+          {% else %}
+            <tr>
+              <td colspan="9" class="text-center text-muted">目前沒有賣方資料</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    {# 📱 手機版：卡片列表 #}
+    <div class="d-block d-md-none">
+      {% if sellers %}
         {% for s in sellers %}
-          <tr>
-            <td>{{ s.name }}</td>
-            <td>{{ s.phone or "-" }}</td>
-            <td>{{ s.level or "-" }}</td>
-            <td>{{ s.stage or "-" }}</td>
-            <td>{{ s.source or "-" }}</td>
-            <td>{{ s.contract_end_date or "-" }}</td>
-            <td>{{ s.address or "-" }}</td>
-            <td>{{ s.created_by_name or "-" }}</td>
-            <td>
-              <a href="{{ url_for('seller_detail', seller_id=s.id) }}"
-                 class="btn btn-sm btn-outline-primary mb-1">
-                詳細 / 追蹤
-              </a>
-              <form method="post"
-                    action="{{ url_for('seller_delete', seller_id=s.id) }}"
-                    style="display:inline;"
-                    onsubmit="return confirm('確定要刪除這位賣方及所有追蹤紀錄嗎？');">
-                <button type="submit" class="btn btn-sm btn-outline-danger mb-1">
-                  刪除
-                </button>
-              </form>
-            </td>
-          </tr>
-        {% else %}
-          <tr>
-            <td colspan="9" class="text-center text-muted">目前沒有賣方資料</td>
-          </tr>
+          <div class="card mb-2">
+            <div class="card-body">
+              <div class="d-flex justify-content-between align-items-start mb-2">
+                <div>
+                  <h5 class="mb-1">{{ s.name or "未填姓名" }}</h5>
+                  <div class="text-muted small">
+                    {{ s.address or "未填地址" }}
+                  </div>
+                </div>
+                <div class="text-end">
+                  {% if s.level %}
+                    <span class="badge bg-primary d-block mb-1">等級 {{ s.level }}</span>
+                  {% endif %}
+                  {% if s.stage %}
+                    <span class="badge bg-secondary d-block">{{ s.stage }}</span>
+                  {% endif %}
+                </div>
+              </div>
+
+              <div class="small mb-2">
+                <div class="row mb-1">
+                  <div class="col-6">
+                    <span class="text-muted">電話：</span>{{ s.phone or "-" }}
+                  </div>
+                  <div class="col-6">
+                    <span class="text-muted">來源：</span>{{ s.source or "-" }}
+                  </div>
+                </div>
+                <div class="row mb-1">
+                  <div class="col-6">
+                    <span class="text-muted">委託到期：</span>{{ s.contract_end_date or "-" }}
+                  </div>
+                  <div class="col-6">
+                    <span class="text-muted">建立者：</span>{{ s.created_by_name or "-" }}
+                  </div>
+                </div>
+              </div>
+
+              <div class="d-flex justify-content-end">
+                <a href="{{ url_for('seller_detail', seller_id=s.id) }}"
+                   class="btn btn-sm btn-outline-primary me-2">
+                  詳細 / 追蹤
+                </a>
+                <form method="post"
+                      action="{{ url_for('seller_delete', seller_id=s.id) }}"
+                      onsubmit="return confirm('確定要刪除這位賣方及所有追蹤紀錄嗎？');">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">
+                    刪除
+                  </button>
+                </form>
+              </div>
+            </div>
+          </div>
         {% endfor %}
-      </tbody>
-    </table>
+      {% else %}
+        <p class="text-muted text-center">目前沒有賣方資料</p>
+      {% endif %}
+    </div>
+
   </div>
 
   <!-- 🖥️ 右邊：桌機版表單（手機隱藏） -->
@@ -348,7 +416,7 @@
       <!-- 📸 賣方圖片（可多張） -->
       <div class="mb-3">
         <label class="form-label">圖片（可多張）</label>
-        <input type="file" name="photos" class="form-control" multiple>
+        <input type="file" name="photos" class="form-control photo-input" multiple>
         <small class="text-muted">
           可一次選擇多張圖片，上傳後會在賣方詳細頁顯示縮圖並可左右滑動。
         </small>
