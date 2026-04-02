@@ -956,55 +956,76 @@ def format_record_timeline(target_type: str, doc_snapshot, limit=10):
     data = doc_snapshot.to_dict() or {}
     record_id = doc_snapshot.id
 
-    note_blocks = []
-    note_text = (data.get("note") or "").strip()
-    if note_text:
-        for block in re.split(r"\n\s*\n", note_text):
-            block = block.strip()
-            if block:
-                note_blocks.append({
-                    "time": "",
-                    "type": "主檔備註",
-                    "text": block,
-                })
-
     followup_collection = "buyer_followups" if target_type == "buyer" else "seller_followups"
     key_name = "buyer_id" if target_type == "buyer" else "seller_id"
+
     followups = []
     for d in db.collection(followup_collection).where(key_name, "==", record_id).stream():
         item = d.to_dict() or {}
         followups.append({
             "time": item.get("contact_time") or item.get("created_at") or "",
-            "type": f"追蹤/{item.get('channel', 'LINE')}",
-            "text": item.get("content", ""),
+            "channel": item.get("channel", "LINE"),
+            "text": (item.get("content") or "").strip(),
+            "created_by_name": item.get("created_by_name", "") or "",
+            "sender_display_name": item.get("sender_display_name", "") or "",
         })
 
-    # 查詢紀錄只顯示後台主檔備註 + 後台追蹤紀錄
-    # 不顯示 line_logs 的 LINE 原始訊息內容
-    merged = note_blocks + followups
-    merged.sort(key=lambda x: x.get("time", ""), reverse=True)
+    followups = [x for x in followups if x.get("text")]
+    followups.sort(key=lambda x: x.get("time", ""), reverse=True)
 
-    header = [
-        f"查詢結果｜{data.get('name', '')}｜{data.get('phone', '')}",
-        f"類型：{'買方/客需' if target_type == 'buyer' else '賣方/委託'}",
-    ]
-    lines = header + [""]
+    lines = ["客戶資訊"]
 
-    count = 0
-    for item in merged:
-        if count >= limit:
-            break
-        text = (item.get("text") or "").strip()
-        if not text:
-            continue
-        time_text = item.get("time", "")
-        lines.append(f"【{item.get('type', '')}】{time_text}".strip())
-        lines.append(text)
-        lines.append("")
-        count += 1
+    if target_type == "buyer":
+        intent_map = {
+            "rent": "租屋",
+            "buy": "買賣",
+            "both": "租買皆可",
+        }
+        lines.extend([
+            f"姓名: {data.get('name', '')}",
+            f"電話: {data.get('phone', '')}",
+            f"客源來源: {data.get('source', '') or '-'}",
+            f"需求類型: {intent_map.get(data.get('intent_type', ''), data.get('intent_type', '') or '-')}",
+            f"預算: {data.get('budget_min', '') or data.get('rent_min', '') or '-'} ~ {data.get('budget_max', '') or data.get('rent_max', '') or '-'}",
+            f"偏好區域: {data.get('preferred_areas', '') or '-'}",
+            f"產品類型: {data.get('property_type', '') or '-'}",
+            f"房數需求: {data.get('room_range', '') or '-'}",
+            f"車位需求: {data.get('car_need', '') or '-'}",
+        ])
+    else:
+        deal_map = {
+            "sale": "買賣",
+            "rent": "出租",
+        }
+        lines.extend([
+            f"姓名: {data.get('name', '')}",
+            f"電話: {data.get('phone', '')}",
+            f"客源來源: {data.get('source', '') or '-'}",
+            f"委託類型: {deal_map.get(data.get('deal_type', ''), data.get('deal_type', '') or '-')}",
+            f"地址: {data.get('address', '') or '-'}",
+            f"產品類型: {data.get('property_type', '') or '-'}",
+            f"開價: {data.get('expected_price', '') or '-'}",
+            f"底價: {data.get('min_price', '') or '-'}",
+            f"委託到期日: {data.get('contract_end_date', '') or '-'}",
+        ])
 
-    if count == 0:
-        lines.append("查無備註或追蹤紀錄")
+    lines.append("")
+    lines.append("追蹤進度")
+
+    if not followups:
+        lines.append("目前沒有追蹤紀錄")
+    else:
+        for item in followups[:limit]:
+            header_parts = [item.get('time', ''), item.get('channel', 'LINE')]
+            creator = (item.get("created_by_name") or "").strip()
+            sender = (item.get("sender_display_name") or "").strip()
+            if creator:
+                header_parts.append(f"KEYIN: {creator}")
+            if sender:
+                header_parts.append(f"留言者: {sender}")
+            lines.append("｜".join([x for x in header_parts if x]))
+            lines.append(item.get("text", ""))
+            lines.append("")
 
     output = "\n".join(lines).strip()
     return output[:4500]
