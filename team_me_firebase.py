@@ -3684,7 +3684,8 @@ def parse_development_batch_message(raw_text: str):
     if not body:
         return []
 
-    chunks = [c.strip() for c in body.split("----") if c.strip()]
+    # 支援 --- 與 ---- 當分隔線；優先使用「獨立一行」的分隔，避免誤切備註內容。
+    chunks = [c.strip() for c in re.split(r"(?m)^-{3,}\s*$", body) if c.strip()]
     items = []
     for chunk in chunks:
         fields = {}
@@ -3720,6 +3721,15 @@ def parse_development_batch_message(raw_text: str):
     return items
 
 
+def infer_development_source(explicit_source: str, url: str) -> str:
+    explicit = (explicit_source or "").strip()
+    if explicit in ("掃街", "踩線"):
+        return explicit
+    if explicit and explicit.upper() != "LINE":
+        return explicit
+    return "踩線" if (url or "").strip() else "掃街"
+
+
 def create_development(fields, event):
     sender_name = get_line_sender_display_name(event) or "未知成員"
     phone = fields.get("phone", "").strip()
@@ -3730,7 +3740,7 @@ def create_development(fields, event):
     current_stage = normalize_development_status(fields.get("current_stage", "").strip() or fields.get("stage", "").strip() or "待聯繫")
     next_action = normalize_development_next_action(fields.get("next_action", "").strip())
     next_action_date = (fields.get("next_action_date", "") or fields.get("next_contact_date", "")).strip()
-    source = fields.get("source", "").strip() or "LINE"
+    source = infer_development_source(fields.get("source", ""), url)
 
     matches = []
     if phone:
@@ -3739,7 +3749,7 @@ def create_development(fields, event):
         matches = [d for d in db.collection("developments").stream() if (d.to_dict() or {}).get("address", "").strip() == address]
 
     labels = build_development_labels(fields.get("labels"))
-    summary_content = fields.get("content", "").strip() or fields.get("address", "").strip() or url or "LINE 新增開發"
+    summary_content = fields.get("content", "").strip() or address or url or "LINE 新增開發"
     note_content = build_line_summary(summary_content, event)
 
     payload = {
@@ -3749,7 +3759,6 @@ def create_development(fields, event):
         "url": url,
         "address": address,
         "registered_address": registered_address,
-        "current_stage": current_stage,
         "current_stage": current_stage,
         "stage": current_stage,
         "next_action": next_action,
@@ -3845,7 +3854,6 @@ def create_development(fields, event):
         "parsed_tag": "新增開發",
     }
 
-
 def create_development_batch(raw_text, event):
 
     items = parse_development_batch_message(raw_text)
@@ -3863,7 +3871,7 @@ def create_development_batch(raw_text, event):
         else:
             fail_count += 1
 
-    reply_text = f"批次開發處理完成：成功 {ok_count} 筆，失敗 {fail_count} 筆"
+    reply_text = f"批量註記完成：成功 {ok_count} 筆，失敗 {fail_count} 筆"
     if last_result and last_result.get("target_type") and last_result.get("target_id"):
         return {
             "handled": True,
@@ -4347,13 +4355,14 @@ def developments_new():
     next_action = normalize_development_next_action(form.get("next_action", "").strip())
     next_action_date = form.get("next_action_date", "").strip()
 
+    _manual_url = form.get("url", "").strip()
     data = {
         "name": form.get("name", "").strip() or "未填姓名",
         "phone": form.get("phone", "").strip(),
-        "source": form.get("source", "").strip(),
+        "source": infer_development_source(form.get("source", "").strip(), _manual_url),
         "address": form.get("address", "").strip(),
         "registered_address": form.get("registered_address", "").strip(),
-        "url": form.get("url", "").strip(),
+        "url": _manual_url,
         "current_stage": current_stage,
         "current_stage": current_stage,
         "stage": current_stage,
