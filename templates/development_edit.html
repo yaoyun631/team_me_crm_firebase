@@ -1,73 +1,35 @@
 {% extends "base.html" %}
 {% block content %}
-
 <h3 class="mb-3">編輯開發資料</h3>
-
 <div class="card">
   <div class="card-body">
     <form method="post">
-      <div class="mb-3">
-        <label class="form-label">姓名</label>
-        <input type="text" name="name" class="form-control" value="{{ development.name or '' }}">
-      </div>
-
-      <div class="row">
-        <div class="col-md-6 mb-3">
-          <label class="form-label">電話</label>
-          <input type="text" name="phone" class="form-control" value="{{ development.phone or '' }}">
-        </div>
-        <div class="col-md-6 mb-3">
-          <label class="form-label">來源</label>
-          <input type="text" name="source" class="form-control" value="{{ development.source or '' }}">
-        </div>
-      </div>
-
-      <div class="mb-3">
-        <label class="form-label">地址</label>
-        <input type="text" name="address" class="form-control" value="{{ development.address or '' }}">
-      </div>
-
-      <div class="mb-3">
-        <label class="form-label">戶籍地址</label>
-        <input type="text" name="registered_address" class="form-control" value="{{ development.registered_address or '' }}">
-      </div>
-
-      <div class="mb-3">
-        <label class="form-label">網址</label>
-        <input type="text" name="url" class="form-control" value="{{ development.url or '' }}">
-      </div>
-
-      <div class="mb-3">
-        <label class="form-label">進度</label>
-        <select name="stage" class="form-select">
-          {% for opt in stage_options %}
-            <option value="{{ opt }}" {% if development.stage == opt %}selected{% endif %}>{{ opt }}</option>
+      <div class="mb-3"><label class="form-label">姓名</label><input type="text" name="name" class="form-control" value="{{ development.name or '' }}"></div>
+      <div class="mb-3"><label class="form-label">電話</label><input type="text" name="phone" class="form-control" value="{{ development.phone or '' }}"></div>
+      <div class="mb-3"><label class="form-label">來源</label><input type="text" name="source" class="form-control" value="{{ development.source or '' }}"></div>
+      <div class="mb-3"><label class="form-label">地址</label><input type="text" name="address" class="form-control" value="{{ development.address or '' }}"></div>
+      <div class="mb-3"><label class="form-label">戶籍地址</label><input type="text" name="registered_address" class="form-control" value="{{ development.registered_address or '' }}"></div>
+      <div class="mb-3"><label class="form-label">網址</label><input type="text" name="url" class="form-control" value="{{ development.url or '' }}"></div>
+      <div class="mb-3"><label class="form-label">目前狀態</label>
+        <select name="current_stage" class="form-select">
+          {% for opt in status_options %}
+            <option value="{{ opt }}" {% if (development.current_stage or development.stage) == opt %}selected{% endif %}>{{ opt }}</option>
           {% endfor %}
         </select>
       </div>
-
-      <div class="mb-3">
-        <label class="form-label">內部備註</label>
-        <textarea name="note" class="form-control" rows="4">{{ development.note or '' }}</textarea>
+      <div class="mb-3"><label class="form-label">下一動作</label>
+        <select name="next_action" class="form-select">
+          <option value="">請選擇</option>
+          {% for opt in next_action_options %}
+            <option value="{{ opt }}" {% if development.next_action == opt %}selected{% endif %}>{{ opt }}</option>
+          {% endfor %}
+        </select>
       </div>
-
-      <div class="mb-3 text-muted">
-        <small>
-          建立時間：{{ development.created_at or "-" }}
-          {% if development.created_by_name %}｜建立者：{{ development.created_by_name }}{% endif %}
-        </small><br>
-        {% if development.updated_at %}
-          <small>
-            最後編輯時間：{{ development.updated_at }}
-            {% if development.updated_by_name %}｜編輯者：{{ development.updated_by_name }}{% endif %}
-          </small>
-        {% endif %}
-      </div>
-
+      <div class="mb-3"><label class="form-label">下次日期</label><input type="date" name="next_action_date" class="form-control" value="{{ development.next_action_date or '' }}"></div>
+      <div class="mb-3"><label class="form-label">內部備註</label><textarea name="note" class="form-control" rows="4">{{ development.note or '' }}</textarea></div>
       <button type="submit" class="btn btn-primary">儲存變更</button>
       <a href="{{ url_for('development_detail', development_id=development.id) }}" class="btn btn-secondary">取消</a>
     </form>
   </div>
 </div>
-
 {% endblock %}

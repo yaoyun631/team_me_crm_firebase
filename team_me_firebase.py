@@ -1,3 +1,16 @@
+# -*- coding: utf-8 -*-
+"""
+完整主程式版本（對應最新需求）
+- buyer 卡片式 + 顯示最後一筆追蹤
+- seller 卡片式（寬度較窄，由 templates/sellers.html 控制）
+- development 使用「目前狀況 / 下一步 / 下次時間」
+- LINE Bot 回覆：已註記客需 / 已註記委託 / 已註記開發
+
+注意：
+1. 這支檔案請直接覆蓋你目前的主程式，不要再疊 patch。
+2. 請搭配最新 templates/buyers.html、templates/sellers.html、templates/developments.html 使用。
+"""
+
 from flask import (
     Flask, render_template, request, redirect,
     url_for, flash, session, Response, Blueprint
@@ -810,7 +823,7 @@ def create_buyer_need(fields, event):
         return {
             "handled": True,
             "ok": True,
-            "reply_text": f"已更新既有客需：{updated_doc.get('name', '')}",
+            "reply_text": f"已註記客需：{updated_doc.get('name', '')}",
             "target_type": "buyer",
             "target_id": doc.id,
             "customer_name": updated_doc.get("name", ""),
@@ -844,7 +857,7 @@ def create_buyer_need(fields, event):
     return {
         "handled": True,
         "ok": True,
-        "reply_text": f"已新增客需：{payload['name']}（{'租' if intent_type == 'rent' else '買賣'}）",
+        "reply_text": f"已註記客需：{payload['name']}（{'租' if intent_type == 'rent' else '買賣'}）",
         "target_type": "buyer",
         "target_id": doc_ref.id,
         "customer_name": payload["name"],
@@ -909,7 +922,7 @@ def create_seller_listing(fields, event):
         return {
             "handled": True,
             "ok": True,
-            "reply_text": f"已更新既有委託：{updated_doc.get('name', '')}",
+            "reply_text": f"已註記委託：{updated_doc.get('name', '')}",
             "target_type": "seller",
             "target_id": doc.id,
             "customer_name": updated_doc.get("name", ""),
@@ -943,7 +956,7 @@ def create_seller_listing(fields, event):
     return {
         "handled": True,
         "ok": True,
-        "reply_text": f"已新增委託：{payload['name']}（{'出租' if deal_type == 'rent' else '買賣'}）",
+        "reply_text": f"已註記委託：{payload['name']}（{'出租' if deal_type == 'rent' else '買賣'}）",
         "target_type": "seller",
         "target_id": doc_ref.id,
         "customer_name": payload["name"],
@@ -1110,7 +1123,7 @@ def process_quote_context_message(event):
     return {
         "handled": True,
         "ok": True,
-        "reply_text": f"已註記到{'買方' if target_type == 'buyer' else '賣方'}：{(doc.to_dict() or {}).get('name', '')}",
+        "reply_text": f"已註記到{'客需' if target_type == 'buyer' else '委託'}：{(doc.to_dict() or {}).get('name', '')}",
         "target_type": target_type,
         "target_id": target_id,
         "customer_name": (doc.to_dict() or {}).get("name", ""),
@@ -1260,6 +1273,41 @@ def build_label_options(*doc_lists):
     return sorted(label_set)
 
 
+BUYER_STAGE_OPTIONS = [
+    "待聯繫",
+    "已聯繫",
+    "帶看中",
+    "持續追蹤",
+    "成交",
+    "無效",
+]
+
+SELLER_STAGE_OPTIONS = [
+    "待聯繫",
+    "已聯繫",
+    "持續追蹤",
+    "委託中",
+    "成交",
+    "無效",
+]
+
+def attach_latest_followup(records, followup_collection, key_name):
+    followups = [doc_to_dict(d) for d in db.collection(followup_collection).stream()]
+    latest_map = {}
+    for f in followups:
+        rid = f.get(key_name)
+        if not rid:
+            continue
+        ts = f.get("contact_time") or f.get("created_at") or ""
+        prev = latest_map.get(rid)
+        prev_ts = (prev or {}).get("contact_time") or (prev or {}).get("created_at") or ""
+        if (not prev) or ts > prev_ts:
+            latest_map[rid] = f
+    for item in records:
+        item["latest_followup"] = latest_map.get(item.get("id"))
+    return records
+
+
 
 
 
@@ -1368,7 +1416,7 @@ def buyers():
         buyers_list = [b for b in buyers_list if b.get("intent_type") == intent_type]
 
     if stage:
-        buyers_list = [b for b in buyers_list if b.get("stage") == stage]
+        buyers_list = [b for b in buyers_list if (b.get("stage") or "") == stage]
 
     if source:
         buyers_list = [b for b in buyers_list if (b.get("source") or "") == source]
@@ -1377,10 +1425,7 @@ def buyers():
         buyers_list = [b for b in buyers_list if label in ensure_list(b.get("labels"))]
 
     def parse_created_at(b):
-        v = b.get("created_at")
-        if not v:
-            return ""
-        return v
+        return b.get("created_at") or ""
 
     if sort_by == "created_at_asc":
         buyers_list.sort(key=parse_created_at)
@@ -1390,6 +1435,8 @@ def buyers():
         buyers_list.sort(key=lambda b: (b.get("name") or ""))
     elif sort_by == "name_desc":
         buyers_list.sort(key=lambda b: (b.get("name") or ""), reverse=True)
+
+    buyers_list = attach_latest_followup(buyers_list, "buyer_followups", "buyer_id")
 
     return render_template(
         "buyers.html",
@@ -1403,8 +1450,8 @@ def buyers():
         label=label,
         label_options=label_options,
         sort_by=sort_by,
+        buyer_stage_options=BUYER_STAGE_OPTIONS,
     )
-
 
 
 # ========= 新增買方 =========
@@ -1776,7 +1823,7 @@ def sellers():
         sellers_list = [s for s in sellers_list if s.get("level") == level]
 
     if stage:
-        sellers_list = [s for s in sellers_list if s.get("stage") == stage]
+        sellers_list = [s for s in sellers_list if (s.get("stage") or "") == stage]
 
     if source:
         sellers_list = [s for s in sellers_list if (s.get("source") or "") == source]
@@ -1785,10 +1832,7 @@ def sellers():
         sellers_list = [s for s in sellers_list if label in ensure_list(s.get("labels"))]
 
     def parse_created_at(s):
-        v = s.get("created_at")
-        if not v:
-            return ""
-        return v
+        return s.get("created_at") or ""
 
     if sort_by == "created_at_asc":
         sellers_list.sort(key=parse_created_at)
@@ -1798,6 +1842,8 @@ def sellers():
         sellers_list.sort(key=lambda s: (s.get("name") or ""))
     elif sort_by == "name_desc":
         sellers_list.sort(key=lambda s: (s.get("name") or ""), reverse=True)
+
+    sellers_list = attach_latest_followup(sellers_list, "seller_followups", "seller_id")
 
     return render_template(
         "sellers.html",
@@ -1810,6 +1856,7 @@ def sellers():
         label=label,
         label_options=label_options,
         sort_by=sort_by,
+        seller_stage_options=SELLER_STAGE_OPTIONS,
     )
 
 
@@ -1833,6 +1880,8 @@ def sellers_new():
     timeline = form.get("timeline", "").strip()
     occupancy_status = form.get("occupancy_status", "").strip()
     contract_end_date = form.get("contract_end_date", "").strip()
+    next_action = form.get("next_action", "").strip()
+    next_contact_date = form.get("next_contact_date", "").strip()
     note = form.get("note", "").strip()
     labels = get_request_labels(form)
 
@@ -1877,6 +1926,8 @@ def sellers_new():
         "timeline": timeline,
         "occupancy_status": occupancy_status,
         "contract_end_date": contract_end_date,
+        "next_action": next_action,
+        "next_contact_date": next_contact_date,
         "note": note,
         "labels": labels,
         "source": source,               # ⭐ 加進 Firestore
@@ -2754,7 +2805,10 @@ def create_development(fields, event):
         "phone": phone,
         "source": fields.get("source", "").strip() or "LINE",
         "url": url,
-        "stage": fields.get("stage", "").strip() or "待追蹤",
+        "current_stage": normalize_development_status(fields.get("current_stage", "").strip() or fields.get("stage", "").strip() or "待聯繫"),
+        "stage": normalize_development_status(fields.get("current_stage", "").strip() or fields.get("stage", "").strip() or "待聯繫"),
+        "next_action": normalize_development_next_action(fields.get("next_action", "").strip()),
+        "next_action_date": fields.get("next_action_date", "").strip() or fields.get("next_contact_date", "").strip(),
         "record_date": fields.get("record_date", "").strip() or datetime.now().strftime("%Y-%m-%d"),
         "note": "",
         "labels": labels,
@@ -2781,6 +2835,8 @@ def create_development(fields, event):
             target_type="development",
             customer_id=doc.id,
             content=note_content,
+            next_action=payload.get("next_action", ""),
+            next_contact_date=payload.get("next_action_date", ""),
             labels=labels,
             line_event=event,
         )
@@ -2788,7 +2844,7 @@ def create_development(fields, event):
         return {
             "handled": True,
             "ok": True,
-            "reply_text": f"已更新既有開發：{updated_doc.get('name', '')}",
+            "reply_text": f"已註記開發：{updated_doc.get('name', '')}",
             "target_type": "development",
             "target_id": doc.id,
             "customer_name": updated_doc.get("name", ""),
@@ -2816,13 +2872,15 @@ def create_development(fields, event):
         target_type="development",
         customer_id=doc_ref.id,
         content=note_content,
+        next_action=payload.get("next_action", ""),
+        next_contact_date=payload.get("next_action_date", ""),
         labels=labels,
         line_event=event,
     )
     return {
         "handled": True,
         "ok": True,
-        "reply_text": f"已新增開發：{payload['name']}",
+        "reply_text": f"已註記開發：{payload['name']}",
         "target_type": "development",
         "target_id": doc_ref.id,
         "customer_name": payload["name"],
@@ -3135,41 +3193,87 @@ def delete_by_field(collection_name, field_name, field_value):
 
 
 
-# ========= 開發模組加強：進度下拉、戶籍地址、批次掃街、LINE 即時更新 =========
 
-DEVELOPMENT_STAGE_OPTIONS = [
-    "待聯繫",
-    "已聯繫",
-    "再聯繫",
+# ========= 開發模組加強：目前狀態 / 下一動作 / 下次日期、戶籍地址、批次掃街、LINE 即時更新 =========
+
+DEVELOPMENT_STATUS_OPTIONS = [
     "待調謄本",
     "已調謄本",
-    "已寄開發信",
+    "待寄開發信",
+    "已寄開發信待跑開發",
+    "已跑開發",
+    "待聯繫",
+    "已聯繫",
+    "持續追蹤",
     "已簽回",
     "已拋轉客需",
     "已拋轉委託",
     "無效",
 ]
+
+DEVELOPMENT_NEXT_ACTION_OPTIONS = [
+    "調謄本",
+    "寄開發信",
+    "跑開發",
+    "電話聯繫",
+    "LINE聯繫",
+    "再次聯繫",
+    "現場拜訪",
+    "約面談",
+    "簽回委託",
+    "拋轉客需",
+    "拋轉委託",
+    "暫不處理",
+    "結案",
+]
+
 DEVELOPMENT_HIDDEN_BY_DEFAULT = {"已簽回", "已拋轉客需", "已拋轉委託"}
 
 
-def normalize_development_stage(raw: str) -> str:
+def normalize_development_status(raw: str) -> str:
     v = (raw or "").strip()
     mapping = {
+        "待調謄本": "待調謄本",
+        "已調謄本": "已調謄本",
+        "待寄開發信": "待寄開發信",
+        "已寄開發信": "已寄開發信待跑開發",
+        "已寄開發信待跑開發": "已寄開發信待跑開發",
+        "寄出開發信": "已寄開發信待跑開發",
+        "已跑開發": "已跑開發",
         "待聯絡": "待聯繫",
         "待聯繫": "待聯繫",
         "已聯絡": "已聯繫",
         "已連繫": "已聯繫",
         "已聯繫": "已聯繫",
-        "再聯絡": "再聯繫",
-        "再聯繫": "再聯繫",
-        "待調謄本": "待調謄本",
-        "已調謄本": "已調謄本",
-        "已寄開發信": "已寄開發信",
-        "寄開發信": "已寄開發信",
+        "再聯絡": "持續追蹤",
+        "再聯繫": "持續追蹤",
+        "持續追蹤": "持續追蹤",
         "已簽回": "已簽回",
         "已拋轉客需": "已拋轉客需",
         "已拋轉委託": "已拋轉委託",
         "無效": "無效",
+    }
+    return mapping.get(v, v)
+
+def normalize_development_next_action(raw: str) -> str:
+    v = (raw or "").strip()
+    mapping = {
+        "調謄本": "調謄本",
+        "寄開發信": "寄開發信",
+        "跑開發": "跑開發",
+        "電話聯絡": "電話聯繫",
+        "電話聯繫": "電話聯繫",
+        "LINE聯絡": "LINE聯繫",
+        "LINE聯繫": "LINE聯繫",
+        "再次聯絡": "再次聯繫",
+        "再次聯繫": "再次聯繫",
+        "現場拜訪": "現場拜訪",
+        "約面談": "約面談",
+        "簽回委託": "簽回委託",
+        "拋轉客需": "拋轉客需",
+        "拋轉委託": "拋轉委託",
+        "暫不處理": "暫不處理",
+        "結案": "結案",
     }
     return mapping.get(v, v)
 
@@ -3207,6 +3311,10 @@ def normalize_line_key(key: str):
         "進程": "stage",
         "階段": "stage",
         "狀態": "stage",
+        "目前狀態": "current_stage",
+        "下一動作": "next_action",
+        "下次日期": "next_action_date",
+        "下次動作日期": "next_action_date",
         "標籤": "labels",
         "分類": "labels",
         "labels": "labels",
@@ -3305,6 +3413,7 @@ def resolve_customer_record(fields, preferred_target_type=""):
     return "", None
 
 
+
 def update_customer_note_and_labels(target_type: str, doc_ref, content: str, labels=None, stage="", source="LINE", event=None, registered_address="", extra_updates=None):
     labels = dedupe_keep_order(["LINE紀錄"] + ensure_list(labels))
     snapshot = doc_ref.get()
@@ -3327,18 +3436,46 @@ def update_customer_note_and_labels(target_type: str, doc_ref, content: str, lab
     if target_type == "development" and registered_address:
         updates["registered_address"] = registered_address
     if extra_updates:
-        updates.update({k: v for k, v in extra_updates.items() if v not in (None, "")})
+        cleaned = {k: v for k, v in extra_updates.items() if v not in (None, "")}
+    
+    if target_type == "development":
+        updates, note_text = parse_reply_field_updates(raw_text)
 
-    doc_ref.update(updates)
+        extra_updates = {k: v for k, v in updates.items() if k in ("address", "phone", "name", "url", "current_stage", "next_action", "next_action_date")}
+        if updates:
+            update_customer_note_and_labels(
+                target_type="development",
+                doc_ref=doc_ref,
+                content=note_text or reply_only_text,
+                labels=labels,
+                stage=updates.get("current_stage", ""),
+                source=updates.get("source", "LINE"),
+                event=event,
+                registered_address=updates.get("registered_address", ""),
+                extra_updates=extra_updates,
+            )
+        else:
+            update_customer_note_and_labels(
+                target_type="development",
+                doc_ref=doc_ref,
+                content=reply_only_text,
+                labels=labels,
+                source="LINE",
+                event=event,
+            )
 
-
-def add_customer_followup(target_type: str, customer_id: str, content: str, next_action="", next_contact_date="", labels=None, line_event=None, stage="", registered_address="", channel="LINE"):
-    if target_type == "buyer":
-        collection_name = "buyer_followups"
-        key_name = "buyer_id"
-    elif target_type == "seller":
-        collection_name = "seller_followups"
-        key_name = "seller_id"
+        followup_text = note_text or reply_only_text or "更新開發資料"
+        add_customer_followup(
+            target_type="development",
+            customer_id=target_id,
+            content=followup_text,
+            labels=labels,
+            line_event=event,
+            current_stage=updates.get("current_stage", "") if updates else "",
+            registered_address=updates.get("registered_address", "") if updates else "",
+            next_action=updates.get("next_action", "") if updates else "",
+            next_action_date=updates.get("next_action_date", "") if updates else "",
+        )
     else:
         collection_name = "development_followups"
         key_name = "development_id"
@@ -3358,8 +3495,13 @@ def add_customer_followup(target_type: str, customer_id: str, content: str, next
         "sender_display_name": sender_display_name,
     }
     if target_type == "development":
-        data["stage"] = normalize_development_stage(stage)
+        cs = normalize_development_status(current_stage or stage)
+        na = normalize_development_next_action(next_action)
+        data["current_stage"] = cs
+        data["stage"] = cs
         data["registered_address"] = registered_address.strip() if registered_address else ""
+        data["next_action"] = na
+        data["next_action_date"] = (next_action_date or next_contact_date or "").strip()
 
     if line_event:
         source = line_event.get("source", {})
@@ -3434,7 +3576,7 @@ def parse_line_formatted_message(text: str):
     fields["deal_type"] = normalize_deal_type(fields.get("deal_type_raw", ""))
     fields["limit"] = parse_int_limit(fields.get("limit", 10), default=10, max_value=30)
     if fields.get("stage"):
-        fields["stage"] = normalize_development_stage(fields.get("stage", ""))
+        fields["stage"] = normalize_development_status(fields.get("stage", ""))
 
     if action == "create_buyer_need":
         if not (fields.get("name") and fields.get("phone") and fields.get("source")):
@@ -3532,9 +3674,9 @@ def parse_potential_development_freeform(text: str):
     }
 
 
+
 def parse_development_batch_message(raw_text: str):
     text = (raw_text or "").replace("\r\n", "\n").strip()
-    # 去掉第一行 #新增開發批次
     lines = text.split("\n")
     if lines and lines[0].strip().startswith("#"):
         lines = lines[1:]
@@ -3563,10 +3705,16 @@ def parse_development_batch_message(raw_text: str):
                 notes.append(ln)
         if notes:
             fields["content"] = (fields.get("content", "") + ("\n" if fields.get("content") else "") + "\n".join(notes)).strip()
-        if not fields.get("stage"):
-            fields["stage"] = "待聯繫"
+
+        if not fields.get("current_stage"):
+            fields["current_stage"] = normalize_development_status(fields.get("stage", "") or "待聯繫")
         else:
-            fields["stage"] = normalize_development_stage(fields["stage"])
+            fields["current_stage"] = normalize_development_status(fields["current_stage"])
+        fields["stage"] = fields["current_stage"]
+
+        if fields.get("next_action"):
+            fields["next_action"] = normalize_development_next_action(fields["next_action"])
+
         if fields.get("name") or fields.get("phone") or fields.get("address") or fields.get("url") or fields.get("content"):
             items.append(fields)
     return items
@@ -3579,7 +3727,9 @@ def create_development(fields, event):
     url = fields.get("url", "").strip()
     address = fields.get("address", "").strip()
     registered_address = fields.get("registered_address", "").strip()
-    stage = normalize_development_stage(fields.get("stage", "").strip() or "待聯繫")
+    current_stage = normalize_development_status(fields.get("current_stage", "").strip() or fields.get("stage", "").strip() or "待聯繫")
+    next_action = normalize_development_next_action(fields.get("next_action", "").strip())
+    next_action_date = (fields.get("next_action_date", "") or fields.get("next_contact_date", "")).strip()
     source = fields.get("source", "").strip() or "LINE"
 
     matches = []
@@ -3599,7 +3749,11 @@ def create_development(fields, event):
         "url": url,
         "address": address,
         "registered_address": registered_address,
-        "stage": stage,
+        "current_stage": current_stage,
+        "current_stage": current_stage,
+        "stage": current_stage,
+        "next_action": next_action,
+        "next_action_date": next_action_date,
         "record_date": fields.get("record_date", "").strip() or datetime.now().strftime("%Y-%m-%d"),
         "note": "",
         "labels": labels,
@@ -3617,11 +3771,18 @@ def create_development(fields, event):
             doc_ref=doc_ref,
             content=note_content,
             labels=labels,
-            stage=stage,
+            stage=current_stage,
             source=source,
             event=event,
             registered_address=registered_address,
-            extra_updates={"address": address, "url": url, "name": name},
+            extra_updates={
+                "address": address,
+                "url": url,
+                "name": name,
+                "current_stage": current_stage,
+                "next_action": next_action,
+                "next_action_date": next_action_date,
+            },
         )
         add_customer_followup(
             target_type="development",
@@ -3629,14 +3790,16 @@ def create_development(fields, event):
             content=note_content,
             labels=labels,
             line_event=event,
-            stage=stage,
+            current_stage=current_stage,
             registered_address=registered_address,
+            next_action=next_action,
+            next_action_date=next_action_date,
         )
         updated_doc = doc_ref.get().to_dict() or {}
         return {
             "handled": True,
             "ok": True,
-            "reply_text": f"已更新既有開發：{updated_doc.get('name', '')}",
+            "reply_text": f"已註記開發：{updated_doc.get('name', '')}",
             "target_type": "development",
             "target_id": doc.id,
             "customer_name": updated_doc.get("name", ""),
@@ -3666,13 +3829,15 @@ def create_development(fields, event):
         content=note_content,
         labels=labels,
         line_event=event,
-        stage=stage,
+        current_stage=current_stage,
         registered_address=registered_address,
+        next_action=next_action,
+        next_action_date=next_action_date,
     )
     return {
         "handled": True,
         "ok": True,
-        "reply_text": f"已新增開發：{payload['name']}",
+        "reply_text": f"已註記開發：{payload['name']}",
         "target_type": "development",
         "target_id": doc_ref.id,
         "customer_name": payload["name"],
@@ -3682,6 +3847,7 @@ def create_development(fields, event):
 
 
 def create_development_batch(raw_text, event):
+
     items = parse_development_batch_message(raw_text)
     if not items:
         return {"handled": True, "ok": False, "reply_text": "未寫入：#新增開發批次 沒有解析到有效資料"}
@@ -3712,27 +3878,48 @@ def create_development_batch(raw_text, event):
     return {"handled": True, "ok": ok_count > 0, "reply_text": reply_text}
 
 
+
 def parse_reply_field_updates(text: str):
     updates = {}
+    note_lines = []
+
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line:
             continue
+
         if "：" in line:
             key, value = line.split("：", 1)
         elif ":" in line:
             key, value = line.split(":", 1)
         else:
+            maybe_status = normalize_development_status(line)
+            maybe_action = normalize_development_next_action(line)
+            if maybe_status in DEVELOPMENT_STATUS_OPTIONS:
+                updates["current_stage"] = maybe_status
+            elif maybe_action in DEVELOPMENT_NEXT_ACTION_OPTIONS:
+                updates["next_action"] = maybe_action
+            else:
+                note_lines.append(line)
             continue
+
         key = normalize_line_key(key.strip())
         value = value.strip()
-        if key == "stage":
-            updates["stage"] = normalize_development_stage(value)
+
+        if key in ("stage", "current_stage"):
+            updates["current_stage"] = normalize_development_status(value)
         elif key == "registered_address":
             updates["registered_address"] = value
+        elif key == "next_action":
+            updates["next_action"] = normalize_development_next_action(value)
+        elif key in ("next_action_date", "next_contact_date"):
+            updates["next_action_date"] = value
         elif key in ("address", "phone", "name", "url", "source"):
             updates[key] = value
-    return updates
+        elif key == "content":
+            note_lines.append(value)
+
+    return updates, "\n".join(note_lines).strip()
 
 
 def process_quote_context_message(event):
@@ -4027,7 +4214,7 @@ def process_line_message_event(event):
                     "doc_ref": doc_ref,
                     "content": summary_text,
                     "labels": labels,
-                    "stage": normalize_development_stage(fields.get("stage", "")) if target_type == "development" else fields.get("stage", ""),
+                    "stage": normalize_development_status(fields.get("stage", "")) if target_type == "development" else fields.get("stage", ""),
                     "source": fields.get("source", "LINE"),
                     "event": event,
                 }
@@ -4049,7 +4236,7 @@ def process_line_message_event(event):
                         next_contact_date=fields.get("next_contact_date", ""),
                         labels=labels,
                         line_event=event,
-                        stage=normalize_development_stage(fields.get("stage", "")) if target_type == "development" else "",
+                        stage=normalize_development_status(fields.get("stage", "")) if target_type == "development" else "",
                         registered_address=fields.get("registered_address", "") if target_type == "development" else "",
                     )
 
@@ -4090,26 +4277,21 @@ def process_line_message_event(event):
     return result
 
 
+
 @app.route("/developments")
 @login_required
 def developments():
     q = request.args.get("q", "").strip()
-    stage = request.args.get("stage", "").strip()
+    current_stage = request.args.get("current_stage", "").strip()
+    next_action = request.args.get("next_action", "").strip()
     source = request.args.get("source", "").strip()
     sort_by = request.args.get("sort_by", "created_at_desc")
     show_done = request.args.get("show_done", "").strip()
 
     docs = db.collection("developments").stream()
-    all_items = [doc_to_dict(d) for d in docs]
+    items = [doc_to_dict(d) for d in docs]
+    source_options = sorted({(x.get("source") or "").strip() for x in items if (x.get("source") or "").strip()})
 
-    source_set = set()
-    for item in all_items:
-        s = (item.get("source") or "").strip()
-        if s:
-            source_set.add(s)
-    source_options = sorted(source_set)
-
-    items = list(all_items)
     if q:
         items = [
             x for x in items
@@ -4118,18 +4300,23 @@ def developments():
             or q in (x.get("address") or "")
             or q in (x.get("registered_address") or "")
         ]
-    if stage:
-        items = [x for x in items if (x.get("stage") or "") == stage]
+
+    if current_stage:
+        items = [x for x in items if (x.get("current_stage") or x.get("stage") or "") == current_stage]
+    if next_action:
+        items = [x for x in items if (x.get("next_action") or "") == next_action]
     if source:
         items = [x for x in items if (x.get("source") or "") == source]
     if show_done != "1":
-        items = [x for x in items if (x.get("stage") or "") not in DEVELOPMENT_HIDDEN_BY_DEFAULT]
+        items = [x for x in items if (x.get("current_stage") or x.get("stage") or "") not in DEVELOPMENT_HIDDEN_BY_DEFAULT]
 
     def parse_created_at(x):
-        return x.get("record_date") or x.get("created_at") or ""
+        return x.get("created_at") or ""
 
     if sort_by == "created_at_asc":
         items.sort(key=parse_created_at)
+    elif sort_by == "created_at_desc":
+        items.sort(key=parse_created_at, reverse=True)
     elif sort_by == "name_asc":
         items.sort(key=lambda x: (x.get("name") or ""))
     elif sort_by == "name_desc":
@@ -4141,12 +4328,14 @@ def developments():
         "developments.html",
         developments=items,
         q=q,
-        stage=stage,
+        current_stage=current_stage,
+        next_action=next_action,
         source=source,
         source_options=source_options,
         show_done=show_done,
         sort_by=sort_by,
-        stage_options=DEVELOPMENT_STAGE_OPTIONS,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
     )
 
 
@@ -4154,6 +4343,10 @@ def developments():
 @login_required
 def developments_new():
     form = request.form
+    current_stage = normalize_development_status(form.get("current_stage", "").strip() or form.get("stage", "").strip() or "待聯繫")
+    next_action = normalize_development_next_action(form.get("next_action", "").strip())
+    next_action_date = form.get("next_action_date", "").strip()
+
     data = {
         "name": form.get("name", "").strip() or "未填姓名",
         "phone": form.get("phone", "").strip(),
@@ -4161,7 +4354,11 @@ def developments_new():
         "address": form.get("address", "").strip(),
         "registered_address": form.get("registered_address", "").strip(),
         "url": form.get("url", "").strip(),
-        "stage": normalize_development_stage(form.get("stage", "").strip() or "待聯繫"),
+        "current_stage": current_stage,
+        "current_stage": current_stage,
+        "stage": current_stage,
+        "next_action": next_action,
+        "next_action_date": next_action_date,
         "note": form.get("note", "").strip(),
         "record_date": datetime.now().strftime("%Y-%m-%d"),
         "created_at": datetime.now().isoformat(),
@@ -4182,11 +4379,13 @@ def developments_new():
             "development_id": doc_ref.id,
             "contact_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "channel": "手動新增",
-            "stage": data["stage"],
+            "current_stage": current_stage,
+            "stage": current_stage,
+            "next_action": next_action,
+            "next_action_date": next_action_date,
             "registered_address": data["registered_address"],
             "content": data["note"],
-            "next_action": "",
-            "next_contact_date": "",
+            "next_contact_date": next_action_date,
             "created_at": datetime.now().isoformat(),
             "created_by_id": session.get("user_id"),
             "created_by_name": session.get("user_name"),
@@ -4213,24 +4412,38 @@ def development_detail(development_id):
         "development_detail.html",
         development=development,
         followups=followups,
-        stage_options=DEVELOPMENT_STAGE_OPTIONS,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
     )
 
 
+@app.route("/developments/<development_id>/quick-flow", methods=["POST"])
 @app.route("/developments/<development_id>/quick-stage", methods=["POST"])
 @login_required
-def development_quick_stage(development_id):
-    stage = normalize_development_stage(request.form.get("stage", "").strip())
-    if not stage:
-        flash("請選擇進度", "warning")
+def development_quick_flow(development_id):
+    current_stage = normalize_development_status(request.form.get("current_stage", "").strip() or request.form.get("stage", "").strip())
+    next_action = normalize_development_next_action(request.form.get("next_action", "").strip())
+    next_action_date = request.form.get("next_action_date", "").strip()
+
+    if not current_stage and not next_action and not next_action_date:
+        flash("請至少調整一個欄位", "warning")
         return redirect(request.referrer or url_for("developments"))
-    db.collection("developments").document(development_id).update({
-        "stage": stage,
+
+    updates = {
         "updated_at": datetime.now().isoformat(),
         "updated_by_id": session.get("user_id"),
         "updated_by_name": session.get("user_name"),
-    })
-    flash("已更新開發進度", "success")
+    }
+    if current_stage:
+        updates["current_stage"] = current_stage
+        updates["stage"] = current_stage
+    if next_action:
+        updates["next_action"] = next_action
+    if next_action_date:
+        updates["next_action_date"] = next_action_date
+
+    db.collection("developments").document(development_id).update(updates)
+    flash("已更新開發流程", "success")
     return redirect(request.referrer or url_for("developments"))
 
 
@@ -4239,22 +4452,28 @@ def development_quick_stage(development_id):
 def add_development_followup(development_id):
     contact_time = request.form.get("contact_time", "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M")
     channel = request.form.get("channel", "").strip()
-    stage = normalize_development_stage(request.form.get("stage", "").strip())
+    current_stage = normalize_development_status(request.form.get("current_stage", "").strip() or request.form.get("stage", "").strip())
+    next_action = normalize_development_next_action(request.form.get("next_action", "").strip())
+    next_action_date = request.form.get("next_action_date", "").strip() or request.form.get("next_contact_date", "").strip()
     registered_address = request.form.get("registered_address", "").strip()
     content = request.form.get("content", "").strip()
-    next_action = request.form.get("next_action", "").strip()
-    next_contact_date = request.form.get("next_contact_date", "").strip()
+    note_extra = request.form.get("note", "").strip()
+    if note_extra:
+        content = (content + ("\n" if content else "") + note_extra).strip()
 
     now = datetime.now().isoformat()
     db.collection("development_followups").add({
         "development_id": development_id,
         "contact_time": contact_time,
         "channel": channel,
-        "stage": stage,
+        "current_stage": current_stage,
+        "current_stage": current_stage,
+        "stage": current_stage,
+        "next_action": next_action,
+        "next_action_date": next_action_date,
         "registered_address": registered_address,
         "content": content,
-        "next_action": next_action,
-        "next_contact_date": next_contact_date,
+        "next_contact_date": next_action_date,
         "created_at": now,
         "created_by_id": session.get("user_id"),
         "created_by_name": session.get("user_name"),
@@ -4266,8 +4485,13 @@ def add_development_followup(development_id):
         "updated_by_id": session.get("user_id"),
         "updated_by_name": session.get("user_name"),
     }
-    if stage:
-        updates["stage"] = stage
+    if current_stage:
+        updates["current_stage"] = current_stage
+        updates["stage"] = current_stage
+    if next_action:
+        updates["next_action"] = next_action
+    if next_action_date:
+        updates["next_action_date"] = next_action_date
     if registered_address:
         updates["registered_address"] = registered_address
 
@@ -4294,6 +4518,9 @@ def development_edit(development_id):
     development = doc_to_dict(doc)
     if request.method == "POST":
         form = request.form
+        current_stage = normalize_development_status(form.get("current_stage", "").strip() or form.get("stage", "").strip())
+        next_action = normalize_development_next_action(form.get("next_action", "").strip())
+        next_action_date = form.get("next_action_date", "").strip()
         updated = {
             "name": form.get("name", "").strip() or "未填姓名",
             "phone": form.get("phone", "").strip(),
@@ -4301,7 +4528,10 @@ def development_edit(development_id):
             "address": form.get("address", "").strip(),
             "registered_address": form.get("registered_address", "").strip(),
             "url": form.get("url", "").strip(),
-            "stage": normalize_development_stage(form.get("stage", "").strip()),
+            "current_stage": current_stage,
+            "stage": current_stage,
+            "next_action": next_action,
+            "next_action_date": next_action_date,
             "note": form.get("note", "").strip(),
             "updated_at": datetime.now().isoformat(),
             "updated_by_id": session.get("user_id"),
@@ -4311,7 +4541,12 @@ def development_edit(development_id):
         flash("已更新開發資料", "success")
         return redirect(url_for("development_detail", development_id=development_id))
 
-    return render_template("development_edit.html", development=development, stage_options=DEVELOPMENT_STAGE_OPTIONS)
+    return render_template(
+        "development_edit.html",
+        development=development,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+    )
 
 
 @app.route("/developments/<development_id>/delete", methods=["POST"])
@@ -4336,20 +4571,22 @@ def development_followup_edit(development_id, followup_id):
     if request.method == "POST":
         contact_time = request.form.get("contact_time", "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M")
         channel = request.form.get("channel", "").strip()
-        stage = normalize_development_stage(request.form.get("stage", "").strip())
+        current_stage = normalize_development_status(request.form.get("current_stage", "").strip() or request.form.get("stage", "").strip())
+        next_action = normalize_development_next_action(request.form.get("next_action", "").strip())
+        next_action_date = request.form.get("next_action_date", "").strip() or request.form.get("next_contact_date", "").strip()
         registered_address = request.form.get("registered_address", "").strip()
         content = request.form.get("content", "").strip()
-        next_action = request.form.get("next_action", "").strip()
-        next_contact_date = request.form.get("next_contact_date", "").strip()
 
         doc_ref.update({
             "contact_time": contact_time,
             "channel": channel,
-            "stage": stage,
+            "current_stage": current_stage,
+            "stage": current_stage,
+            "next_action": next_action,
+            "next_action_date": next_action_date,
             "registered_address": registered_address,
             "content": content,
-            "next_action": next_action,
-            "next_contact_date": next_contact_date,
+            "next_contact_date": next_action_date,
         })
 
         updates = {
@@ -4357,8 +4594,13 @@ def development_followup_edit(development_id, followup_id):
             "updated_by_id": session.get("user_id"),
             "updated_by_name": session.get("user_name"),
         }
-        if stage:
-            updates["stage"] = stage
+        if current_stage:
+            updates["current_stage"] = current_stage
+            updates["stage"] = current_stage
+        if next_action:
+            updates["next_action"] = next_action
+        if next_action_date:
+            updates["next_action_date"] = next_action_date
         if registered_address:
             updates["registered_address"] = registered_address
         db.collection("developments").document(development_id).update(updates)
@@ -4370,7 +4612,8 @@ def development_followup_edit(development_id, followup_id):
         "development_followup_edit.html",
         development_id=development_id,
         followup=followup,
-        stage_options=DEVELOPMENT_STAGE_OPTIONS,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
     )
 
 
@@ -4387,10 +4630,9 @@ def development_followup_delete(development_id, followup_id):
 def download_developments():
     docs = db.collection("developments").stream()
     rows = [doc_to_dict(d) for d in docs]
-
     si = StringIO()
     writer = csv.writer(si)
-    writer.writerow(["id","日期","姓名","電話","地址","戶籍地址","網址","進度","來源","內部備註","建立時間","建立者"])
+    writer.writerow(["id","日期","姓名","電話","地址","戶籍地址","網址","目前狀態","下一動作","下次日期","來源","內部備註","建立時間","建立者"])
     for r in rows:
         writer.writerow([
             r.get("id",""),
@@ -4400,7 +4642,9 @@ def download_developments():
             r.get("address",""),
             r.get("registered_address",""),
             r.get("url",""),
-            r.get("stage",""),
+            r.get("current_stage","") or r.get("stage",""),
+            r.get("next_action",""),
+            r.get("next_action_date",""),
             r.get("source",""),
             r.get("note",""),
             r.get("created_at",""),
@@ -4410,6 +4654,7 @@ def download_developments():
     response = Response(csv_data, mimetype="text/csv; charset=utf-8")
     response.headers["Content-Disposition"] = "attachment; filename=developments.csv"
     return response
+
 
 
 if __name__ == "__main__":
