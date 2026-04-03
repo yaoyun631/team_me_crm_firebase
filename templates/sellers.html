@@ -2,28 +2,32 @@
 {% block content %}
 
 <div class="d-flex justify-content-between align-items-center mb-3">
-  <h3 class="mb-0">賣方列表</h3>
+  <h3 class="mb-0">委託列表</h3>
   <div>
     <a href="{{ url_for('download_sellers') }}" class="btn btn-outline-success me-2">下載 CSV</a>
   </div>
 </div>
 
-<!-- 🔍 篩選區 -->
 <form class="row g-2 mb-3" method="get">
   <div class="col-12 col-md-auto">
     <input type="text" name="q" class="form-control" placeholder="搜尋姓名 / 電話" value="{{ q }}">
   </div>
-
   <div class="col-6 col-md-auto">
     <select name="level" class="form-select">
       <option value="">客戶等級</option>
-      <option value="A" {% if level == "A" %}selected{% endif %}>A（高意願 / 緊急出售）</option>
-      <option value="B" {% if level == "B" %}selected{% endif %}>B（可談 / 觀望）</option>
-      <option value="C" {% if level == "C" %}selected{% endif %}>C（隨緣 / 長期）</option>
+      <option value="A" {% if level == "A" %}selected{% endif %}>A</option>
+      <option value="B" {% if level == "B" %}selected{% endif %}>B</option>
+      <option value="C" {% if level == "C" %}selected{% endif %}>C</option>
     </select>
   </div>
-
-  <!-- ⭐ 來源篩選（使用後端給的 source_options） -->
+  <div class="col-6 col-md-auto">
+    <select name="stage" class="form-select">
+      <option value="">目前狀態</option>
+      {% for opt in seller_stage_options or [] %}
+        <option value="{{ opt }}" {% if stage == opt %}selected{% endif %}>{{ opt }}</option>
+      {% endfor %}
+    </select>
+  </div>
   <div class="col-6 col-md-auto">
     <select name="source" class="form-select">
       <option value="">來源（全部）</option>
@@ -32,17 +36,6 @@
       {% endfor %}
     </select>
   </div>
-
-  <!-- 進程：開發中 / 委託中 / 成交 -->
-  <div class="col-6 col-md-auto">
-    <select name="stage" class="form-select">
-      <option value="">進程</option>
-      <option value="開發中" {% if stage == "開發中" %}selected{% endif %}>開發中</option>
-      <option value="委託中" {% if stage == "委託中" %}selected{% endif %}>委託中</option>
-      <option value="成交" {% if stage == "成交" %}selected{% endif %}>成交</option>
-    </select>
-  </div>
-
   <div class="col-6 col-md-auto">
     <select name="sort_by" class="form-select">
       <option value="created_at_desc" {% if sort_by == "created_at_desc" %}selected{% endif %}>最新在前</option>
@@ -51,140 +44,82 @@
       <option value="name_desc" {% if sort_by == "name_desc" %}selected{% endif %}>姓名 Z→A</option>
     </select>
   </div>
-
   <div class="col-6 col-md-auto">
     <button class="btn btn-outline-secondary w-100" type="submit">套用</button>
   </div>
 </form>
 
-<!-- 📱 手機版：新增賣方 卡片（折疊） -->
 <button class="btn btn-primary w-100 d-md-none mb-3"
         type="button"
         data-bs-toggle="collapse"
-        data-bs-target="#newSellerCardMobile"
-        aria-expanded="false"
-        aria-controls="newSellerCardMobile">
-  新增賣方
+        data-bs-target="#newSellerCardMobile">
+  新增委託
 </button>
 
 <div class="collapse d-md-none mb-3" id="newSellerCardMobile">
-  <div class="card">
+  <div class="card compact-card">
     <div class="card-body">
-      <h5 class="card-title mb-3">新增賣方</h5>
-      <form method="post"
-            action="{{ url_for('sellers_new') }}"
-            enctype="multipart/form-data">
-
-        <div class="mb-3">
+      <h5 class="card-title mb-3">新增委託</h5>
+      <form method="post" action="{{ url_for('sellers_new') }}" enctype="multipart/form-data">
+        <div class="mb-2">
           <label class="form-label">姓名（必填）</label>
           <input type="text" name="name" class="form-control" required>
         </div>
-
-        <div class="row">
-          <div class="col-sm-6 mb-3">
+        <div class="row g-2">
+          <div class="col-sm-6">
             <label class="form-label">電話</label>
             <input type="text" name="phone" class="form-control">
           </div>
-          <div class="col-sm-6 mb-3">
-            <label class="form-label">LINE ID</label>
-            <input type="text" name="line_id" class="form-control">
+          <div class="col-sm-6">
+            <label class="form-label">來源</label>
+            <input type="text" name="source" class="form-control">
           </div>
         </div>
-
-        <div class="mb-3">
-          <label class="form-label">Email</label>
-          <input type="email" name="email" class="form-control">
-        </div>
-
-        <!-- ⭐ 客源來源 / 開發來源（手動輸入） -->
-        <div class="mb-3">
-          <label class="form-label">來源</label>
-          <input type="text" name="source" class="form-control" placeholder="例：591、路邊招牌、社區拜訪、介紹…">
-        </div>
-
-        <div class="mb-3">
-          <label class="form-label">物件地址</label>
+        <div class="mb-2 mt-2">
+          <label class="form-label">地址</label>
           <input type="text" name="address" class="form-control">
         </div>
-
-        <div class="row">
-          <div class="col-sm-6 mb-3">
+        <div class="row g-2">
+          <div class="col-sm-6">
             <label class="form-label">產品類型</label>
-            <input type="text" name="property_type" class="form-control"
-                   placeholder="例：華廈、電梯大樓、透天、店面…">
+            <input type="text" name="property_type" class="form-control">
           </div>
-          <div class="col-sm-6 mb-3">
+          <div class="col-sm-6">
             <label class="form-label">客戶等級</label>
             <select name="level" class="form-select">
               <option value="">未設定</option>
-              <option value="A">A（高意願 / 經常聯絡）</option>
-              <option value="B">B（可談 / 觀望）</option>
-              <option value="C">C（隨緣 / 長期）</option>
+              <option value="A">A</option>
+              <option value="B">B</option>
+              <option value="C">C</option>
             </select>
           </div>
         </div>
-
-        <!-- 進程：開發中 / 委託中 / 成交 -->
-        <div class="mb-3">
-          <label class="form-label">進程</label>
+        <div class="mb-2 mt-2">
+          <label class="form-label">目前狀態</label>
           <select name="stage" class="form-select">
-            <option value="">未設定</option>
-            <option value="開發中">開發中</option>
-            <option value="委託中">委託中</option>
-            <option value="成交">成交</option>
+            {% for opt in seller_stage_options or [] %}
+              <option value="{{ opt }}" {% if opt == "委託中" %}selected{% endif %}>{{ opt }}</option>
+            {% endfor %}
           </select>
         </div>
-
-        <div class="mb-3">
-          <label class="form-label">出售原因</label>
-          <textarea name="reason" class="form-control" rows="2"
-                    placeholder="例：換屋、資金需求、移民、繼承…"></textarea>
-        </div>
-
-        <div class="row">
-          <div class="col-sm-6 mb-3">
-            <label class="form-label">期望售價（萬）</label>
-            <input type="number" name="expected_price" class="form-control">
+        <div class="row g-2">
+          <div class="col-sm-6">
+            <label class="form-label">下一動作</label>
+            <input type="text" name="next_action" class="form-control">
           </div>
-          <div class="col-sm-6 mb-3">
-            <label class="form-label">可接受底價（萬）</label>
-            <input type="number" name="min_price" class="form-control">
+          <div class="col-sm-6">
+            <label class="form-label">下次日期</label>
+            <input type="date" name="next_contact_date" class="form-control">
           </div>
         </div>
-
-        <div class="mb-3">
-          <label class="form-label">預計出售時程</label>
-          <input type="text" name="timeline" class="form-control"
-                 placeholder="例：1 個月內、半年內、沒有時間壓力…">
-        </div>
-
-        <div class="mb-3">
-          <label class="form-label">目前使用狀態</label>
-          <input type="text" name="occupancy_status" class="form-control"
-                 placeholder="例：自住、出租中、空屋…">
-        </div>
-
-        <!-- 委託到期日 -->
-        <div class="mb-3">
+        <div class="mb-2 mt-2">
           <label class="form-label">委託到期日</label>
           <input type="date" name="contract_end_date" class="form-control">
         </div>
-
-        <!-- 📸 賣方圖片（可多張） -->
-        <div class="mb-3">
-          <label class="form-label">圖片（可多張）</label>
-          <input type="file" name="photos" class="form-control photo-input" multiple>
-          <small class="text-muted">
-            可一次選擇多張圖片，上傳後會在賣方詳細頁顯示縮圖並可左右滑動。
-          </small>
-        </div>
-
-        <div class="mb-3">
+        <div class="mb-2">
           <label class="form-label">內部備註</label>
-          <textarea name="note" class="form-control" rows="3"
-                    placeholder="例：價格談判空間、與其他仲介合作情況、屋況重點…"></textarea>
+          <textarea name="note" class="form-control" rows="3"></textarea>
         </div>
-
         <button type="submit" class="btn btn-primary w-100">儲存</button>
       </form>
     </div>
@@ -192,245 +127,140 @@
 </div>
 
 <div class="row">
-  <!-- 🧾 左邊：列表 -->
   <div class="col-md-7">
-
-    {# 🖥️ 桌機版：表格 #}
-    <div class="d-none d-md-block">
-      <table class="table table-striped table-hover bg-white">
-        <thead>
-          <tr>
-            <th>姓名</th>
-            <th>電話</th>
-            <th>等級</th>
-            <th>進程</th>
-            <th>來源</th>
-            <th>委託到期日</th>
-            <th>地址</th>
-            <th>建立者</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for s in sellers %}
-            <tr>
-              <td>{{ s.name }}</td>
-              <td>{{ s.phone or "-" }}</td>
-              <td>{{ s.level or "-" }}</td>
-              <td>{{ s.stage or "-" }}</td>
-              <td>{{ s.source or "-" }}</td>
-              <td>{{ s.contract_end_date or "-" }}</td>
-              <td>{{ s.address or "-" }}</td>
-              <td>{{ s.created_by_name or "-" }}</td>
-              <td>
-                <a href="{{ url_for('seller_detail', seller_id=s.id) }}"
-                   class="btn btn-sm btn-outline-primary mb-1">
-                  詳細 / 追蹤
-                </a>
-                <form method="post"
-                      action="{{ url_for('seller_delete', seller_id=s.id) }}"
-                      style="display:inline;"
-                      onsubmit="return confirm('確定要刪除這位賣方及所有追蹤紀錄嗎？');">
-                  <button type="submit" class="btn btn-sm btn-outline-danger mb-1">
-                    刪除
-                  </button>
-                </form>
-              </td>
-            </tr>
-          {% else %}
-            <tr>
-              <td colspan="9" class="text-center text-muted">目前沒有賣方資料</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-
-    {# 📱 手機版：卡片列表 #}
-    <div class="d-block d-md-none">
-      {% if sellers %}
-        {% for s in sellers %}
-          <div class="card mb-2">
-            <div class="card-body">
-              <div class="d-flex justify-content-between align-items-start mb-2">
-                <div>
-                  <h5 class="mb-1">{{ s.name or "未填姓名" }}</h5>
-                  <div class="text-muted small">
-                    {{ s.address or "未填地址" }}
-                  </div>
+    {% if sellers %}
+      {% for s in sellers %}
+        <div class="card compact-card mb-2 shadow-sm">
+          <div class="card-body">
+            <div class="d-flex justify-content-between align-items-start gap-2 mb-2">
+              <div class="flex-grow-1 min-w-0">
+                <div class="d-flex flex-wrap align-items-center gap-2 mb-1">
+                  <h5 class="mb-0">{{ s.name or "未填姓名" }}</h5>
+                  <span class="small text-muted">{{ s.phone or "-" }}</span>
                 </div>
-                <div class="text-end">
-                  {% if s.level %}
-                    <span class="badge bg-primary d-block mb-1">等級 {{ s.level }}</span>
-                  {% endif %}
-                  {% if s.stage %}
-                    <span class="badge bg-secondary d-block">{{ s.stage }}</span>
-                  {% endif %}
-                </div>
+                <div class="small text-muted text-break">{{ s.address or "-" }}</div>
               </div>
-
-              <div class="small mb-2">
-                <div class="row mb-1">
-                  <div class="col-6">
-                    <span class="text-muted">電話：</span>{{ s.phone or "-" }}
-                  </div>
-                  <div class="col-6">
-                    <span class="text-muted">來源：</span>{{ s.source or "-" }}
-                  </div>
-                </div>
-                <div class="row mb-1">
-                  <div class="col-6">
-                    <span class="text-muted">委託到期：</span>{{ s.contract_end_date or "-" }}
-                  </div>
-                  <div class="col-6">
-                    <span class="text-muted">建立者：</span>{{ s.created_by_name or "-" }}
-                  </div>
-                </div>
-              </div>
-
-              <div class="d-flex justify-content-end">
-                <a href="{{ url_for('seller_detail', seller_id=s.id) }}"
-                   class="btn btn-sm btn-outline-primary me-2">
-                  詳細 / 追蹤
-                </a>
-                <form method="post"
-                      action="{{ url_for('seller_delete', seller_id=s.id) }}"
-                      onsubmit="return confirm('確定要刪除這位賣方及所有追蹤紀錄嗎？');">
-                  <button type="submit" class="btn btn-sm btn-outline-danger">
-                    刪除
-                  </button>
-                </form>
+              <div class="text-end">
+                {% if s.stage %}<span class="badge bg-secondary d-block mb-1">{{ s.stage }}</span>{% endif %}
+                {% if s.level %}<span class="badge bg-primary d-block">等級 {{ s.level }}</span>{% endif %}
               </div>
             </div>
-          </div>
-        {% endfor %}
-      {% else %}
-        <p class="text-muted text-center">目前沒有賣方資料</p>
-      {% endif %}
-    </div>
 
+            <div class="row gx-3 gy-1 small lh-sm meta-grid">
+              <div class="col-6">
+                <div><span class="text-muted">來源：</span>{{ s.source or "-" }}</div>
+                <div><span class="text-muted">產品：</span>{{ s.property_type or "-" }}</div>
+                <div><span class="text-muted">委託到期：</span>{{ s.contract_end_date or "-" }}</div>
+              </div>
+              <div class="col-6">
+                <div><span class="text-muted">下一步：</span>{{ s.next_action or "-" }}</div>
+                <div><span class="text-muted">下次日期：</span>{{ s.next_action_date or s.next_contact_date or "-" }}</div>
+                <div><span class="text-muted">建立者：</span>{{ s.created_by_name or "-" }}</div>
+              </div>
+            </div>
+
+            {% if s.latest_followup %}
+              <div class="mt-2 p-2 bg-light rounded small">
+                <div class="text-muted mb-1">最後追蹤｜{{ s.latest_followup.contact_time or "-" }}{% if s.latest_followup.channel %}｜{{ s.latest_followup.channel }}{% endif %}</div>
+                {% set follow_text = s.latest_followup.content or "" %}
+                <div class="narrow-text">
+                  <span>{{ follow_text[:70] }}{% if follow_text|length > 70 %}...{% endif %}</span>
+                  {% if follow_text|length > 70 %}
+                    <details class="mt-1"><summary>繼續閱讀</summary><div class="mt-1">{{ follow_text }}</div></details>
+                  {% endif %}
+                </div>
+              </div>
+            {% endif %}
+
+            <div class="d-flex justify-content-end gap-2 mt-2 flex-wrap">
+              <a href="{{ url_for('seller_detail', seller_id=s.id) }}" class="btn btn-sm btn-outline-primary">詳細 / 追蹤</a>
+              <form method="post" action="{{ url_for('seller_delete', seller_id=s.id) }}" onsubmit="return confirm('確定要刪除這位委託及所有追蹤紀錄嗎？');">
+                <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <p class="text-muted text-center">目前沒有委託資料</p>
+    {% endif %}
   </div>
 
-  <!-- 🖥️ 右邊：桌機版表單（手機隱藏） -->
   <div class="col-md-5 d-none d-md-block">
-    <h4 class="mb-3">新增賣方</h4>
-    <form method="post"
-          action="{{ url_for('sellers_new') }}"
-          enctype="multipart/form-data">
-
-      <div class="mb-3">
+    <h4 class="mb-3">新增委託</h4>
+    <form method="post" action="{{ url_for('sellers_new') }}" enctype="multipart/form-data">
+      <div class="mb-2">
         <label class="form-label">姓名（必填）</label>
         <input type="text" name="name" class="form-control" required>
       </div>
-
-      <div class="row">
-        <div class="col-md-6 mb-3">
+      <div class="row g-2">
+        <div class="col-md-6">
           <label class="form-label">電話</label>
           <input type="text" name="phone" class="form-control">
         </div>
-        <div class="col-md-6 mb-3">
-          <label class="form-label">LINE ID</label>
-          <input type="text" name="line_id" class="form-control">
+        <div class="col-md-6">
+          <label class="form-label">來源</label>
+          <input type="text" name="source" class="form-control">
         </div>
       </div>
-
-      <div class="mb-3">
-        <label class="form-label">Email</label>
-        <input type="email" name="email" class="form-control">
-      </div>
-
-      <!-- ⭐ 客源來源 / 開發來源 -->
-      <div class="mb-3">
-        <label class="form-label">來源</label>
-        <input type="text" name="source" class="form-control" placeholder="例：591、路邊招牌、社區拜訪、介紹…">
-      </div>
-
-      <div class="mb-3">
-        <label class="form-label">物件地址</label>
+      <div class="mb-2 mt-2">
+        <label class="form-label">地址</label>
         <input type="text" name="address" class="form-control">
       </div>
-
-      <div class="row">
-        <div class="col-md-6 mb-3">
+      <div class="row g-2">
+        <div class="col-md-6">
           <label class="form-label">產品類型</label>
-          <input type="text" name="property_type" class="form-control"
-                 placeholder="例：華廈、電梯大樓、透天、店面…">
+          <input type="text" name="property_type" class="form-control">
         </div>
-        <div class="col-md-6 mb-3">
+        <div class="col-md-6">
           <label class="form-label">客戶等級</label>
           <select name="level" class="form-select">
             <option value="">未設定</option>
-            <option value="A">A（高意願 / 經常聯絡）</option>
-            <option value="B">B（可談 / 觀望）</option>
-            <option value="C">C（隨緣 / 長期）</option>
+            <option value="A">A</option>
+            <option value="B">B</option>
+            <option value="C">C</option>
           </select>
         </div>
       </div>
-
-      <!-- 進程 -->
-      <div class="mb-3">
-        <label class="form-label">進程</label>
+      <div class="mb-2 mt-2">
+        <label class="form-label">目前狀態</label>
         <select name="stage" class="form-select">
-          <option value="">未設定</option>
-          <option value="開發中">開發中</option>
-          <option value="委託中">委託中</option>
-          <option value="成交">成交</option>
+          {% for opt in seller_stage_options or [] %}
+            <option value="{{ opt }}" {% if opt == "委託中" %}selected{% endif %}>{{ opt }}</option>
+          {% endfor %}
         </select>
       </div>
-
-      <div class="mb-3">
-        <label class="form-label">出售原因</label>
-        <textarea name="reason" class="form-control" rows="2"
-                  placeholder="例：換屋、資金需求、移民、繼承…"></textarea>
-      </div>
-
-      <div class="row">
-        <div class="col-md-6 mb-3">
-          <label class="form-label">期望售價（萬）</label>
-          <input type="number" name="expected_price" class="form-control">
+      <div class="row g-2">
+        <div class="col-md-6">
+          <label class="form-label">下一動作</label>
+          <input type="text" name="next_action" class="form-control">
         </div>
-        <div class="col-md-6 mb-3">
-          <label class="form-label">可接受底價（萬）</label>
-          <input type="number" name="min_price" class="form-control">
+        <div class="col-md-6">
+          <label class="form-label">下次日期</label>
+          <input type="date" name="next_contact_date" class="form-control">
         </div>
       </div>
-
-      <div class="mb-3">
-        <label class="form-label">預計出售時程</label>
-        <input type="text" name="timeline" class="form-control"
-               placeholder="例：1 個月內、半年內、沒有時間壓力…">
-      </div>
-
-      <div class="mb-3">
-        <label class="form-label">目前使用狀態</label>
-        <input type="text" name="occupancy_status" class="form-control"
-               placeholder="例：自住、出租中、空屋…">
-      </div>
-
-      <!-- 委託到期日 -->
-      <div class="mb-3">
+      <div class="mb-2 mt-2">
         <label class="form-label">委託到期日</label>
         <input type="date" name="contract_end_date" class="form-control">
       </div>
-
-      <!-- 📸 賣方圖片（可多張） -->
-      <div class="mb-3">
-        <label class="form-label">圖片（可多張）</label>
-        <input type="file" name="photos" class="form-control photo-input" multiple>
-        <small class="text-muted">
-          可一次選擇多張圖片，上傳後會在賣方詳細頁顯示縮圖並可左右滑動。
-        </small>
-      </div>
-
-      <div class="mb-3">
+      <div class="mb-2">
         <label class="form-label">內部備註</label>
-        <textarea name="note" class="form-control" rows="3"
-                  placeholder="例：價格談判空間、與其他仲介合作情況、屋況重點…"></textarea>
+        <textarea name="note" class="form-control" rows="3"></textarea>
       </div>
-
       <button type="submit" class="btn btn-primary w-100">儲存</button>
     </form>
   </div>
 </div>
+
+<style>
+.compact-card .card-body { padding: .85rem .95rem; }
+.narrow-text { max-width: 100%; word-break: break-word; }
+.meta-grid { font-size: .9rem; }
+@media (max-width: 576px) {
+  .compact-card .card-body { padding: .7rem .75rem; }
+  .small, .meta-grid { font-size: .78rem; }
+}
+</style>
 
 {% endblock %}
