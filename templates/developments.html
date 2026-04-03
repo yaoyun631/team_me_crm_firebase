@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="mb-0">開發列表</h3>
+  <div>
+    <a href="{{ url_for('download_developments') }}" class="btn btn-outline-success me-2">下載 CSV</a>
+  </div>
+</div>
+
+<form class="row g-2 mb-3" method="get">
+  <div class="col-12 col-md-auto">
+    <input type="text" name="q" class="form-control" placeholder="搜尋姓名 / 電話 / 網址" value="{{ q }}">
+  </div>
+  <div class="col-6 col-md-auto">
+    <select name="source" class="form-select">
+      <option value="">來源（全部）</option>
+      {% for s in source_options %}
+        <option value="{{ s }}" {% if source == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-6 col-md-auto">
+    <select name="stage" class="form-select">
+      <option value="">進度</option>
+      <option value="待追蹤" {% if stage == "待追蹤" %}selected{% endif %}>待追蹤</option>
+      <option value="已聯繫" {% if stage == "已聯繫" %}selected{% endif %}>已聯繫</option>
+      <option value="待回覆" {% if stage == "待回覆" %}selected{% endif %}>待回覆</option>
+      <option value="公司接了" {% if stage == "公司接了" %}selected{% endif %}>公司接了</option>
+      <option value="已轉買方" {% if stage == "已轉買方" %}selected{% endif %}>已轉買方</option>
+      <option value="已轉賣方" {% if stage == "已轉賣方" %}selected{% endif %}>已轉賣方</option>
+      <option value="無效" {% if stage == "無效" %}selected{% endif %}>無效</option>
+    </select>
+  </div>
+  <div class="col-6 col-md-auto">
+    <select name="label" class="form-select">
+      <option value="">標籤（全部）</option>
+      {% for s in label_options %}
+        <option value="{{ s }}" {% if label == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="col-6 col-md-auto">
+    <select name="sort_by" class="form-select">
+      <option value="record_date_desc" {% if sort_by == "record_date_desc" %}selected{% endif %}>最新在前</option>
+      <option value="record_date_asc" {% if sort_by == "record_date_asc" %}selected{% endif %}>最舊在前</option>
+      <option value="name_asc" {% if sort_by == "name_asc" %}selected{% endif %}>姓名 A→Z</option>
+      <option value="name_desc" {% if sort_by == "name_desc" %}selected{% endif %}>姓名 Z→A</option>
+    </select>
+  </div>
+  <div class="col-6 col-md-auto">
+    <button class="btn btn-outline-secondary w-100" type="submit">套用</button>
+  </div>
+</form>
+
+<button class="btn btn-primary w-100 d-md-none mb-3" type="button" data-bs-toggle="collapse" data-bs-target="#newDevelopmentCardMobile" aria-expanded="false" aria-controls="newDevelopmentCardMobile">
+  新增開發
+</button>
+<div class="collapse d-md-none mb-3" id="newDevelopmentCardMobile">
+  <div class="card"><div class="card-body">
+    <h5 class="card-title mb-3">新增開發</h5>
+    <form method="post" action="{{ url_for('developments_new') }}">
+      <div class="mb-3"><label class="form-label">日期</label><input type="date" name="record_date" class="form-control"></div>
+      <div class="mb-3"><label class="form-label">姓名</label><input type="text" name="name" class="form-control"></div>
+      <div class="mb-3"><label class="form-label">電話</label><input type="text" name="phone" class="form-control"></div>
+      <div class="mb-3"><label class="form-label">來源</label><input type="text" name="source" class="form-control" placeholder="例：591、LINE、朋友介紹"></div>
+      <div class="mb-3"><label class="form-label">進度</label>
+        <select name="stage" class="form-select">
+          <option value="待追蹤">待追蹤</option><option value="已聯繫">已聯繫</option><option value="待回覆">待回覆</option><option value="公司接了">公司接了</option><option value="已轉買方">已轉買方</option><option value="已轉賣方">已轉賣方</option><option value="無效">無效</option>
+        </select>
+      </div>
+      <div class="mb-3"><label class="form-label">網址</label><input type="url" name="url" class="form-control"></div>
+      <div class="mb-3"><label class="form-label">紀錄 / 備註</label><textarea name="content" class="form-control" rows="4"></textarea></div>
+      <div class="mb-3"><label class="form-label">標籤（逗號分隔）</label><input type="text" name="labels_csv" class="form-control" placeholder="例：開發,LINE,591"></div>
+      <button type="submit" class="btn btn-primary w-100">儲存</button>
+    </form>
+  </div></div>
+</div>
+
+<div class="row">
+  <div class="col-md-7">
+    <div class="d-none d-md-block">
+      <table class="table table-striped table-hover bg-white">
+        <thead>
+          <tr>
+            <th>日期</th><th>姓名</th><th>電話</th><th>紀錄</th><th>進度</th><th>網址</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for d in developments %}
+          <tr>
+            <td>{{ d.record_date or '-' }}</td>
+            <td>{{ d.name or '-' }}</td>
+            <td>{{ d.phone or '-' }}</td>
+            <td style="max-width:240px;">{{ (d.note or '-')[:60] }}{% if d.note and d.note|length > 60 %}...{% endif %}</td>
+            <td>{{ d.stage or '-' }}</td>
+            <td>
+              {% if d.url %}<a href="{{ d.url }}" target="_blank">開啟連結</a>{% else %}-{% endif %}
+            </td>
+            <td>
+              <a href="{{ url_for('development_detail', development_id=d.id) }}" class="btn btn-sm btn-outline-primary mb-1">詳細 / 追蹤</a>
+              <form method="post" action="{{ url_for('development_delete', development_id=d.id) }}" style="display:inline;" onsubmit="return confirm('確定要刪除這筆開發資料及所有追蹤紀錄嗎？');">
+                <button type="submit" class="btn btn-sm btn-outline-danger mb-1">刪除</button>
+              </form>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" class="text-center text-muted">目前沒有開發資料</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="d-block d-md-none">
+      {% if developments %}
+        {% for d in developments %}
+          <div class="card mb-2"><div class="card-body">
+            <div class="d-flex justify-content-between align-items-start mb-2">
+              <div>
+                <h5 class="mb-1">{{ d.name or '未填姓名' }}</h5>
+                <div class="text-muted small">{{ d.phone or '-' }}</div>
+              </div>
+              <span class="badge bg-secondary">{{ d.stage or '-' }}</span>
+            </div>
+            <div class="small mb-2">
+              <div><span class="text-muted">日期：</span>{{ d.record_date or '-' }}</div>
+              <div><span class="text-muted">來源：</span>{{ d.source or '-' }}</div>
+              <div><span class="text-muted">網址：</span>{% if d.url %}<a href="{{ d.url }}" target="_blank">開啟</a>{% else %}-{% endif %}</div>
+              <div><span class="text-muted">紀錄：</span>{{ (d.note or '-')[:80] }}{% if d.note and d.note|length > 80 %}...{% endif %}</div>
+            </div>
+            <div class="d-flex justify-content-end">
+              <a href="{{ url_for('development_detail', development_id=d.id) }}" class="btn btn-sm btn-outline-primary me-2">詳細 / 追蹤</a>
+              <form method="post" action="{{ url_for('development_delete', development_id=d.id) }}" onsubmit="return confirm('確定要刪除這筆開發資料及所有追蹤紀錄嗎？');">
+                <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
+              </form>
+            </div>
+          </div></div>
+        {% endfor %}
+      {% else %}
+        <p class="text-muted text-center">目前沒有開發資料</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="col-md-5 d-none d-md-block">
+    <h4 class="mb-3">新增開發</h4>
+    <form method="post" action="{{ url_for('developments_new') }}">
+      <div class="mb-3"><label class="form-label">日期</label><input type="date" name="record_date" class="form-control"></div>
+      <div class="mb-3"><label class="form-label">姓名</label><input type="text" name="name" class="form-control"></div>
+      <div class="mb-3"><label class="form-label">電話</label><input type="text" name="phone" class="form-control"></div>
+      <div class="mb-3"><label class="form-label">來源</label><input type="text" name="source" class="form-control" placeholder="例：591、LINE、朋友介紹"></div>
+      <div class="mb-3"><label class="form-label">進度</label>
+        <select name="stage" class="form-select">
+          <option value="待追蹤">待追蹤</option><option value="已聯繫">已聯繫</option><option value="待回覆">待回覆</option><option value="公司接了">公司接了</option><option value="已轉買方">已轉買方</option><option value="已轉賣方">已轉賣方</option><option value="無效">無效</option>
+        </select>
+      </div>
+      <div class="mb-3"><label class="form-label">網址</label><input type="url" name="url" class="form-control"></div>
+      <div class="mb-3"><label class="form-label">紀錄 / 備註</label><textarea name="content" class="form-control" rows="4"></textarea></div>
+      <div class="mb-3"><label class="form-label">標籤（逗號分隔）</label><input type="text" name="labels_csv" class="form-control" placeholder="例：開發,LINE,591"></div>
+      <button type="submit" class="btn btn-primary w-100">儲存</button>
+    </form>
+  </div>
+</div>
+
+{% endblock %}

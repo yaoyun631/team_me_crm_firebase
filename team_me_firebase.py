@@ -2407,5 +2407,1008 @@ def create_user_cmd():
     print("使用者建立完成")
 
 
+
+
+# ========= 開發資料（developments） =========
+def build_development_labels(extra=None):
+    return dedupe_keep_order(["開發", "LINE紀錄"] + ensure_list(extra))
+
+
+def normalize_line_key(key: str):
+    k = (key or "").strip().replace(" ", "")
+    mapping = {
+        "對象": "target_type",
+        "類型": "target_type",
+        "目標": "target_type",
+        "客戶類型": "target_type",
+        "電話": "phone",
+        "手機": "phone",
+        "電話號碼": "phone",
+        "姓名": "name",
+        "客戶": "name",
+        "買方": "name",
+        "賣方": "name",
+        "屋主": "name",
+        "客戶來源": "source",
+        "來源": "source",
+        "需求類型": "intent_type_raw",
+        "委託類型": "deal_type_raw",
+        "ID": "record_id",
+        "客戶ID": "record_id",
+        "buyer_id": "record_id",
+        "seller_id": "record_id",
+        "development_id": "record_id",
+        "內容": "content",
+        "紀錄": "content",
+        "備註": "content",
+        "說明": "content",
+        "進度內容": "content",
+        "進程": "stage",
+        "階段": "stage",
+        "狀態": "stage",
+        "標籤": "labels",
+        "分類": "labels",
+        "labels": "labels",
+        "下一步": "next_action",
+        "下次行動": "next_action",
+        "next_action": "next_action",
+        "下次聯絡日": "next_contact_date",
+        "下次聯絡日期": "next_contact_date",
+        "next_contact_date": "next_contact_date",
+        "地址": "address",
+        "物件": "address",
+        "案名": "address",
+        "總價": "price",
+        "價格": "price",
+        "預算": "budget",
+        "區域": "preferred_areas",
+        "產品類型": "property_type",
+        "房數": "room_range",
+        "車位": "car_need",
+        "開價": "expected_price",
+        "底價": "min_price",
+        "委託到期日": "contract_end_date",
+        "筆數": "limit",
+        "網址": "url",
+        "連結": "url",
+        "網站": "url",
+        "日期": "record_date",
+    }
+    return mapping.get(k, k)
+
+
+def normalize_target_type(value: str) -> str:
+    v = (value or "").strip()
+    if v in ("買方", "客需", "buyer", "buyers"):
+        return "buyer"
+    if v in ("賣方", "委託", "seller", "sellers", "屋主"):
+        return "seller"
+    if v in ("開發", "development", "developments", "名單", "開發名單"):
+        return "development"
+    return ""
+
+
+def parse_line_formatted_message(text: str):
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    first = lines[0]
+    if not first.startswith("#"):
+        return None
+
+    tag = first.lstrip("#").strip()
+    tag_map = {
+        "新增客需": "create_buyer_need",
+        "新增委託": "create_seller_listing",
+        "新增開發": "create_development",
+        "買方追蹤": "buyer_followup",
+        "賣方追蹤": "seller_followup",
+        "開發追蹤": "development_followup",
+        "客戶分類": "classify",
+        "查詢紀錄": "query_records",
+        "查詢委託到期": "query_contract_end",
+        "查詢開發": "query_records",
+        "帶看": "buyer_followup",
+        "成交": "buyer_followup",
+        "委託": "seller_followup",
+        "紀錄": "generic_note",
+    }
+    action = tag_map.get(tag)
+    if not action:
+        return None
+
+    fields = {}
+    for line in lines[1:]:
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.+)$", line)
+        if not m:
+            continue
+        key = normalize_line_key(m.group(1))
+        value = m.group(2).strip()
+        if key == "labels":
+            fields[key] = parse_label_csv(value)
+        else:
+            fields[key] = value
+
+    if tag in ("買方追蹤", "帶看", "成交") and not fields.get("target_type"):
+        fields["target_type"] = "buyer"
+    if tag in ("賣方追蹤", "委託") and not fields.get("target_type"):
+        fields["target_type"] = "seller"
+    if tag in ("開發追蹤", "查詢開發") and not fields.get("target_type"):
+        fields["target_type"] = "development"
+
+    fields["target_type"] = normalize_target_type(fields.get("target_type", "")) or fields.get("target_type", "")
+    fields["intent_type"] = normalize_intent_type(fields.get("intent_type_raw", ""), fields)
+    fields["deal_type"] = normalize_deal_type(fields.get("deal_type_raw", ""))
+    fields["limit"] = parse_int_limit(fields.get("limit", 10), default=10, max_value=30)
+
+    if action == "create_buyer_need":
+        if not (fields.get("name") and fields.get("phone") and fields.get("source")):
+            return None
+    elif action == "create_seller_listing":
+        if not (fields.get("name") and fields.get("phone") and fields.get("source")):
+            return None
+    elif action == "create_development":
+        if not ((fields.get("phone") or fields.get("name")) and (fields.get("url") or fields.get("content"))):
+            return None
+    elif action in ("buyer_followup", "seller_followup", "development_followup", "classify", "query_records", "query_contract_end"):
+        if not (fields.get("record_id") or fields.get("phone") or fields.get("name")):
+            return None
+
+    return {
+        "tag": tag,
+        "action": action,
+        "fields": fields,
+        "raw_text": text,
+    }
+
+
+def parse_potential_development_freeform(text: str):
+    raw = (text or "").strip()
+    if not raw or raw.startswith("#"):
+        return None
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) < 3:
+        return None
+
+    url = ""
+    phone = ""
+    name = ""
+    note_lines = []
+
+    for ln in lines:
+        if not url:
+            m = re.search(r"https?://\S+", ln)
+            if m:
+                url = m.group(0)
+                continue
+        cleaned = re.sub(r"[^0-9]", "", ln)
+        if not phone and len(cleaned) >= 8 and len(cleaned) <= 12:
+            phone = ln
+            continue
+
+    if not url or not phone:
+        return None
+
+    # 姓名：取電話上一行或下一行最像名字的那行
+    try:
+        phone_idx = next(i for i, ln in enumerate(lines) if re.sub(r"[^0-9]", "", ln) == re.sub(r"[^0-9]", "", phone))
+    except StopIteration:
+        phone_idx = -1
+
+    candidate_indices = []
+    if phone_idx > 0:
+        candidate_indices.append(phone_idx - 1)
+    if phone_idx + 1 < len(lines):
+        candidate_indices.append(phone_idx + 1)
+    for idx in candidate_indices:
+        ln = lines[idx]
+        if ln != url and ln != phone and not re.search(r"https?://", ln):
+            if len(ln) <= 20:
+                name = ln
+                break
+    if not name:
+        name = "未填姓名"
+
+    for ln in lines:
+        if ln in (url, phone, name):
+            continue
+        if re.search(r"https?://", ln):
+            continue
+        note_lines.append(ln)
+
+    return {
+        "tag": "新增開發",
+        "action": "create_development",
+        "fields": {
+            "name": name,
+            "phone": phone,
+            "source": "LINE",
+            "url": url,
+            "content": "\n".join(note_lines).strip(),
+            "stage": "待追蹤",
+        },
+        "raw_text": raw,
+    }
+
+
+def find_customer_record(target_type: str, record_id: str = "", phone: str = "", name: str = ""):
+    if target_type == "buyer":
+        collection_name = "buyers"
+    elif target_type == "seller":
+        collection_name = "sellers"
+    else:
+        collection_name = "developments"
+
+    if record_id:
+        doc = db.collection(collection_name).document(record_id).get()
+        if doc.exists:
+            return doc
+
+    if phone:
+        matches = find_records_by_phone(collection_name, phone)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return None
+
+    if name:
+        docs = list(db.collection(collection_name).where("name", "==", name.strip()).limit(2).stream())
+        if len(docs) == 1:
+            return docs[0]
+
+    return None
+
+
+def resolve_customer_record(fields, preferred_target_type=""):
+    record_id = fields.get("record_id", "")
+    phone = fields.get("phone", "")
+    name = fields.get("name", "")
+    target_type = preferred_target_type or normalize_target_type(fields.get("target_type", ""))
+
+    if target_type in ("buyer", "seller", "development"):
+        doc = find_customer_record(target_type, record_id, phone, name)
+        return target_type, doc
+
+    candidates = []
+    for t in ("buyer", "seller", "development"):
+        doc = find_customer_record(t, record_id, phone, name)
+        if doc:
+            candidates.append((t, doc))
+    if len(candidates) == 1:
+        return candidates[0]
+    return "", None
+
+
+def update_customer_note_and_labels(target_type: str, doc_ref, content: str, labels=None, stage="", source="LINE", event=None):
+    labels = dedupe_keep_order(["LINE紀錄"] + ensure_list(labels))
+    snapshot = doc_ref.get()
+    current = snapshot.to_dict() or {}
+    old_note = current.get("note", "")
+
+    source_label = build_line_operator_label(event) if event else "LINE"
+    updates = {
+        "note": append_note_block(old_note, content, source_label),
+        "labels": firestore.ArrayUnion(labels),
+        "updated_at": datetime.now().isoformat(),
+        "updated_by_id": "line_bot",
+        "updated_by_name": "LINE Bot",
+    }
+    if stage:
+        updates["stage"] = stage
+    if source:
+        updates["source"] = source
+
+    doc_ref.update(updates)
+
+
+def add_customer_followup(target_type: str, customer_id: str, content: str, next_action="", next_contact_date="", labels=None, line_event=None):
+    if target_type == "buyer":
+        collection_name = "buyer_followups"
+        key_name = "buyer_id"
+    elif target_type == "seller":
+        collection_name = "seller_followups"
+        key_name = "seller_id"
+    else:
+        collection_name = "development_followups"
+        key_name = "development_id"
+
+    sender_display_name = get_line_sender_display_name(line_event) if line_event else ""
+    data = {
+        key_name: customer_id,
+        "contact_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "channel": "LINE",
+        "content": content,
+        "next_action": next_action,
+        "next_contact_date": next_contact_date,
+        "labels": dedupe_keep_order(["LINE紀錄"] + ensure_list(labels)),
+        "created_at": datetime.now().isoformat(),
+        "created_by_id": "line_bot",
+        "created_by_name": "LINE Bot",
+        "sender_display_name": sender_display_name,
+    }
+
+    if line_event:
+        source = line_event.get("source", {})
+        data["line_group_id"] = source.get("groupId", "")
+        data["line_room_id"] = source.get("roomId", "")
+        data["line_user_id"] = source.get("userId", "")
+        data["line_message_id"] = (line_event.get("message") or {}).get("id", "")
+        data["quoted_message_id"] = (line_event.get("message") or {}).get("quotedMessageId", "")
+
+    db.collection(collection_name).add(data)
+
+
+def create_development(fields, event):
+    phone = fields.get("phone", "").strip()
+    name = fields.get("name", "").strip() or "未填姓名"
+    url = fields.get("url", "").strip()
+    matches = find_records_by_phone("developments", phone) if phone else []
+
+    labels = build_development_labels(fields.get("labels"))
+    content_text = fields.get("content", "").strip() or fields.get("address", "").strip() or url or "LINE 新增開發"
+    note_content = build_line_summary(content_text, event)
+
+    payload = {
+        "name": name,
+        "phone": phone,
+        "source": fields.get("source", "").strip() or "LINE",
+        "url": url,
+        "stage": fields.get("stage", "").strip() or "待追蹤",
+        "record_date": fields.get("record_date", "").strip() or datetime.now().strftime("%Y-%m-%d"),
+        "note": "",
+        "labels": labels,
+        "updated_at": datetime.now().isoformat(),
+        "updated_by_id": "line_bot",
+        "updated_by_name": "LINE Bot",
+        "sender_display_name": get_line_sender_display_name(event) or "",
+    }
+
+    if len(matches) == 1:
+        doc = matches[0]
+        doc_ref = db.collection("developments").document(doc.id)
+        update_customer_note_and_labels(
+            target_type="development",
+            doc_ref=doc_ref,
+            content=note_content,
+            labels=labels,
+            stage=payload["stage"],
+            source=payload["source"],
+            event=event,
+        )
+        doc_ref.update({k: v for k, v in payload.items() if v != "" and k != "note"})
+        add_customer_followup(
+            target_type="development",
+            customer_id=doc.id,
+            content=note_content,
+            labels=labels,
+            line_event=event,
+        )
+        updated_doc = doc_ref.get().to_dict() or {}
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": f"已更新既有開發：{updated_doc.get('name', '')}",
+            "target_type": "development",
+            "target_id": doc.id,
+            "customer_name": updated_doc.get("name", ""),
+            "phone": updated_doc.get("phone", ""),
+            "parsed_tag": "新增開發",
+        }
+
+    if len(matches) > 1:
+        return {
+            "handled": True,
+            "ok": False,
+            "reply_text": "未寫入：同電話有多筆開發資料，請先到後台整理或改用客戶ID",
+        }
+
+    now = datetime.now().isoformat()
+    payload.update({
+        "created_at": now,
+        "created_by_id": "line_bot",
+        "created_by_name": "LINE Bot",
+        "note": append_note_block("", note_content, build_line_operator_label(event)),
+    })
+    doc_ref = db.collection("developments").document()
+    doc_ref.set(payload)
+    add_customer_followup(
+        target_type="development",
+        customer_id=doc_ref.id,
+        content=note_content,
+        labels=labels,
+        line_event=event,
+    )
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": f"已新增開發：{payload['name']}",
+        "target_type": "development",
+        "target_id": doc_ref.id,
+        "customer_name": payload["name"],
+        "phone": payload["phone"],
+        "parsed_tag": "新增開發",
+    }
+
+
+def format_record_timeline(target_type: str, doc_snapshot, limit=10):
+    data = doc_snapshot.to_dict() or {}
+    record_id = doc_snapshot.id
+
+    if target_type == "buyer":
+        followup_collection = "buyer_followups"
+        key_name = "buyer_id"
+    elif target_type == "seller":
+        followup_collection = "seller_followups"
+        key_name = "seller_id"
+    else:
+        followup_collection = "development_followups"
+        key_name = "development_id"
+
+    followups = []
+    for d in db.collection(followup_collection).where(key_name, "==", record_id).stream():
+        item = d.to_dict() or {}
+        followups.append({
+            "time": item.get("contact_time") or item.get("created_at") or "",
+            "channel": item.get("channel", "LINE"),
+            "text": (item.get("content") or "").strip(),
+            "created_by_name": item.get("created_by_name", "") or "",
+            "sender_display_name": item.get("sender_display_name", "") or "",
+        })
+
+    followups = [x for x in followups if x.get("text")]
+    followups.sort(key=lambda x: x.get("time", ""), reverse=True)
+
+    lines = ["客戶資訊"]
+
+    if target_type == "buyer":
+        intent_map = {"rent": "租屋", "buy": "買賣", "both": "租買皆可"}
+        lines.extend([
+            f"姓名: {data.get('name', '')}",
+            f"電話: {data.get('phone', '')}",
+            f"客源來源: {data.get('source', '') or '-'}",
+            f"需求類型: {intent_map.get(data.get('intent_type', ''), data.get('intent_type', '') or '-')}",
+            f"預算: {data.get('budget_min', '') or data.get('rent_min', '') or '-'} ~ {data.get('budget_max', '') or data.get('rent_max', '') or '-'}",
+            f"偏好區域: {data.get('preferred_areas', '') or '-'}",
+            f"產品類型: {data.get('property_type', '') or '-'}",
+            f"房數需求: {data.get('room_range', '') or '-'}",
+            f"車位需求: {data.get('car_need', '') or '-'}",
+        ])
+    elif target_type == "seller":
+        deal_map = {"sale": "買賣", "rent": "出租"}
+        lines.extend([
+            f"姓名: {data.get('name', '')}",
+            f"電話: {data.get('phone', '')}",
+            f"客源來源: {data.get('source', '') or '-'}",
+            f"委託類型: {deal_map.get(data.get('deal_type', ''), data.get('deal_type', '') or '-')}",
+            f"地址: {data.get('address', '') or '-'}",
+            f"產品類型: {data.get('property_type', '') or '-'}",
+            f"開價: {data.get('expected_price', '') or '-'}",
+            f"底價: {data.get('min_price', '') or '-'}",
+            f"委託到期日: {data.get('contract_end_date', '') or '-'}",
+        ])
+    else:
+        lines.extend([
+            f"日期: {data.get('record_date', '') or '-'}",
+            f"姓名: {data.get('name', '')}",
+            f"電話: {data.get('phone', '') or '-'}",
+            f"來源: {data.get('source', '') or '-'}",
+            f"進度: {data.get('stage', '') or '-'}",
+            f"網址: {data.get('url', '') or '-'}",
+            f"主紀錄: {data.get('note', '').splitlines()[-1] if data.get('note') else '-'}",
+        ])
+
+    lines.append("")
+    lines.append("追蹤進度")
+
+    if not followups:
+        lines.append("目前沒有追蹤紀錄")
+    else:
+        for item in followups[:limit]:
+            header_parts = [item.get('time', ''), item.get('channel', 'LINE')]
+            creator = (item.get("created_by_name") or "").strip()
+            sender = (item.get("sender_display_name") or "").strip()
+            if creator:
+                header_parts.append(f"KEYIN: {creator}")
+            if sender:
+                header_parts.append(f"留言者: {sender}")
+            lines.append("｜".join([p for p in header_parts if p]))
+            lines.append(item.get("text", ""))
+            lines.append("")
+
+    return "\n".join(lines).strip()[:4500]
+
+
+def query_contract_end_text(fields):
+    target_type, doc = resolve_customer_record(fields, preferred_target_type="seller")
+    if target_type != "seller" or not doc:
+        return False, "查無唯一委託資料，請提供正確電話或客戶ID", None
+
+    data = doc.to_dict() or {}
+    deal_type = data.get("deal_type", "")
+    deal_label = "出租" if deal_type == "rent" else "買賣" if deal_type == "sale" else "未設定"
+    text = "\n".join([
+        "查詢委託到期",
+        f"姓名: {data.get('name', '')}",
+        f"電話: {data.get('phone', '')}",
+        f"地址: {data.get('address', '')}",
+        f"委託類型: {deal_label}",
+        f"委託到期日: {data.get('contract_end_date', '') or '未填寫'}",
+        f"目前進程: {data.get('stage', '') or '未填寫'}",
+    ]).strip()
+    return True, text[:4500], {
+        "target_type": "seller",
+        "target_id": doc.id,
+        "customer_name": data.get("name", ""),
+        "phone": data.get("phone", ""),
+        "parsed_tag": "查詢委託到期",
+    }
+
+
+def process_quote_context_message(event):
+    message = event.get("message") or {}
+    quoted_message_id = message.get("quotedMessageId", "")
+    raw_text = (message.get("text") or "").strip()
+    if not quoted_message_id or not raw_text:
+        return {"handled": False}
+
+    link = get_line_message_link(quoted_message_id)
+    if not link:
+        return {"handled": False}
+
+    target_type = link.get("target_type", "")
+    target_id = link.get("target_id", "")
+    if target_type not in ("buyer", "seller", "development") or not target_id:
+        return {"handled": False}
+
+    if target_type == "buyer":
+        collection_name = "buyers"
+    elif target_type == "seller":
+        collection_name = "sellers"
+    else:
+        collection_name = "developments"
+
+    doc_ref = db.collection(collection_name).document(target_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return {"handled": True, "ok": False, "reply_text": "未寫入：引用的客戶資料不存在"}
+
+    labels = dedupe_keep_order(["LINE紀錄", "群組回覆註記"])
+    reply_only_text = raw_text
+
+    update_customer_note_and_labels(
+        target_type=target_type,
+        doc_ref=doc_ref,
+        content=reply_only_text,
+        labels=labels,
+        source="LINE",
+        event=event,
+    )
+    add_customer_followup(
+        target_type=target_type,
+        customer_id=target_id,
+        content=reply_only_text,
+        labels=labels,
+        line_event=event,
+    )
+
+    parsed = {
+        "tag": "群組回覆註記",
+        "action": "quoted_context_note",
+        "fields": {"quoted_message_id": quoted_message_id},
+        "raw_text": raw_text,
+    }
+    save_line_log(parsed, event, "success", target_type=target_type, target_id=target_id, sender_display_name=get_line_sender_display_name(event))
+    target_label = "買方" if target_type == "buyer" else "賣方" if target_type == "seller" else "開發"
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": f"已註記到{target_label}：{(doc.to_dict() or {}).get('name', '')}",
+        "target_type": target_type,
+        "target_id": target_id,
+        "customer_name": (doc.to_dict() or {}).get("name", ""),
+        "phone": (doc.to_dict() or {}).get("phone", ""),
+        "parsed_tag": "群組回覆註記",
+    }
+
+
+def process_line_message_event(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+
+    sender_display_name = get_line_sender_display_name(event)
+
+    parsed = parse_line_formatted_message(message.get("text", ""))
+    if not parsed:
+        quoted_result = process_quote_context_message(event)
+        if quoted_result.get("handled"):
+            return quoted_result
+        parsed = parse_potential_development_freeform(message.get("text", ""))
+        if not parsed:
+            return {"handled": False}
+
+    fields = parsed["fields"]
+    action = parsed["action"]
+
+    if action == "create_buyer_need":
+        result = create_buyer_need(fields, event)
+    elif action == "create_seller_listing":
+        result = create_seller_listing(fields, event)
+    elif action == "create_development":
+        result = create_development(fields, event)
+    elif action == "query_records":
+        target_type, doc = resolve_customer_record(fields)
+        if not doc:
+            result = {"handled": True, "ok": False, "reply_text": "查無唯一資料，請補電話或客戶ID"}
+        else:
+            result = {
+                "handled": True,
+                "ok": True,
+                "reply_text": format_record_timeline(target_type, doc, limit=fields.get("limit", 10)),
+                "target_type": target_type,
+                "target_id": doc.id,
+                "customer_name": (doc.to_dict() or {}).get("name", ""),
+                "phone": (doc.to_dict() or {}).get("phone", ""),
+                "parsed_tag": parsed.get("tag", ""),
+            }
+    elif action == "query_contract_end":
+        ok, text, ctx = query_contract_end_text(fields)
+        result = {"handled": True, "ok": ok, "reply_text": text}
+        if ctx:
+            result.update(ctx)
+    else:
+        target_type = fields.get("target_type", "")
+        if action == "buyer_followup":
+            target_type = "buyer"
+        elif action == "seller_followup":
+            target_type = "seller"
+        elif action == "development_followup":
+            target_type = "development"
+
+        if target_type not in ("buyer", "seller", "development"):
+            result = {"handled": True, "ok": False, "reply_text": "請提供對象：買方、賣方 或 開發"}
+        else:
+            doc = find_customer_record(
+                target_type=target_type,
+                record_id=fields.get("record_id", ""),
+                phone=fields.get("phone", ""),
+                name=fields.get("name", ""),
+            )
+            if not doc:
+                target_label = "買方" if target_type == "buyer" else "賣方" if target_type == "seller" else "開發"
+                result = {"handled": True, "ok": False, "reply_text": f"未寫入：找不到唯一一位{target_label}，請補客戶ID或正確電話"}
+            else:
+                content = fields.get("content", "").strip() or build_line_summary("LINE 更新", event)
+                labels = fields.get("labels") or ["LINE紀錄"]
+                collection_name = "buyers" if target_type == "buyer" else "sellers" if target_type == "seller" else "developments"
+                doc_ref = db.collection(collection_name).document(doc.id)
+                update_customer_note_and_labels(
+                    target_type=target_type,
+                    doc_ref=doc_ref,
+                    content=content,
+                    labels=labels,
+                    stage=fields.get("stage", "").strip(),
+                    source="LINE",
+                    event=event,
+                )
+                add_customer_followup(
+                    target_type=target_type,
+                    customer_id=doc.id,
+                    content=content,
+                    next_action=fields.get("next_action", "").strip(),
+                    next_contact_date=fields.get("next_contact_date", "").strip(),
+                    labels=labels,
+                    line_event=event,
+                )
+                data = doc_ref.get().to_dict() or {}
+                target_label = "買方" if target_type == "buyer" else "賣方" if target_type == "seller" else "開發"
+                result = {
+                    "handled": True,
+                    "ok": True,
+                    "reply_text": f"已新增{target_label}追蹤：{data.get('name', '')}",
+                    "target_type": target_type,
+                    "target_id": doc.id,
+                    "customer_name": data.get("name", ""),
+                    "phone": data.get("phone", ""),
+                    "parsed_tag": parsed.get("tag", ""),
+                }
+
+    if result.get("handled"):
+        save_line_log(
+            parsed=parsed,
+            event=event,
+            status="success" if result.get("ok") else "failed",
+            target_type=result.get("target_type", ""),
+            target_id=result.get("target_id", ""),
+            note=result.get("reply_text", ""),
+            sender_display_name=sender_display_name,
+        )
+    return result
+
+
+def delete_by_field(collection_name, field_name, field_value):
+    ref = db.collection(collection_name).where(field_name, "==", field_value)
+    docs = list(ref.stream())
+    for d in docs:
+        d.reference.delete()
+
+
+@app.route("/developments")
+@login_required
+def developments():
+    q = request.args.get("q", "").strip()
+    stage = request.args.get("stage", "").strip()
+    source = request.args.get("source", "").strip()
+    label = request.args.get("label", "").strip()
+    sort_by = request.args.get("sort_by", "record_date_desc")
+
+    docs = db.collection("developments").stream()
+    all_items = [doc_to_dict(d) for d in docs]
+
+    source_set = set()
+    for item in all_items:
+        s = (item.get("source") or "").strip()
+        if s:
+            source_set.add(s)
+    source_options = sorted(source_set)
+    label_options = build_label_options(all_items)
+
+    items = list(all_items)
+    if q:
+        items = [x for x in items if q in (x.get("name") or "") or q in (x.get("phone") or "") or q in (x.get("url") or "")]
+    if stage:
+        items = [x for x in items if x.get("stage") == stage]
+    if source:
+        items = [x for x in items if (x.get("source") or "") == source]
+    if label:
+        items = [x for x in items if label in (x.get("labels") or [])]
+
+    def sort_key(x):
+        return x.get("record_date") or x.get("created_at") or ""
+
+    if sort_by == "record_date_asc":
+        items.sort(key=sort_key)
+    elif sort_by == "name_asc":
+        items.sort(key=lambda x: x.get("name") or "")
+    elif sort_by == "name_desc":
+        items.sort(key=lambda x: x.get("name") or "", reverse=True)
+    else:
+        items.sort(key=sort_key, reverse=True)
+
+    return render_template(
+        "developments.html",
+        developments=items,
+        q=q,
+        stage=stage,
+        source=source,
+        label=label,
+        source_options=source_options,
+        label_options=label_options,
+        sort_by=sort_by,
+    )
+
+
+@app.route("/developments/new", methods=["POST"])
+@login_required
+def developments_new():
+    form = request.form
+    name = form.get("name", "").strip()
+    phone = form.get("phone", "").strip()
+    url = form.get("url", "").strip()
+    content = form.get("content", "").strip()
+    stage = form.get("stage", "").strip() or "待追蹤"
+    source = form.get("source", "").strip()
+    record_date = form.get("record_date", "").strip() or datetime.now().strftime("%Y-%m-%d")
+    labels = [x.strip() for x in request.form.getlist("labels") if x.strip()]
+    labels_csv = form.get("labels_csv", "").strip()
+    if labels_csv:
+        labels = dedupe_keep_order(labels + parse_label_csv(labels_csv))
+
+    if not (name or phone or url):
+        flash("至少請填姓名、電話、網址其中一項", "danger")
+        return redirect(url_for("developments"))
+
+    now = datetime.now().isoformat()
+    note = content.strip()
+    payload = {
+        "name": name or "未填姓名",
+        "phone": phone,
+        "url": url,
+        "source": source,
+        "stage": stage,
+        "record_date": record_date,
+        "note": note,
+        "labels": build_development_labels(labels),
+        "created_at": now,
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+    }
+    doc_ref = db.collection("developments").document()
+    doc_ref.set(payload)
+    if note:
+        db.collection("development_followups").add({
+            "development_id": doc_ref.id,
+            "contact_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "channel": "手動新增",
+            "content": note,
+            "next_action": "",
+            "next_contact_date": "",
+            "labels": build_development_labels(labels),
+            "created_at": now,
+            "created_by_id": session.get("user_id"),
+            "created_by_name": session.get("user_name"),
+            "sender_display_name": session.get("user_name"),
+        })
+
+    flash("已新增開發資料", "success")
+    return redirect(url_for("developments"))
+
+
+@app.route("/developments/<development_id>")
+@login_required
+def development_detail(development_id):
+    doc = db.collection("developments").document(development_id).get()
+    if not doc.exists:
+        flash("找不到這筆開發資料", "danger")
+        return redirect(url_for("developments"))
+
+    development = doc_to_dict(doc)
+    followups_ref = db.collection("development_followups").where("development_id", "==", development_id)
+    followups = [doc_to_dict(f) for f in followups_ref.stream()]
+    followups.sort(key=lambda x: x.get("contact_time", ""), reverse=True)
+    return render_template("development_detail.html", development=development, followups=followups)
+
+
+@app.route("/developments/<development_id>/followup", methods=["POST"])
+@login_required
+def add_development_followup(development_id):
+    contact_time = request.form.get("contact_time", "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M")
+    channel = request.form.get("channel", "").strip()
+    content = request.form.get("content", "").strip()
+    next_action = request.form.get("next_action", "").strip()
+    next_contact_date = request.form.get("next_contact_date", "").strip()
+
+    now = datetime.now().isoformat()
+    db.collection("development_followups").add({
+        "development_id": development_id,
+        "contact_time": contact_time,
+        "channel": channel,
+        "content": content,
+        "next_action": next_action,
+        "next_contact_date": next_contact_date,
+        "created_at": now,
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+        "sender_display_name": session.get("user_name"),
+    })
+
+    if content:
+        ref = db.collection("developments").document(development_id)
+        snap = ref.get()
+        current = snap.to_dict() or {}
+        ref.update({
+            "note": append_note_block(current.get("note", ""), content, session.get("user_name") or "後台"),
+            "updated_at": now,
+            "updated_by_id": session.get("user_id"),
+            "updated_by_name": session.get("user_name"),
+        })
+
+    flash("已新增開發追蹤紀錄", "success")
+    return redirect(url_for("development_detail", development_id=development_id))
+
+
+@app.route("/developments/<development_id>/edit", methods=["GET", "POST"])
+@login_required
+def development_edit(development_id):
+    doc_ref = db.collection("developments").document(development_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        flash("找不到這筆開發資料", "danger")
+        return redirect(url_for("developments"))
+
+    development = doc_to_dict(doc)
+    if request.method == "POST":
+        form = request.form
+        labels = [x.strip() for x in request.form.getlist("labels") if x.strip()]
+        labels_csv = form.get("labels_csv", "").strip()
+        if labels_csv:
+            labels = dedupe_keep_order(labels + parse_label_csv(labels_csv))
+
+        updated = {
+            "name": form.get("name", "").strip() or "未填姓名",
+            "phone": form.get("phone", "").strip(),
+            "url": form.get("url", "").strip(),
+            "source": form.get("source", "").strip(),
+            "stage": form.get("stage", "").strip(),
+            "record_date": form.get("record_date", "").strip(),
+            "note": form.get("note", "").strip(),
+            "labels": build_development_labels(labels),
+            "updated_at": datetime.now().isoformat(),
+            "updated_by_id": session.get("user_id"),
+            "updated_by_name": session.get("user_name"),
+        }
+        doc_ref.update(updated)
+        flash("已更新開發資料", "success")
+        return redirect(url_for("development_detail", development_id=development_id))
+
+    return render_template("development_edit.html", development=development)
+
+
+@app.route("/developments/<development_id>/delete", methods=["POST"])
+@login_required
+def development_delete(development_id):
+    delete_by_field("development_followups", "development_id", development_id)
+    db.collection("developments").document(development_id).delete()
+    flash("已刪除開發資料與相關追蹤紀錄", "info")
+    return redirect(url_for("developments"))
+
+
+@app.route("/developments/<development_id>/followup/<followup_id>/edit", methods=["GET", "POST"])
+@login_required
+def development_followup_edit(development_id, followup_id):
+    doc_ref = db.collection("development_followups").document(followup_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        flash("找不到這筆追蹤紀錄", "danger")
+        return redirect(url_for("development_detail", development_id=development_id))
+
+    followup = doc_to_dict(doc)
+    if request.method == "POST":
+        contact_time = request.form.get("contact_time", "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M")
+        channel = request.form.get("channel", "").strip()
+        content = request.form.get("content", "").strip()
+        next_action = request.form.get("next_action", "").strip()
+        next_contact_date = request.form.get("next_contact_date", "").strip()
+        doc_ref.update({
+            "contact_time": contact_time,
+            "channel": channel,
+            "content": content,
+            "next_action": next_action,
+            "next_contact_date": next_contact_date,
+        })
+        flash("已更新追蹤紀錄", "success")
+        return redirect(url_for("development_detail", development_id=development_id))
+
+    return render_template("development_followup_edit.html", development_id=development_id, followup=followup)
+
+
+@app.route("/developments/<development_id>/followup/<followup_id>/delete", methods=["POST"])
+@login_required
+def development_followup_delete(development_id, followup_id):
+    db.collection("development_followups").document(followup_id).delete()
+    flash("已刪除追蹤紀錄", "info")
+    return redirect(url_for("development_detail", development_id=development_id))
+
+
+@app.route("/developments/download")
+@login_required
+def download_developments():
+    docs = db.collection("developments").stream()
+    items = [doc_to_dict(d) for d in docs]
+
+    si = StringIO()
+    writer = csv.writer(si)
+    writer.writerow(["id", "日期", "姓名", "電話", "紀錄", "進度", "網址", "來源", "標籤", "建立時間", "建立者"])
+    for item in items:
+        writer.writerow([
+            item.get("id", ""),
+            item.get("record_date", ""),
+            item.get("name", ""),
+            item.get("phone", ""),
+            item.get("note", ""),
+            item.get("stage", ""),
+            item.get("url", ""),
+            item.get("source", ""),
+            ",".join(item.get("labels", []) or []),
+            item.get("created_at", ""),
+            item.get("created_by_name", ""),
+        ])
+    csv_data = '\ufeff' + si.getvalue()
+    response = Response(csv_data, mimetype="text/csv; charset=utf-8")
+    response.headers["Content-Disposition"] = "attachment; filename=developments.csv"
+    return response
+
+
 if __name__ == "__main__":
     app.run(debug=True)
