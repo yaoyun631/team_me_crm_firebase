@@ -5950,3 +5950,271 @@ def process_line_message_event(event):
         )
 
     return result
+
+
+
+# ========= quoted reply followup fix for buyer / seller / development =========
+
+def _collection_key_by_target(target_type: str):
+    if target_type == "buyer":
+        return "buyers", "buyer_followups", "buyer_id", "客需"
+    if target_type == "seller":
+        return "sellers", "seller_followups", "seller_id", "委託"
+    return "developments", "development_followups", "development_id", "開發"
+
+def _find_docs_by_phone_in_collection(target_type: str, phone: str):
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return []
+    collection_name, _, _, _ = _collection_key_by_target(target_type)
+    hits = []
+    for doc in db.collection(collection_name).stream():
+        data = doc.to_dict() or {}
+        if normalize_phone(data.get("phone", "")) == normalized:
+            hits.append(doc)
+    return hits
+
+def _resolve_target_doc_from_link(link):
+    target_type = (link.get("target_type") or "").strip()
+    if target_type not in ("buyer", "seller", "development"):
+        return target_type, None, []
+    collection_name, _, _, _ = _collection_key_by_target(target_type)
+    target_id = (link.get("target_id") or "").strip()
+    if target_id:
+        doc = db.collection(collection_name).document(target_id).get()
+        if doc.exists:
+            return target_type, doc, []
+    phone = (link.get("phone") or "").strip()
+    if phone:
+        docs = _find_docs_by_phone_in_collection(target_type, phone)
+        if len(docs) == 1:
+            return target_type, docs[0], []
+        if len(docs) > 1:
+            return target_type, None, docs
+    name = (link.get("customer_name") or "").strip()
+    if name:
+        docs = list(db.collection(collection_name).where("name", "==", name).limit(5).stream())
+        if len(docs) == 1:
+            return target_type, docs[0], []
+        if len(docs) > 1:
+            return target_type, None, docs
+    return target_type, None, []
+
+def _describe_doc_brief(target_type: str, doc):
+    data = doc.to_dict() or {}
+    return f"{data.get('name','未填姓名')} / {data.get('phone','-')} / {data.get('address','-')}"
+
+def _parse_quoted_reply_updates(target_type: str, raw_text: str):
+    text = (raw_text or "").strip()
+    updates = {}
+    note_lines = []
+    touched_field = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", line)
+        if not m:
+            note_lines.append(line)
+            continue
+        key = normalize_line_key(m.group(1))
+        value = (m.group(2) or "").strip()
+        touched_field = True
+        if key in ("stage", "current_stage"):
+            updates["stage"] = normalize_development_status(value) if target_type == "development" else value
+        elif key == "next_action":
+            updates["next_action"] = normalize_development_next_action(value) if target_type == "development" else value
+        elif key in ("next_contact_date", "next_action_date"):
+            updates["next_contact_date"] = value
+        elif key == "registered_address" and target_type == "development":
+            updates["registered_address"] = value
+        elif key in ("address", "phone", "name", "url", "source"):
+            updates[key] = value
+        elif key == "content":
+            if value:
+                note_lines.append(value)
+        else:
+            note_lines.append(line)
+    joined_note = "\n".join([x for x in note_lines if x]).strip()
+    if target_type == "development":
+        plain_status_map = {
+            "已連繫": "已聯繫",
+            "已聯繫": "已聯繫",
+            "已連絡": "已聯繫",
+            "已聯絡": "已聯繫",
+            "待聯繫": "待聯繫",
+            "待聯絡": "待聯繫",
+            "已寄開發信": "已寄開發信待跑開發",
+            "持續追蹤": "持續追蹤",
+            "未接": "待聯繫",
+            "未接，再聯繫": "待聯繫",
+        }
+        if not updates.get("stage"):
+            s = plain_status_map.get(text, "")
+            if s:
+                updates["stage"] = s
+        if not updates.get("registered_address") and _looks_like_address(text):
+            updates["registered_address"] = text
+    followup_text = joined_note or text
+    return updates, followup_text
+
+def process_quote_context_message(event):
+    message = event.get("message") or {}
+    quoted_message_id = message.get("quotedMessageId", "")
+    raw_text = (message.get("text") or "").strip()
+    if not quoted_message_id or not raw_text:
+        return {"handled": False}
+    link = get_line_message_link(quoted_message_id)
+    if not link:
+        return {"handled": False}
+    target_type, doc, multi = _resolve_target_doc_from_link(link)
+    if target_type not in ("buyer", "seller", "development"):
+        return {"handled": False}
+    if multi:
+        preview = "\n".join([f"- {_describe_doc_brief(target_type, d)}" for d in multi[:5]])
+        return {"handled": True, "ok": False, "reply_text": f"找到多筆同電話/同姓名資料，請確認要註記哪一筆：\n{preview}"}
+    if not doc:
+        label = "客需" if target_type == "buyer" else "委託" if target_type == "seller" else "開發"
+        return {"handled": True, "ok": False, "reply_text": f"找不到對應的{label}資料"}
+    collection_name, _, _, label_text = _collection_key_by_target(target_type)
+    updates, followup_text = _parse_quoted_reply_updates(target_type, raw_text)
+    doc_ref = db.collection(collection_name).document(doc.id)
+    labels = dedupe_keep_order(["LINE紀錄", "群組回覆註記"])
+    extra_updates = {}
+    for k in ("address", "url", "phone", "name"):
+        if updates.get(k):
+            extra_updates[k] = updates[k]
+    if updates.get("next_action") and target_type == "development":
+        extra_updates["next_action"] = updates["next_action"]
+    if updates.get("next_contact_date") and target_type == "development":
+        extra_updates["next_action_date"] = updates["next_contact_date"]
+    update_kwargs = {
+        "target_type": target_type,
+        "doc_ref": doc_ref,
+        "content": build_line_summary(followup_text, event),
+        "labels": labels,
+        "stage": updates.get("stage", ""),
+        "source": link.get("source", "LINE"),
+        "event": event,
+    }
+    if target_type == "development":
+        update_kwargs["registered_address"] = updates.get("registered_address", "")
+        if extra_updates:
+            update_kwargs["extra_updates"] = extra_updates
+    elif extra_updates:
+        update_kwargs["extra_updates"] = extra_updates
+    update_customer_note_and_labels(**update_kwargs)
+    add_customer_followup(
+        target_type=target_type,
+        customer_id=doc.id,
+        content=build_line_summary(followup_text, event),
+        next_action=updates.get("next_action", ""),
+        next_contact_date=updates.get("next_contact_date", ""),
+        labels=labels,
+        line_event=event,
+        stage=updates.get("stage", "") if target_type == "development" else "",
+        registered_address=updates.get("registered_address", "") if target_type == "development" else "",
+    )
+    current = doc_ref.get().to_dict() or {}
+    reply_name = current.get("name", "") or "未填姓名"
+    reply_phone = current.get("phone", "") or "-"
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": f"已註記{label_text}：{reply_name}（{reply_phone}）",
+        "target_type": target_type,
+        "target_id": doc.id,
+        "customer_name": reply_name,
+        "phone": reply_phone,
+        "parsed_tag": "群組回覆註記",
+    }
+
+def process_line_message_event(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+    sender_display_name = get_line_sender_display_name(event)
+    raw_text = message.get("text", "")
+    quoted_result = process_quote_context_message(event)
+    if quoted_result.get("handled"):
+        parsed = {"tag": "群組回覆註記", "action": "quoted_context_note", "fields": {"quoted_message_id": (message or {}).get("quotedMessageId", "")}, "raw_text": raw_text}
+        save_line_log(parsed, event, "success" if quoted_result.get("ok") else "failed", target_type=quoted_result.get("target_type", ""), target_id=quoted_result.get("target_id", ""), note=quoted_result.get("reply_text", ""), sender_display_name=sender_display_name)
+        if quoted_result.get("ok") and quoted_result.get("target_type") and quoted_result.get("target_id"):
+            incoming_message_id = message.get("id", "")
+            save_line_message_link(incoming_message_id, quoted_result["target_type"], quoted_result["target_id"], tag=quoted_result.get("parsed_tag", ""), action="quoted_context_note", customer_name=quoted_result.get("customer_name", ""), phone=quoted_result.get("phone", ""), source_event=event)
+        return quoted_result
+    parsed = parse_line_formatted_message(raw_text)
+    if not parsed:
+        free = _maybe_freeform_development(raw_text) if '_maybe_freeform_development' in globals() else None
+        if free:
+            if free.get("batch"):
+                result = create_development_batch(raw_text, event)
+            else:
+                result = create_development(free["fields"], event)
+            save_line_log({"tag": "自由格式開發", "action": "create_development_batch" if free.get("batch") else "create_development", "fields": free.get("fields", {}), "raw_text": raw_text}, event, "success" if result.get("ok") else "failed", target_type=result.get("target_type", ""), target_id=result.get("target_id", ""), note=result.get("reply_text", ""), sender_display_name=sender_display_name)
+            if result.get("ok") and result.get("target_type") and result.get("target_id"):
+                incoming_message_id = message.get("id", "")
+                save_line_message_link(incoming_message_id, result["target_type"], result["target_id"], tag=result.get("parsed_tag", "自由格式開發"), action="create_development", customer_name=result.get("customer_name", ""), phone=result.get("phone", ""), source_event=event)
+            return result
+        return {"handled": False}
+    fields = parsed["fields"]
+    action = parsed["action"]
+    if action == "create_buyer_need":
+        result = create_buyer_need(fields, event)
+    elif action == "create_seller_listing":
+        result = create_seller_listing(fields, event)
+    elif action == "create_development":
+        result = create_development(fields, event)
+    elif action == "create_development_batch":
+        result = create_development_batch(parsed.get("raw_body") or raw_text, event)
+    elif action == "development_followup":
+        result = add_development_followup_via_line(fields, event)
+    elif action == "query_records":
+        target_type, doc = resolve_customer_record(fields)
+        if not doc and (fields.get("record_id") or fields.get("phone") or fields.get("name") or fields.get("address")):
+            doc = find_customer_record("development", fields.get("record_id",""), fields.get("phone",""), fields.get("name",""), fields.get("address",""))
+            if doc:
+                target_type = "development"
+        if not doc:
+            result = {"handled": True, "ok": False, "reply_text": "查無唯一客戶，請補電話、地址或客戶ID"}
+        else:
+            result = {"handled": True, "ok": True, "reply_text": format_record_timeline(target_type, doc, limit=fields.get("limit", 10)), "target_type": target_type, "target_id": doc.id, "customer_name": (doc.to_dict() or {}).get("name", ""), "phone": (doc.to_dict() or {}).get("phone", ""), "parsed_tag": parsed.get("tag", "")}
+    elif action == "query_contract_end":
+        ok, text, ctx = query_contract_end_text(fields)
+        result = {"handled": True, "ok": ok, "reply_text": text}
+        if ctx:
+            result.update(ctx)
+    else:
+        target_type = fields.get("target_type", "")
+        if action == "buyer_followup":
+            target_type = "buyer"
+        elif action == "seller_followup":
+            target_type = "seller"
+        if target_type not in ("buyer", "seller"):
+            result = {"handled": True, "ok": False, "reply_text": "請提供對象：買方 或 賣方"}
+        else:
+            doc = find_customer_record(target_type=target_type, record_id=fields.get("record_id", ""), phone=fields.get("phone", ""), name=fields.get("name", ""))
+            if not doc:
+                result = {"handled": True, "ok": False, "reply_text": "找不到唯一客戶，請補客戶ID或正確電話"}
+            else:
+                doc_ref = db.collection("buyers" if target_type == "buyer" else "sellers").document(doc.id)
+                labels = dedupe_keep_order(["LINE紀錄"] + ensure_list(fields.get("labels")))
+                summary_parts = []
+                if fields.get("content"):
+                    summary_parts.append(fields["content"])
+                if fields.get("address"):
+                    summary_parts.append(f"地址/物件：{fields['address']}")
+                if fields.get("price"):
+                    summary_parts.append(f"價格：{fields['price']}")
+                summary_text = build_line_summary("；".join(summary_parts).strip() or "LINE 更新", event)
+                update_customer_note_and_labels(target_type=target_type, doc_ref=doc_ref, content=summary_text, labels=labels, stage=fields.get("stage", ""), source=fields.get("source", "LINE"), event=event)
+                if action in ("buyer_followup", "seller_followup", "classify"):
+                    add_customer_followup(target_type=target_type, customer_id=doc.id, content=summary_text, next_action=fields.get("next_action", ""), next_contact_date=fields.get("next_contact_date", ""), labels=labels, line_event=event)
+                label_text = "客需" if target_type == "buyer" else "委託"
+                current_data = doc_ref.get().to_dict() or {}
+                result = {"handled": True, "ok": True, "reply_text": f"已註記{label_text}：{current_data.get('name', '')}（{current_data.get('phone','-')}）", "target_type": target_type, "target_id": doc.id, "customer_name": current_data.get("name", ""), "phone": current_data.get("phone", ""), "parsed_tag": parsed.get("tag", "")}
+    save_line_log(parsed, event, "success" if result.get("ok") else "failed", target_type=result.get("target_type", ""), target_id=result.get("target_id", ""), note=result.get("reply_text", ""), sender_display_name=sender_display_name)
+    if result.get("ok") and result.get("target_type") and result.get("target_id"):
+        incoming_message_id = message.get("id", "")
+        save_line_message_link(incoming_message_id, result["target_type"], result["target_id"], tag=result.get("parsed_tag", ""), action=action, customer_name=result.get("customer_name", ""), phone=result.get("phone", ""), source_event=event)
+    return result
