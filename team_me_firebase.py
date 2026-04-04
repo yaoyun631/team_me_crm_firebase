@@ -1083,28 +1083,41 @@ def process_quote_context_message(event):
 
     target_type = link.get("target_type", "")
     target_id = link.get("target_id", "")
-    if target_type not in ("buyer", "seller") or not target_id:
+    if target_type not in ("buyer", "seller", "development") or not target_id:
         return {"handled": False}
 
-    collection_name = "buyers" if target_type == "buyer" else "sellers"
+    if target_type == "buyer":
+        collection_name = "buyers"
+        label_text = "客需"
+    elif target_type == "seller":
+        collection_name = "sellers"
+        label_text = "委託"
+    else:
+        collection_name = "developments"
+        label_text = "開發"
+
     doc_ref = db.collection(collection_name).document(target_id)
     doc = doc_ref.get()
     if not doc.exists:
-        return {"handled": True, "ok": False, "reply_text": "未寫入：引用的客戶資料不存在"}
+        return {"handled": True, "ok": False, "reply_text": "未寫入：引用的資料不存在"}
 
     labels = dedupe_keep_order(["LINE紀錄", "群組回覆註記"])
-    # 引用/回覆型註記只記錄「新的回覆內容」；
-    # 發話者姓名會由 note 的 source_label 與 followup 的 sender_display_name 另行保留。
     reply_only_text = raw_text
 
-    update_customer_note_and_labels(
-        target_type=target_type,
-        doc_ref=doc_ref,
-        content=reply_only_text,
-        labels=labels,
-        source="LINE",
-        event=event,
-    )
+    update_kwargs = {
+        "target_type": target_type,
+        "doc_ref": doc_ref,
+        "content": reply_only_text,
+        "labels": labels,
+        "source": "LINE",
+        "event": event,
+    }
+    if target_type == "development":
+        update_kwargs["stage"] = ""
+        update_kwargs["registered_address"] = ""
+        update_kwargs["extra_updates"] = {}
+
+    update_customer_note_and_labels(**update_kwargs)
     add_customer_followup(
         target_type=target_type,
         customer_id=target_id,
@@ -1119,18 +1132,25 @@ def process_quote_context_message(event):
         "fields": {"quoted_message_id": quoted_message_id},
         "raw_text": raw_text,
     }
-    save_line_log(parsed, event, "success", target_type=target_type, target_id=target_id, sender_display_name=get_line_sender_display_name(event))
+    save_line_log(
+        parsed,
+        event,
+        "success",
+        target_type=target_type,
+        target_id=target_id,
+        sender_display_name=get_line_sender_display_name(event),
+    )
+    data = doc.to_dict() or {}
     return {
         "handled": True,
         "ok": True,
-        "reply_text": f"已註記到{'客需' if target_type == 'buyer' else '委託'}：{(doc.to_dict() or {}).get('name', '')}",
+        "reply_text": f"已註記{label_text}：{data.get('name', '')}",
         "target_type": target_type,
         "target_id": target_id,
-        "customer_name": (doc.to_dict() or {}).get("name", ""),
-        "phone": (doc.to_dict() or {}).get("phone", ""),
+        "customer_name": data.get("name", ""),
+        "phone": data.get("phone", ""),
         "parsed_tag": "群組回覆註記",
     }
-
 
 def process_line_message_event(event):
     message = event.get("message") or {}
