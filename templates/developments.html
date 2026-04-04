@@ -1,10 +1,33 @@
 {% extends "base.html" %}
 {% block content %}
 
-<div class="d-flex justify-content-between align-items-center mb-3">
-  <h3 class="mb-0">開發列表</h3>
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
   <div>
-    <a href="{{ url_for('download_developments') }}" class="btn btn-outline-success me-2">下載 CSV</a>
+    <h3 class="mb-1">開發列表</h3>
+    <div class="small text-muted">
+      總筆數 <span class="badge bg-dark">{{ total_count or 0 }}</span>
+      {% if filtered_count is defined %}
+        <span class="ms-2">目前顯示 <span class="badge bg-primary">{{ filtered_count }}</span></span>
+      {% endif %}
+      {% if label_docx_enabled %}
+        <span class="ms-2">可列印標籤 <span class="badge bg-success">{{ label_docx_count or 0 }}</span></span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="d-flex gap-2 flex-wrap">
+    {% if label_docx_enabled %}
+      <a href="{{ url_for('development_labels_docx',
+                          q=q,
+                          current_stage=current_stage,
+                          next_action=next_action or '寄開發信',
+                          source=source,
+                          sort_by=sort_by,
+                          show_done=show_done) }}"
+         class="btn btn-primary">
+        生成 Word 16格標籤
+      </a>
+    {% endif %}
+    <a href="{{ url_for('download_developments') }}" class="btn btn-outline-success">下載 CSV</a>
   </div>
 </div>
 
@@ -36,7 +59,15 @@
       {% endfor %}
     </select>
   </div>
-  <div class="col-6 col-md-auto form-check d-flex align-items-center ms-2">
+  <div class="col-6 col-md-auto">
+    <select name="sort_by" class="form-select">
+      <option value="created_at_desc" {% if sort_by == "created_at_desc" %}selected{% endif %}>最新在前</option>
+      <option value="created_at_asc" {% if sort_by == "created_at_asc" %}selected{% endif %}>最舊在前</option>
+      <option value="name_asc" {% if sort_by == "name_asc" %}selected{% endif %}>姓名 A→Z</option>
+      <option value="name_desc" {% if sort_by == "name_desc" %}selected{% endif %}>姓名 Z→A</option>
+    </select>
+  </div>
+  <div class="col-12 col-md-auto form-check d-flex align-items-center ms-2">
     <input class="form-check-input me-2" type="checkbox" name="show_done" value="1" id="show_done"
            {% if show_done == "1" %}checked{% endif %}>
     <label class="form-check-label" for="show_done">顯示已簽回/已拋轉</label>
@@ -45,6 +76,12 @@
     <button class="btn btn-outline-secondary w-100" type="submit">套用</button>
   </div>
 </form>
+
+{% if label_docx_enabled %}
+  <div class="alert alert-info py-2 small">
+    目前已篩選「下一步＝寄開發信」。右上角可直接產生 Word 16 格標籤貼紙，內容會使用「戶籍地址 + 姓名（負責人收）」。
+  </div>
+{% endif %}
 
 <button class="btn btn-primary w-100 d-md-none mb-3"
         type="button"
