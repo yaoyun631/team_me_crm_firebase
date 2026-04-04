@@ -4668,3 +4668,812 @@ def download_developments():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
+
+# ========= 開發自由格式解析（新版覆蓋） =========
+DEVELOPMENT_SOURCE_SELLER_SELF = "屋主自售/踩線"
+DEVELOPMENT_SOURCE_STREET = "掃街"
+
+def infer_development_source(explicit_source: str, url: str) -> str:
+    explicit = (explicit_source or "").strip()
+    if explicit in (DEVELOPMENT_SOURCE_STREET, DEVELOPMENT_SOURCE_SELLER_SELF):
+        return explicit
+    if explicit and explicit.upper() != "LINE":
+        return explicit
+    return DEVELOPMENT_SOURCE_SELLER_SELF if (url or "").strip() else DEVELOPMENT_SOURCE_STREET
+
+def normalize_line_key(key: str):
+    k = (key or "").strip().replace(" ", "")
+    mapping = {
+        "對象": "target_type",
+        "類型": "target_type",
+        "目標": "target_type",
+        "客戶類型": "target_type",
+        "電話": "phone",
+        "手機": "phone",
+        "電話號碼": "phone",
+        "姓名": "name",
+        "客戶": "name",
+        "買方": "name",
+        "賣方": "name",
+        "屋主": "name",
+        "客戶來源": "source",
+        "來源": "source",
+        "需求類型": "intent_type_raw",
+        "委託類型": "deal_type_raw",
+        "ID": "record_id",
+        "客戶ID": "record_id",
+        "buyer_id": "record_id",
+        "seller_id": "record_id",
+        "development_id": "record_id",
+        "內容": "content",
+        "紀錄": "content",
+        "備註": "content",
+        "說明": "content",
+        "進度內容": "content",
+        "進程": "current_stage",
+        "階段": "current_stage",
+        "狀態": "current_stage",
+        "進度": "current_stage",
+        "目前狀況": "current_stage",
+        "目前狀態": "current_stage",
+        "標籤": "labels",
+        "分類": "labels",
+        "labels": "labels",
+        "下一步": "next_action",
+        "下次行動": "next_action",
+        "next_action": "next_action",
+        "下一次時間": "next_action_date",
+        "下次時間": "next_action_date",
+        "下次日期": "next_action_date",
+        "下次聯絡日": "next_action_date",
+        "下次聯絡日期": "next_action_date",
+        "next_contact_date": "next_action_date",
+        "地址": "address",
+        "物件": "address",
+        "案名": "address",
+        "戶籍地址": "registered_address",
+        "戶籍地": "registered_address",
+        "網址": "url",
+        "連結": "url",
+        "網站": "url",
+        "日期": "record_date",
+        "總價": "price",
+        "價格": "price",
+        "預算": "budget",
+        "區域": "preferred_areas",
+        "產品類型": "property_type",
+        "房數": "room_range",
+        "車位": "car_need",
+        "開價": "expected_price",
+        "底價": "min_price",
+        "委託到期日": "contract_end_date",
+        "筆數": "limit",
+    }
+    return mapping.get(k, k)
+
+def _looks_like_url(line: str) -> bool:
+    s = (line or "").strip()
+    return bool(re.search(r'(https?://|www\.|591\.com|rakuya|house|chyi\.com)', s, re.I))
+
+def _extract_first_url(line: str) -> str:
+    m = re.search(r'(https?://\S+|www\.\S+)', line or '', re.I)
+    return m.group(1).strip() if m else ''
+
+def _looks_like_phone(line: str) -> bool:
+    s = re.sub(r'\s+', '', line or '')
+    return bool(re.search(r'(09\d{2}[- ]?\d{3}[- ]?\d{3}|0\d{1,2}[- ]?\d{6,8})', s))
+
+def _extract_first_phone(line: str) -> str:
+    m = re.search(r'(09\d{2}[- ]?\d{3}[- ]?\d{3}|0\d{1,2}[- ]?\d{6,8})', line or '')
+    return m.group(1).strip() if m else ''
+
+def _looks_like_address(line: str) -> bool:
+    s = (line or '').strip()
+    if not s:
+        return False
+    patterns = [
+        r'[台臺]中市?.{0,15}(區|里|路|街|段|巷|弄|號)',
+        r'.+(路|街|大道|段).*(巷|弄|號)',
+        r'.+(路|街|大道|段).*(號)',
+        r'.+(區).*(路|街|段|巷|弄|號)',
+    ]
+    return any(re.search(p, s) for p in patterns)
+
+def _looks_like_name(line: str) -> bool:
+    s = (line or '').strip()
+    if not s or len(s) > 12:
+        return False
+    if _looks_like_url(s) or _looks_like_phone(s) or _looks_like_address(s):
+        return False
+    bad = ['目前狀況','目前狀態','下一步','下次','網址','地址','戶籍地址','備註','來源']
+    if any(b in s for b in bad):
+        return False
+    return True
+
+def _extract_date_text(line: str) -> str:
+    s = (line or '').strip()
+    m = re.search(r'(\d{4}-\d{1,2}-\d{1,2})', s)
+    if m:
+        return m.group(1)
+    m = re.search(r'(\d{1,2}/\d{1,2})', s)
+    if m:
+        mm, dd = m.group(1).split('/')
+        year = datetime.now().year
+        return f"{year}-{int(mm):02d}-{int(dd):02d}"
+    return ''
+
+def _find_status_in_text(text: str) -> str:
+    options = sorted(DEVELOPMENT_STATUS_OPTIONS, key=len, reverse=True)
+    raw = text or ''
+    for opt in options:
+        if opt in raw:
+            return opt
+    aliases = {
+        '已寄開發信': '已寄開發信待跑開發',
+        '待聯絡': '待聯繫',
+        '已聯絡': '已聯繫',
+        '已連繫': '已聯繫',
+        '再聯絡': '持續追蹤',
+        '再聯繫': '持續追蹤',
+    }
+    for k, v in aliases.items():
+        if k in raw:
+            return v
+    return ''
+
+def _find_next_action_in_text(text: str) -> str:
+    options = sorted(DEVELOPMENT_NEXT_ACTION_OPTIONS, key=len, reverse=True)
+    raw = text or ''
+    for opt in options:
+        if opt in raw:
+            return opt
+    aliases = {
+        '電話聯絡': '電話聯繫',
+        'LINE聯絡': 'LINE聯繫',
+        '再次聯絡': '再次聯繫',
+    }
+    for k, v in aliases.items():
+        if k in raw:
+            return v
+    return ''
+
+def parse_flexible_development_chunk(raw_text: str) -> dict:
+    text = (raw_text or '').replace('\r\n', '\n').strip()
+    if not text:
+        return {}
+
+    fields = {}
+    notes = []
+    candidate_names = []
+
+    for raw_line in text.split('\n'):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        m = re.match(r'^([^:：]+)\s*[:：]\s*(.*)$', line)
+        if m:
+            key = normalize_line_key(m.group(1))
+            value = (m.group(2) or '').strip()
+            if key == 'labels':
+                fields[key] = parse_label_csv(value)
+            elif value:
+                fields[key] = value
+            continue
+
+        url = _extract_first_url(line)
+        phone = _extract_first_phone(line)
+        date_txt = _extract_date_text(line)
+
+        if url and not fields.get('url'):
+            fields['url'] = url
+            leftover = line.replace(url, '').strip()
+            if leftover:
+                notes.append(leftover)
+            continue
+
+        if phone and not fields.get('phone'):
+            fields['phone'] = phone
+            leftover = line.replace(phone, '').strip(' ：:')
+            if leftover and _looks_like_name(leftover):
+                candidate_names.append(leftover)
+            elif leftover:
+                notes.append(leftover)
+            continue
+
+        if _looks_like_address(line):
+            if not fields.get('address'):
+                fields['address'] = line
+            elif not fields.get('registered_address') and ('戶籍' in line or '住址' in line):
+                fields['registered_address'] = line
+            else:
+                notes.append(line)
+            continue
+
+        if date_txt and not fields.get('next_action_date') and any(word in line for word in ['下次','再','聯絡','時間','日期']):
+            fields['next_action_date'] = date_txt
+            leftover = line.replace(date_txt, '').strip(' ：:')
+            if leftover and leftover not in ('下次','下次時間','下一次時間','下次日期'):
+                notes.append(leftover)
+            continue
+
+        if _looks_like_name(line):
+            candidate_names.append(line)
+            continue
+
+        notes.append(line)
+
+    if not fields.get('name') and candidate_names:
+        fields['name'] = candidate_names[0]
+
+    joined_notes = '\n'.join(notes).strip()
+    if joined_notes:
+        fields['content'] = ((fields.get('content', '') + '\n' + joined_notes).strip() if fields.get('content') else joined_notes)
+
+    # 自動從整段文字抓狀態 / 下一步 / 日期
+    big_text = text
+    if not fields.get('current_stage'):
+        auto_stage = _find_status_in_text(big_text)
+        fields['current_stage'] = normalize_development_status(auto_stage or '待聯繫')
+    else:
+        fields['current_stage'] = normalize_development_status(fields.get('current_stage'))
+
+    if not fields.get('next_action'):
+        fields['next_action'] = normalize_development_next_action(_find_next_action_in_text(big_text))
+    else:
+        fields['next_action'] = normalize_development_next_action(fields.get('next_action'))
+
+    if not fields.get('next_action_date'):
+        auto_date = _extract_date_text(big_text)
+        if auto_date:
+            fields['next_action_date'] = auto_date
+
+    fields['source'] = infer_development_source(fields.get('source', ''), fields.get('url', ''))
+    if not fields.get('record_date'):
+        fields['record_date'] = datetime.now().strftime('%Y-%m-%d')
+
+    has_any = any(fields.get(k) for k in ['name','phone','address','url','content'])
+    return fields if has_any else {}
+
+def parse_development_batch_message(raw_text: str):
+    text = (raw_text or '').replace('\r\n', '\n').strip()
+    lines = text.split('\n')
+    if lines and lines[0].strip().startswith('#'):
+        lines = lines[1:]
+    body = '\n'.join(lines).strip()
+    if not body:
+        return []
+
+    if re.search(r'(?m)^/{3,}\s*$', body):
+        chunks = [c.strip() for c in re.split(r'(?m)^/{3,}\s*$', body) if c.strip()]
+    elif re.search(r'(?m)^-{3,}\s*$', body):
+        chunks = [c.strip() for c in re.split(r'(?m)^-{3,}\s*$', body) if c.strip()]
+    else:
+        # 沒有分隔線時，嘗試依地址行切段
+        lines2 = [ln.rstrip() for ln in body.split('\n')]
+        chunks, current = [], []
+        seen_first = False
+        for ln in lines2:
+            s = ln.strip()
+            if not s:
+                continue
+            if _looks_like_address(s) and seen_first and current:
+                chunks.append('\n'.join(current).strip())
+                current = [s]
+            else:
+                current.append(s)
+                if _looks_like_address(s):
+                    seen_first = True
+        if current:
+            chunks.append('\n'.join(current).strip())
+
+    items = []
+    for chunk in chunks:
+        fields = parse_flexible_development_chunk(chunk)
+        if fields:
+            items.append(fields)
+    return items
+
+def parse_line_formatted_message(text: str):
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    first = lines[0]
+    if not first.startswith("#"):
+        return None
+
+    tag = first.lstrip("#").strip()
+    tag_map = {
+        "新增客需": "create_buyer_need",
+        "新增委託": "create_seller_listing",
+        "新增開發": "create_development",
+        "新增開發批次": "create_development_batch",
+        "開發追蹤": "development_followup",
+        "買方追蹤": "buyer_followup",
+        "賣方追蹤": "seller_followup",
+        "客戶分類": "classify",
+        "查詢紀錄": "query_records",
+        "查詢委託到期": "query_contract_end",
+        "帶看": "buyer_followup",
+        "成交": "buyer_followup",
+        "委託": "seller_followup",
+        "紀錄": "generic_note",
+    }
+    action = tag_map.get(tag)
+    if not action:
+        return None
+
+    raw_body = "\n".join(lines[1:]).strip()
+
+    if action == "create_development_batch":
+        return {
+            "tag": tag,
+            "action": action,
+            "fields": {},
+            "raw_text": text,
+            "raw_body": raw_body,
+        }
+
+    if action == "create_development":
+        fields = parse_flexible_development_chunk(raw_body)
+        if not fields:
+            return None
+        return {
+            "tag": tag,
+            "action": action,
+            "fields": fields,
+            "raw_text": text,
+            "raw_body": raw_body,
+        }
+
+    fields = {}
+    for line in lines[1:]:
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.+)$", line)
+        if not m:
+            continue
+        key = normalize_line_key(m.group(1))
+        value = m.group(2).strip()
+        if key == "labels":
+            fields[key] = parse_label_csv(value)
+        else:
+            fields[key] = value
+
+    if tag in ("買方追蹤", "帶看", "成交") and not fields.get("target_type"):
+        fields["target_type"] = "buyer"
+    if tag in ("賣方追蹤", "委託") and not fields.get("target_type"):
+        fields["target_type"] = "seller"
+    if tag == "開發追蹤" and not fields.get("target_type"):
+        fields["target_type"] = "development"
+
+    fields["target_type"] = normalize_target_type(fields.get("target_type", "")) or fields.get("target_type", "")
+    fields["intent_type"] = normalize_intent_type(fields.get("intent_type_raw", ""), fields)
+    fields["deal_type"] = normalize_deal_type(fields.get("deal_type_raw", ""))
+    fields["limit"] = parse_int_limit(fields.get("limit", 10), default=10, max_value=30)
+
+    if action == "create_buyer_need":
+        if not (fields.get("name") and fields.get("phone")):
+            return None
+    elif action == "create_seller_listing":
+        if not (fields.get("name") and fields.get("phone")):
+            return None
+    elif action in ("buyer_followup", "seller_followup", "classify", "query_records", "query_contract_end", "development_followup"):
+        if not (fields.get("record_id") or fields.get("phone") or fields.get("name") or fields.get("address")):
+            return None
+
+    return {
+        "tag": tag,
+        "action": action,
+        "fields": fields,
+        "raw_text": text,
+        "raw_body": raw_body,
+    }
+
+def find_development_record(record_id: str = "", phone: str = "", name: str = "", address: str = ""):
+    col = db.collection("developments")
+    if record_id:
+        doc = col.document(record_id).get()
+        if doc.exists:
+            return doc
+    if phone:
+        matches = find_records_by_phone("developments", phone)
+        if len(matches) == 1:
+            return matches[0]
+    if name:
+        docs = list(col.where("name", "==", name.strip()).limit(2).stream())
+        if len(docs) == 1:
+            return docs[0]
+    if address:
+        docs = list(col.where("address", "==", address.strip()).limit(2).stream())
+        if len(docs) == 1:
+            return docs[0]
+    return None
+
+def create_development(fields, event):
+    phone = fields.get("phone", "").strip()
+    name = fields.get("name", "").strip() or "未填姓名"
+    url = fields.get("url", "").strip()
+    source = infer_development_source(fields.get("source", ""), url)
+    address = fields.get("address", "").strip()
+
+    matches = find_records_by_phone("developments", phone) if phone else []
+    if not matches and address:
+        doc = find_development_record(address=address)
+        if doc:
+            matches = [doc]
+
+    labels = build_development_labels(fields.get("labels"))
+    content_text = fields.get("content", "").strip() or address or url or "LINE 新增開發"
+    note_content = build_line_summary(content_text, event)
+
+    payload = {
+        "name": name,
+        "phone": phone,
+        "source": source,
+        "url": url,
+        "address": address,
+        "registered_address": fields.get("registered_address", "").strip(),
+        "current_stage": normalize_development_status(fields.get("current_stage", "").strip() or fields.get("stage", "").strip() or "待聯繫"),
+        "stage": normalize_development_status(fields.get("current_stage", "").strip() or fields.get("stage", "").strip() or "待聯繫"),
+        "next_action": normalize_development_next_action(fields.get("next_action", "").strip()),
+        "next_action_date": fields.get("next_action_date", "").strip() or fields.get("next_contact_date", "").strip(),
+        "record_date": fields.get("record_date", "").strip() or datetime.now().strftime("%Y-%m-%d"),
+        "note": "",
+        "labels": labels,
+        "updated_at": datetime.now().isoformat(),
+        "updated_by_id": "line_bot",
+        "updated_by_name": "LINE Bot",
+        "sender_display_name": get_line_sender_display_name(event) or "",
+    }
+
+    if len(matches) == 1:
+        doc = matches[0]
+        doc_ref = db.collection("developments").document(doc.id)
+        update_customer_note_and_labels(
+            target_type="development",
+            doc_ref=doc_ref,
+            content=note_content,
+            labels=labels,
+            stage=payload["stage"],
+            source=payload["source"],
+            event=event,
+        )
+        doc_ref.update({k: v for k, v in payload.items() if v != "" and k != "note"})
+        add_customer_followup(
+            target_type="development",
+            customer_id=doc.id,
+            content=note_content,
+            next_action=payload.get("next_action", ""),
+            next_contact_date=payload.get("next_action_date", ""),
+            labels=labels,
+            line_event=event,
+        )
+        updated_doc = doc_ref.get().to_dict() or {}
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": f"已註記開發：{updated_doc.get('name', '')}",
+            "target_type": "development",
+            "target_id": doc.id,
+            "customer_name": updated_doc.get("name", ""),
+            "phone": updated_doc.get("phone", ""),
+            "parsed_tag": "新增開發",
+        }
+
+    if len(matches) > 1:
+        return {
+            "handled": True,
+            "ok": False,
+            "reply_text": "未寫入：同電話有多筆開發資料，請補地址或客戶ID",
+        }
+
+    now = datetime.now().isoformat()
+    payload.update({
+        "created_at": now,
+        "created_by_id": "line_bot",
+        "created_by_name": "LINE Bot",
+        "note": append_note_block("", note_content, build_line_operator_label(event)),
+    })
+    doc_ref = db.collection("developments").document()
+    doc_ref.set(payload)
+    add_customer_followup(
+        target_type="development",
+        customer_id=doc_ref.id,
+        content=note_content,
+        next_action=payload.get("next_action", ""),
+        next_contact_date=payload.get("next_action_date", ""),
+        labels=labels,
+        line_event=event,
+    )
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": f"已註記開發：{name}",
+        "target_type": "development",
+        "target_id": doc_ref.id,
+        "customer_name": name,
+        "phone": phone,
+        "parsed_tag": "新增開發",
+    }
+
+def create_development_batch(raw_text, event):
+    items = parse_development_batch_message(raw_text)
+    if not items:
+        return {"handled": True, "ok": False, "reply_text": "未寫入：沒有解析到有效開發資料"}
+
+    ok_count = 0
+    fail_count = 0
+    last_result = None
+    for fields in items:
+        result = create_development(fields, event)
+        last_result = result
+        if result.get("ok"):
+            ok_count += 1
+        else:
+            fail_count += 1
+
+    reply_text = f"批量註記完成：成功 {ok_count} 筆，失敗 {fail_count} 筆"
+    if last_result and last_result.get("target_type") and last_result.get("target_id"):
+        return {
+            "handled": True,
+            "ok": ok_count > 0,
+            "reply_text": reply_text,
+            "target_type": last_result.get("target_type", ""),
+            "target_id": last_result.get("target_id", ""),
+            "customer_name": last_result.get("customer_name", ""),
+            "phone": last_result.get("phone", ""),
+            "parsed_tag": "新增開發批次",
+        }
+    return {"handled": True, "ok": ok_count > 0, "reply_text": reply_text}
+
+def add_development_followup_via_line(fields, event):
+    doc = find_development_record(
+        record_id=fields.get("record_id", ""),
+        phone=fields.get("phone", ""),
+        name=fields.get("name", ""),
+        address=fields.get("address", ""),
+    )
+    if not doc:
+        return {"handled": True, "ok": False, "reply_text": "找不到唯一開發資料，請補電話、地址或客戶ID"}
+
+    content = (fields.get("content") or "").strip() or "LINE 更新"
+    current_stage = normalize_development_status(fields.get("current_stage", "").strip() or fields.get("stage", "").strip())
+    next_action = normalize_development_next_action(fields.get("next_action", "").strip())
+    next_action_date = fields.get("next_action_date", "").strip() or fields.get("next_contact_date", "").strip()
+    registered_address = fields.get("registered_address", "").strip()
+    source = infer_development_source(fields.get("source",""), fields.get("url",""))
+
+    doc_ref = db.collection("developments").document(doc.id)
+    update_customer_note_and_labels(
+        target_type="development",
+        doc_ref=doc_ref,
+        content=build_line_summary(content, event),
+        labels=build_development_labels(fields.get("labels")),
+        stage=current_stage,
+        source=source or None,
+        event=event,
+    )
+    updates = {
+        "updated_at": datetime.now().isoformat(),
+        "updated_by_id": "line_bot",
+        "updated_by_name": "LINE Bot",
+    }
+    if current_stage:
+        updates["current_stage"] = current_stage
+        updates["stage"] = current_stage
+    if next_action:
+        updates["next_action"] = next_action
+    if next_action_date:
+        updates["next_action_date"] = next_action_date
+    if registered_address:
+        updates["registered_address"] = registered_address
+    if source:
+        updates["source"] = source
+    doc_ref.update(updates)
+
+    add_customer_followup(
+        target_type="development",
+        customer_id=doc.id,
+        content=build_line_summary(content, event),
+        next_action=next_action,
+        next_contact_date=next_action_date,
+        labels=build_development_labels(fields.get("labels")),
+        line_event=event,
+    )
+
+    data = doc_ref.get().to_dict() or {}
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": f"已註記開發：{data.get('name', '')}",
+        "target_type": "development",
+        "target_id": doc.id,
+        "customer_name": data.get("name", ""),
+        "phone": data.get("phone", ""),
+        "parsed_tag": "開發追蹤",
+    }
+
+def _maybe_freeform_development(text: str):
+    raw = (text or '').strip()
+    if not raw:
+        return None
+    body = raw
+    if raw.startswith('#'):
+        return None
+    if '///' in raw or re.search(r'(?m)^/{3,}\s*$', raw):
+        items = parse_development_batch_message(raw)
+        return {"batch": True, "items": items} if items else None
+    fields = parse_flexible_development_chunk(raw)
+    return {"batch": False, "fields": fields} if fields else None
+
+def process_line_message_event(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+
+    sender_display_name = get_line_sender_display_name(event)
+    raw_text = message.get("text", "")
+
+    parsed = parse_line_formatted_message(raw_text)
+    if not parsed:
+        free = _maybe_freeform_development(raw_text)
+        if free:
+            if free.get("batch"):
+                result = create_development_batch(raw_text, event)
+            else:
+                result = create_development(free["fields"], event)
+            save_line_log(
+                {"tag": "自由格式開發", "action": "create_development_batch" if free.get("batch") else "create_development",
+                 "fields": free.get("fields", {}), "raw_text": raw_text},
+                event,
+                "success" if result.get("ok") else "failed",
+                target_type=result.get("target_type", ""),
+                target_id=result.get("target_id", ""),
+                note=result.get("reply_text", ""),
+                sender_display_name=sender_display_name,
+            )
+            if result.get("ok") and result.get("target_type") and result.get("target_id"):
+                incoming_message_id = message.get("id", "")
+                save_line_message_link(
+                    incoming_message_id,
+                    result["target_type"],
+                    result["target_id"],
+                    tag=result.get("parsed_tag", "自由格式開發"),
+                    action="create_development",
+                    customer_name=result.get("customer_name", ""),
+                    phone=result.get("phone", ""),
+                    source_event=event,
+                )
+            return result
+
+        quoted_result = process_quote_context_message(event)
+        if quoted_result.get("handled"):
+            return quoted_result
+        return {"handled": False}
+
+    fields = parsed["fields"]
+    action = parsed["action"]
+
+    if action == "create_buyer_need":
+        result = create_buyer_need(fields, event)
+    elif action == "create_seller_listing":
+        result = create_seller_listing(fields, event)
+    elif action == "create_development":
+        result = create_development(fields, event)
+    elif action == "create_development_batch":
+        result = create_development_batch(parsed.get("raw_body") or raw_text, event)
+    elif action == "development_followup":
+        result = add_development_followup_via_line(fields, event)
+    elif action == "query_records":
+        target_type, doc = resolve_customer_record(fields)
+        if not doc and (fields.get("record_id") or fields.get("phone") or fields.get("name") or fields.get("address")):
+            doc = find_development_record(fields.get("record_id",""), fields.get("phone",""), fields.get("name",""), fields.get("address",""))
+            if doc:
+                target_type = "development"
+        if not doc:
+            result = {"handled": True, "ok": False, "reply_text": "查無唯一客戶，請補電話、地址或客戶ID"}
+        else:
+            result = {
+                "handled": True,
+                "ok": True,
+                "reply_text": format_record_timeline(target_type, doc, limit=fields.get("limit", 10)),
+                "target_type": target_type,
+                "target_id": doc.id,
+                "customer_name": (doc.to_dict() or {}).get("name", ""),
+                "phone": (doc.to_dict() or {}).get("phone", ""),
+                "parsed_tag": parsed.get("tag", ""),
+            }
+    elif action == "query_contract_end":
+        ok, text, ctx = query_contract_end_text(fields)
+        result = {"handled": True, "ok": ok, "reply_text": text}
+        if ctx:
+            result.update(ctx)
+    else:
+        target_type = fields.get("target_type", "")
+        if action == "buyer_followup":
+            target_type = "buyer"
+        elif action == "seller_followup":
+            target_type = "seller"
+
+        if target_type not in ("buyer", "seller"):
+            result = {"handled": True, "ok": False, "reply_text": "請提供對象：買方 或 賣方"}
+        else:
+            doc = find_customer_record(
+                target_type=target_type,
+                record_id=fields.get("record_id", ""),
+                phone=fields.get("phone", ""),
+                name=fields.get("name", ""),
+            )
+            if not doc:
+                result = {"handled": True, "ok": False, "reply_text": "找不到唯一客戶，請補客戶ID或正確電話"}
+            else:
+                doc_ref = db.collection("buyers" if target_type == "buyer" else "sellers").document(doc.id)
+                labels = dedupe_keep_order(["LINE紀錄"] + ensure_list(fields.get("labels")))
+                summary_parts = []
+                if fields.get("content"):
+                    summary_parts.append(fields["content"])
+                if fields.get("address"):
+                    summary_parts.append(f"地址/物件：{fields['address']}")
+                if fields.get("price"):
+                    summary_parts.append(f"價格：{fields['price']}")
+                summary_text = build_line_summary("；".join(summary_parts).strip() or "LINE 更新", event)
+
+                update_customer_note_and_labels(
+                    target_type=target_type,
+                    doc_ref=doc_ref,
+                    content=summary_text,
+                    labels=labels,
+                    stage=fields.get("stage", ""),
+                    source=fields.get("source", "LINE"),
+                    event=event,
+                )
+
+                if action in ("buyer_followup", "seller_followup", "classify"):
+                    add_customer_followup(
+                        target_type=target_type,
+                        customer_id=doc.id,
+                        content=summary_text,
+                        next_action=fields.get("next_action", ""),
+                        next_contact_date=fields.get("next_contact_date", ""),
+                        labels=labels,
+                        line_event=event,
+                    )
+
+                label_text = "客需" if target_type == "buyer" else "委託"
+                current_data = doc_ref.get().to_dict() or {}
+                result = {
+                    "handled": True,
+                    "ok": True,
+                    "reply_text": f"已註記{label_text}：{current_data.get('name', '')}",
+                    "target_type": target_type,
+                    "target_id": doc.id,
+                    "customer_name": current_data.get("name", ""),
+                    "phone": current_data.get("phone", ""),
+                    "parsed_tag": parsed.get("tag", ""),
+                }
+
+    save_line_log(
+        parsed,
+        event,
+        "success" if result.get("ok") else "failed",
+        target_type=result.get("target_type", ""),
+        target_id=result.get("target_id", ""),
+        note=result.get("reply_text", ""),
+        sender_display_name=sender_display_name,
+    )
+
+    if result.get("ok") and result.get("target_type") and result.get("target_id"):
+        incoming_message_id = message.get("id", "")
+        save_line_message_link(
+            incoming_message_id,
+            result["target_type"],
+            result["target_id"],
+            tag=result.get("parsed_tag", ""),
+            action=action,
+            customer_name=result.get("customer_name", ""),
+            phone=result.get("phone", ""),
+            source_event=event,
+        )
+
+    return result
