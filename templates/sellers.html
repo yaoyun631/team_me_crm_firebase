@@ -1,8 +1,16 @@
 {% extends "base.html" %}
 {% block content %}
 
-<div class="d-flex justify-content-between align-items-center mb-3">
-  <h3 class="mb-0">委託列表</h3>
+<div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-0">委託列表</h3>
+    <div class="small text-muted mt-1">
+      目前共 <strong>{{ filtered_count or (sellers|length) }}</strong> 筆
+      {% if total_count is defined %}
+        ／ 全部 {{ total_count }} 筆
+      {% endif %}
+    </div>
+  </div>
   <div>
     <a href="{{ url_for('download_sellers') }}" class="btn btn-outline-success me-2">下載 CSV</a>
   </div>
@@ -146,6 +154,19 @@
               </div>
             </div>
 
+            <form method="post" action="{{ url_for('seller_quick_stage', seller_id=s.id) }}" class="quick-stage-form mb-2">
+              <div class="input-group input-group-sm">
+                <label class="input-group-text">調整狀態</label>
+                <select name="stage" class="form-select">
+                  <option value="">目前狀態</option>
+                  {% for opt in seller_stage_options or [] %}
+                    <option value="{{ opt }}" {% if s.stage == opt %}selected{% endif %}>{{ opt }}</option>
+                  {% endfor %}
+                </select>
+                <button type="submit" class="btn btn-outline-primary">更新</button>
+              </div>
+            </form>
+
             <div class="row gx-3 gy-1 small lh-sm meta-grid">
               <div class="col-6">
                 <div><span class="text-muted">來源：</span>{{ s.source or "-" }}</div>
@@ -257,6 +278,7 @@
 .compact-card .card-body { padding: .85rem .95rem; }
 .narrow-text { max-width: 100%; word-break: break-word; }
 .meta-grid { font-size: .9rem; }
+.quick-stage-form .input-group-text { min-width: 78px; }
 @media (max-width: 576px) {
   .compact-card .card-body { padding: .7rem .75rem; }
   .small, .meta-grid { font-size: .78rem; }

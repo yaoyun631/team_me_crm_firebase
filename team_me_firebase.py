@@ -13,7 +13,7 @@
 
 from flask import (
     Flask, render_template, request, redirect,
-    url_for, flash, session, Response, Blueprint
+    url_for, flash, session, Response, Blueprint, send_file
 )
 import os
 import json
@@ -26,6 +26,17 @@ import base64
 import re
 from uuid import uuid4
 from PIL import Image
+
+try:
+    from docx import Document
+    from docx.shared import Mm, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+except Exception:
+    Document = None
+    Mm = Pt = None
+    WD_ALIGN_PARAGRAPH = None
+    WD_CELL_VERTICAL_ALIGNMENT = None
 
 import firebase_admin
 from firebase_admin import credentials, firestore, storage  
@@ -1451,6 +1462,8 @@ def buyers():
         label_options=label_options,
         sort_by=sort_by,
         buyer_stage_options=BUYER_STAGE_OPTIONS,
+        total_count=len(all_buyers),
+        filtered_count=len(buyers_list),
     )
 
 
@@ -1555,6 +1568,26 @@ def buyer_detail(buyer_id):
     followups.sort(key=lambda x: x.get("contact_time", ""), reverse=True)
 
     return render_template("buyer_detail.html", buyer=buyer, followups=followups)
+
+@app.route("/buyers/<buyer_id>/quick-stage", methods=["POST"])
+@login_required
+def buyer_quick_stage(buyer_id):
+    stage = (request.form.get("stage", "") or request.form.get("current_stage", "")).strip()
+    if not stage:
+        flash("請選擇進度", "warning")
+        return redirect(request.referrer or url_for("buyers"))
+    if stage not in BUYER_STAGE_OPTIONS:
+        flash("買方進度不在可選清單內", "danger")
+        return redirect(request.referrer or url_for("buyers"))
+    updates = {
+        "stage": stage,
+        "updated_at": datetime.now().isoformat(),
+        "updated_by_id": session.get("user_id"),
+        "updated_by_name": session.get("user_name"),
+    }
+    db.collection("buyers").document(buyer_id).update(updates)
+    flash("已更新買方進度", "success")
+    return redirect(request.referrer or url_for("buyers"))
 
 
 # ========= 新增買方追蹤紀錄 =========
@@ -1857,6 +1890,8 @@ def sellers():
         label_options=label_options,
         sort_by=sort_by,
         seller_stage_options=SELLER_STAGE_OPTIONS,
+        total_count=len(all_sellers),
+        filtered_count=len(sellers_list),
     )
 
 
@@ -1970,6 +2005,26 @@ def seller_detail(seller_id):
     followups.sort(key=lambda x: x.get("contact_time", ""), reverse=True)
 
     return render_template("seller_detail.html", seller=seller, followups=followups)
+
+@app.route("/sellers/<seller_id>/quick-stage", methods=["POST"])
+@login_required
+def seller_quick_stage(seller_id):
+    stage = (request.form.get("stage", "") or request.form.get("current_stage", "")).strip()
+    if not stage:
+        flash("請選擇目前狀態", "warning")
+        return redirect(request.referrer or url_for("sellers"))
+    if stage not in SELLER_STAGE_OPTIONS:
+        flash("委託狀態不在可選清單內", "danger")
+        return redirect(request.referrer or url_for("sellers"))
+    updates = {
+        "stage": stage,
+        "updated_at": datetime.now().isoformat(),
+        "updated_by_id": session.get("user_id"),
+        "updated_by_name": session.get("user_name"),
+    }
+    db.collection("sellers").document(seller_id).update(updates)
+    flash("已更新委託狀態", "success")
+    return redirect(request.referrer or url_for("sellers"))
 
 
 # ========= 新增賣方追蹤紀錄 =========
@@ -4297,8 +4352,10 @@ def developments():
     show_done = request.args.get("show_done", "").strip()
 
     docs = db.collection("developments").stream()
-    items = [doc_to_dict(d) for d in docs]
-    source_options = sorted({(x.get("source") or "").strip() for x in items if (x.get("source") or "").strip()})
+    all_items = [doc_to_dict(d) for d in docs]
+    total_count = len(all_items)
+    items = list(all_items)
+    source_options = sorted({(x.get("source") or "").strip() for x in all_items if (x.get("source") or "").strip()})
 
     if q:
         items = [
@@ -4344,6 +4401,10 @@ def developments():
         sort_by=sort_by,
         development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
         development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+        total_count=total_count,
+        filtered_count=len(items),
+        label_docx_enabled=(next_action == "寄開發信"),
+        label_docx_count=len([x for x in items if (x.get("registered_address") or "").strip()]),
     )
 
 
@@ -4632,6 +4693,145 @@ def development_followup_delete(development_id, followup_id):
     db.collection("development_followups").document(followup_id).delete()
     flash("已刪除追蹤紀錄", "info")
     return redirect(url_for("development_detail", development_id=development_id))
+
+
+
+
+def _filter_development_items_from_args(args):
+    q = (args.get("q") or "").strip()
+    current_stage = (args.get("current_stage") or "").strip()
+    next_action = (args.get("next_action") or "").strip()
+    source = (args.get("source") or "").strip()
+    sort_by = (args.get("sort_by") or "created_at_desc").strip()
+    show_done = (args.get("show_done") or "").strip()
+
+    items = [doc_to_dict(d) for d in db.collection("developments").stream()]
+    if q:
+        items = [
+            x for x in items
+            if q in (x.get("name") or "")
+            or q in (x.get("phone") or "")
+            or q in (x.get("address") or "")
+            or q in (x.get("registered_address") or "")
+        ]
+    if current_stage:
+        items = [x for x in items if (x.get("current_stage") or x.get("stage") or "") == current_stage]
+    if next_action:
+        items = [x for x in items if (x.get("next_action") or "") == next_action]
+    if source:
+        items = [x for x in items if (x.get("source") or "") == source]
+    if show_done != "1":
+        items = [x for x in items if (x.get("current_stage") or x.get("stage") or "") not in DEVELOPMENT_HIDDEN_BY_DEFAULT]
+
+    def parse_created_at(x):
+        return x.get("created_at") or ""
+
+    if sort_by == "created_at_asc":
+        items.sort(key=parse_created_at)
+    elif sort_by == "created_at_desc":
+        items.sort(key=parse_created_at, reverse=True)
+    elif sort_by == "name_asc":
+        items.sort(key=lambda x: (x.get("name") or ""))
+    elif sort_by == "name_desc":
+        items.sort(key=lambda x: (x.get("name") or ""), reverse=True)
+    else:
+        items.sort(key=parse_created_at, reverse=True)
+    return items
+
+
+def _build_label_recipient_text(name: str) -> str:
+    name = (name or "").strip()
+    return f"{name} - 負責人收" if name else "負責人收"
+
+
+def _build_development_label_rows(items):
+    rows = []
+    for item in items:
+        address = (item.get("registered_address") or "").strip()
+        if not address:
+            continue
+        rows.append({
+            "address": address,
+            "recipient": _build_label_recipient_text(item.get("name", "")),
+        })
+    return rows
+
+
+def _render_development_labels_docx(rows):
+    if Document is None:
+        raise RuntimeError("python-docx 未安裝")
+    doc = Document()
+    section = doc.sections[0]
+    section.top_margin = Mm(7)
+    section.bottom_margin = Mm(7)
+    section.left_margin = Mm(7)
+    section.right_margin = Mm(7)
+
+    page_width = section.page_width - section.left_margin - section.right_margin
+    page_height = section.page_height - section.top_margin - section.bottom_margin
+    col_width = int(page_width / 4)
+    row_height = int(page_height / 4)
+
+    for offset in range(0, len(rows), 16):
+        chunk = rows[offset:offset + 16]
+        if offset > 0:
+            doc.add_page_break()
+        table = doc.add_table(rows=4, cols=4)
+        table.autofit = False
+        for col in table.columns:
+            for cell in col.cells:
+                cell.width = col_width
+        idx = 0
+        for r in range(4):
+            tr = table.rows[r]
+            tr.height = row_height
+            for c in range(4):
+                cell = tr.cells[c]
+                cell.width = col_width
+                cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP if WD_CELL_VERTICAL_ALIGNMENT else None
+                cell.text = ""
+                if idx < len(chunk):
+                    row = chunk[idx]
+                    p1 = cell.paragraphs[0]
+                    p1.alignment = WD_ALIGN_PARAGRAPH.LEFT if WD_ALIGN_PARAGRAPH else None
+                    run1 = p1.add_run(row["address"])
+                    run1.font.size = Pt(11) if Pt else None
+                    run1.bold = False
+                    p2 = cell.add_paragraph()
+                    p2.alignment = WD_ALIGN_PARAGRAPH.LEFT if WD_ALIGN_PARAGRAPH else None
+                    run2 = p2.add_run(row["recipient"])
+                    run2.font.size = Pt(12) if Pt else None
+                    run2.bold = True
+                idx += 1
+    bio = BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio
+
+
+@app.route("/developments/labels-docx")
+@login_required
+def development_labels_docx():
+    args = request.args.to_dict(flat=True)
+    if not (args.get("next_action") or "").strip():
+        args["next_action"] = "寄開發信"
+    items = _filter_development_items_from_args(args)
+    rows = _build_development_label_rows(items)
+    if not rows:
+        flash("目前沒有可列印的寄開發信標籤資料（需有戶籍地址）", "warning")
+        return redirect(request.referrer or url_for("developments", **args))
+    try:
+        bio = _render_development_labels_docx(rows)
+    except Exception as e:
+        flash(f"產生 Word 標籤失敗：{e}", "danger")
+        return redirect(request.referrer or url_for("developments", **args))
+    filename = f"開發信標籤_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+    return send_file(
+        bio,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
 
 
 @app.route("/developments/download")
