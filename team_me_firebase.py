@@ -4664,12 +4664,6 @@ def download_developments():
     response.headers["Content-Disposition"] = "attachment; filename=developments.csv"
     return response
 
-
-
-if __name__ == "__main__":
-    app.run(debug=True)
-
-
 # ========= 開發自由格式解析（新版覆蓋） =========
 DEVELOPMENT_SOURCE_SELLER_SELF = "屋主自售/踩線"
 DEVELOPMENT_SOURCE_STREET = "掃街"
@@ -6218,3 +6212,7 @@ def process_line_message_event(event):
         incoming_message_id = message.get("id", "")
         save_line_message_link(incoming_message_id, result["target_type"], result["target_id"], tag=result.get("parsed_tag", ""), action=action, customer_name=result.get("customer_name", ""), phone=result.get("phone", ""), source_event=event)
     return result
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
