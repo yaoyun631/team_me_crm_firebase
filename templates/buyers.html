@@ -1,14 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
 
-<div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+<div class="d-flex justify-content-between align-items-center mb-3">
   <div>
     <h3 class="mb-0">客需列表</h3>
     <div class="small text-muted mt-1">
-      目前共 <strong>{{ filtered_count or (buyers|length) }}</strong> 筆
-      {% if total_count is defined %}
-        ／ 全部 {{ total_count }} 筆
-      {% endif %}
+      總筆數 <span class="badge bg-dark">{{ total_count or buyers|length }}</span>
+      目前顯示 <span class="badge bg-primary">{{ filtered_count or buyers|length }}</span>
     </div>
   </div>
   <div>
@@ -137,27 +135,22 @@
                 <div class="d-flex flex-wrap align-items-center gap-2 mb-1">
                   <h5 class="mb-0">{{ b.name or "未填姓名" }}</h5>
                   <span class="small text-muted">{{ b.phone or "-" }}</span>
+
+                  <form method="post" action="{{ url_for('buyer_quick_stage', buyer_id=b.id) }}" class="d-inline-flex align-items-center gap-1 ms-1 buyer-stage-inline">
+                    <select name="stage" class="form-select form-select-sm buyer-stage-select">
+                      {% for opt in buyer_stage_options or [] %}
+                        <option value="{{ opt }}" {% if b.stage == opt %}selected{% endif %}>{{ opt }}</option>
+                      {% endfor %}
+                    </select>
+                    <button class="btn btn-sm btn-outline-primary py-0 px-2" type="submit">更新</button>
+                  </form>
                 </div>
                 <div class="small text-muted text-truncate">{{ "租屋" if b.intent_type == "rent" else "買賣" if b.intent_type == "buy" else "-" }}</div>
               </div>
               <div class="text-end">
                 {% if b.level %}<span class="badge bg-primary d-block mb-1">等級 {{ b.level }}</span>{% endif %}
-                {% if b.stage %}<span class="badge bg-secondary d-block">{{ b.stage }}</span>{% endif %}
               </div>
             </div>
-
-            <form method="post" action="{{ url_for('buyer_quick_stage', buyer_id=b.id) }}" class="quick-stage-form mb-2">
-              <div class="input-group input-group-sm">
-                <label class="input-group-text">調整狀態</label>
-                <select name="stage" class="form-select">
-                  <option value="">目前狀態</option>
-                  {% for opt in buyer_stage_options or [] %}
-                    <option value="{{ opt }}" {% if b.stage == opt %}selected{% endif %}>{{ opt }}</option>
-                  {% endfor %}
-                </select>
-                <button type="submit" class="btn btn-outline-primary">更新</button>
-              </div>
-            </form>
 
             <div class="row gx-3 gy-1 small lh-sm meta-grid">
               <div class="col-6">
@@ -173,24 +166,34 @@
             </div>
 
             {% if b.latest_followup %}
-              <div class="mt-2 p-2 bg-light rounded small">
-                <div class="text-muted mb-1">最後追蹤｜{{ b.latest_followup.contact_time or "-" }}{% if b.latest_followup.channel %}｜{{ b.latest_followup.channel }}{% endif %}</div>
-                {% set follow_text = b.latest_followup.content or "" %}
-                <div class="narrow-text">
-                  <span>{{ follow_text[:70] }}{% if follow_text|length > 70 %}...{% endif %}</span>
-                  {% if follow_text|length > 70 %}
-                    <details class="mt-1"><summary>繼續閱讀</summary><div class="mt-1">{{ follow_text }}</div></details>
-                  {% endif %}
+              <div class="mt-2 latest-row">
+                <div class="latest-left p-2 bg-light rounded small">
+                  <div class="text-muted mb-1">最後追蹤｜{{ b.latest_followup.contact_time or "-" }}{% if b.latest_followup.channel %}｜{{ b.latest_followup.channel }}{% endif %}</div>
+                  {% set follow_text = b.latest_followup.content or "" %}
+                  <div class="narrow-text">
+                    <span>{{ follow_text[:90] }}{% if follow_text|length > 90 %}...{% endif %}</span>
+                    {% if follow_text|length > 90 %}
+                      <details class="mt-1"><summary>繼續閱讀</summary><div class="mt-1">{{ follow_text }}</div></details>
+                    {% endif %}
+                  </div>
+                </div>
+                <div class="latest-right">
+                  <div class="d-grid gap-2">
+                    <a href="{{ url_for('buyer_detail', buyer_id=b.id) }}" class="btn btn-sm btn-outline-primary">詳細 / 追蹤</a>
+                    <form method="post" action="{{ url_for('buyer_delete', buyer_id=b.id) }}" onsubmit="return confirm('確定要刪除這位客需及所有追蹤紀錄嗎？');">
+                      <button type="submit" class="btn btn-sm btn-outline-danger w-100">刪除</button>
+                    </form>
+                  </div>
                 </div>
               </div>
+            {% else %}
+              <div class="d-flex justify-content-end gap-2 mt-2 flex-wrap">
+                <a href="{{ url_for('buyer_detail', buyer_id=b.id) }}" class="btn btn-sm btn-outline-primary">詳細 / 追蹤</a>
+                <form method="post" action="{{ url_for('buyer_delete', buyer_id=b.id) }}" onsubmit="return confirm('確定要刪除這位客需及所有追蹤紀錄嗎？');">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
+                </form>
+              </div>
             {% endif %}
-
-            <div class="d-flex justify-content-end gap-2 mt-2 flex-wrap">
-              <a href="{{ url_for('buyer_detail', buyer_id=b.id) }}" class="btn btn-sm btn-outline-primary">詳細 / 追蹤</a>
-              <form method="post" action="{{ url_for('buyer_delete', buyer_id=b.id) }}" onsubmit="return confirm('確定要刪除這位客需及所有追蹤紀錄嗎？');">
-                <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
-              </form>
-            </div>
           </div>
         </div>
       {% endfor %}
@@ -259,10 +262,16 @@
 .compact-card .card-body { padding: .85rem .95rem; }
 .narrow-text { max-width: 100%; word-break: break-word; }
 .meta-grid { font-size: .9rem; }
-.quick-stage-form .input-group-text { min-width: 78px; }
+.buyer-stage-inline { flex-wrap: nowrap; }
+.buyer-stage-select { width: 118px; min-width: 118px; font-size: .8rem; padding-top: .2rem; padding-bottom: .2rem; }
+.latest-row { display: grid; grid-template-columns: minmax(0, 1fr) 116px; gap: .6rem; align-items: start; }
+.latest-right .btn { white-space: nowrap; }
 @media (max-width: 576px) {
   .compact-card .card-body { padding: .7rem .75rem; }
   .small, .meta-grid { font-size: .78rem; }
+  .buyer-stage-select { width: 96px; min-width: 96px; font-size: .74rem; }
+  .latest-row { grid-template-columns: minmax(0, 1fr) 92px; gap: .45rem; }
+  .latest-right .btn { font-size: .72rem; padding-left: .35rem; padding-right: .35rem; }
 }
 </style>
 

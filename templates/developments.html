@@ -1,28 +1,18 @@
 {% extends "base.html" %}
 {% block content %}
 
-<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <div>
-    <h3 class="mb-1">開發列表</h3>
-    <div class="small text-muted">
+    <h3 class="mb-0">開發列表</h3>
+    <div class="small text-muted mt-1">
       總筆數 <span class="badge bg-dark">{{ total_count or 0 }}</span>
-      {% if filtered_count is defined %}
-        <span class="ms-2">目前顯示 <span class="badge bg-primary">{{ filtered_count }}</span></span>
-      {% endif %}
-      {% if label_docx_enabled %}
-        <span class="ms-2">可列印標籤 <span class="badge bg-success">{{ label_docx_count or 0 }}</span></span>
-      {% endif %}
+      目前顯示 <span class="badge bg-primary">{{ filtered_count or (developments|length) }}</span>
+      可列印標籤 <span class="badge bg-success">{{ printable_count or 0 }}</span>
     </div>
   </div>
   <div class="d-flex gap-2 flex-wrap">
-    {% if label_docx_enabled %}
-      <a href="{{ url_for('development_labels_docx',
-                          q=q,
-                          current_stage=current_stage,
-                          next_action=next_action or '寄開發信',
-                          source=source,
-                          sort_by=sort_by,
-                          show_done=show_done) }}"
+    {% if next_action == "寄開發信" %}
+      <a href="{{ url_for('development_labels_docx', q=q, current_stage=current_stage, next_action=next_action, source=source, sort_by=sort_by, show_done=show_done) }}"
          class="btn btn-primary">
         生成 Word 16格標籤
       </a>
@@ -67,7 +57,7 @@
       <option value="name_desc" {% if sort_by == "name_desc" %}selected{% endif %}>姓名 Z→A</option>
     </select>
   </div>
-  <div class="col-12 col-md-auto form-check d-flex align-items-center ms-2">
+  <div class="col-12 col-md-auto form-check d-flex align-items-center ms-md-2">
     <input class="form-check-input me-2" type="checkbox" name="show_done" value="1" id="show_done"
            {% if show_done == "1" %}checked{% endif %}>
     <label class="form-check-label" for="show_done">顯示已簽回/已拋轉</label>
@@ -77,9 +67,9 @@
   </div>
 </form>
 
-{% if label_docx_enabled %}
+{% if next_action == "寄開發信" %}
   <div class="alert alert-info py-2 small">
-    目前已篩選「下一步＝寄開發信」。右上角可直接產生 Word 16 格標籤貼紙，內容會使用「戶籍地址 + 姓名（負責人收）」。
+    右上角可直接生成 Word 16 格標籤貼紙
   </div>
 {% endif %}
 
@@ -109,7 +99,7 @@
             <select name="source" class="form-select">
               <option value="">未設定</option>
               <option value="掃街">掃街</option>
-              <option value="踩線">踩線</option>
+              <option value="踩線/屋主自售">踩線/屋主自售</option>
               <option value="LINE">LINE</option>
               <option value="591">591</option>
             </select>
@@ -187,7 +177,15 @@
                 <div><span class="text-muted">下一次時間：</span>{{ d.next_action_date or "-" }}</div>
               </div>
               <div class="col-6">
-                <div><span class="text-muted">戶籍地址：</span>{% if d.registered_address %}{{ d.registered_address }} <a href="https://www.google.com/maps/search/?api=1&query={{ d.registered_address|urlencode }}" target="_blank" class="ms-1">導航</a>{% else %}-{% endif %}</div>
+                <div>
+                  <span class="text-muted">戶籍地址：</span>
+                  {% if d.registered_address %}
+                    {{ d.registered_address }}
+                    <a href="https://www.google.com/maps/search/?api=1&query={{ d.registered_address|urlencode }}" target="_blank" class="ms-1">導航</a>
+                  {% else %}
+                    -
+                  {% endif %}
+                </div>
                 <div><span class="text-muted">日期：</span>{{ d.record_date or "-" }}</div>
                 <div><span class="text-muted">建立者：</span>{{ d.created_by_name or "-" }}</div>
               </div>
@@ -207,33 +205,26 @@
             {% endif %}
 
             <form method="post" action="{{ url_for('development_quick_flow', development_id=d.id) }}" class="mt-3">
-              <div class="row g-2">
-                <div class="col-md-4">
-                  <label class="form-label small text-muted mb-1">目前狀況</label>
-                  <select name="current_stage" class="form-select form-select-sm">
-                    {% for opt in development_current_stage_options %}
-                      <option value="{{ opt }}" {% if d.current_stage == opt %}selected{% endif %}>{{ opt }}</option>
-                    {% endfor %}
-                  </select>
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label small text-muted mb-1">下一步</label>
-                  <select name="next_action" class="form-select form-select-sm">
-                    <option value="">-</option>
-                    {% for opt in development_next_action_options %}
-                      <option value="{{ opt }}" {% if d.next_action == opt %}selected{% endif %}>{{ opt }}</option>
-                    {% endfor %}
-                  </select>
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label small text-muted mb-1">下一次時間</label>
-                  <input type="date" name="next_action_date" class="form-control form-control-sm" value="{{ d.next_action_date or '' }}">
-                </div>
-              </div>
-              <div class="d-flex justify-content-end gap-2 mt-2 flex-wrap">
-                <button class="btn btn-sm btn-outline-primary" type="submit">存</button>
-                <a href="{{ url_for('development_detail', development_id=d.id) }}" class="btn btn-sm btn-outline-primary">詳細 / 追蹤</a>
-                <button form="delete-development-{{ d.id }}" type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
+              <div class="quick-flow-inline">
+                <select name="current_stage" class="form-select form-select-sm quick-flow-select" title="目前狀況" aria-label="目前狀況">
+                  {% for opt in development_current_stage_options %}
+                    <option value="{{ opt }}" {% if d.current_stage == opt %}selected{% endif %}>{{ opt }}</option>
+                  {% endfor %}
+                </select>
+
+                <select name="next_action" class="form-select form-select-sm quick-flow-select quick-flow-next" title="下一步" aria-label="下一步">
+                  <option value="">-</option>
+                  {% for opt in development_next_action_options %}
+                    <option value="{{ opt }}" {% if d.next_action == opt %}selected{% endif %}>{{ opt }}</option>
+                  {% endfor %}
+                </select>
+
+                <input type="date" name="next_action_date" class="form-control form-control-sm quick-flow-date"
+                       value="{{ d.next_action_date or '' }}" title="下一次時間" aria-label="下一次時間">
+
+                <button class="btn btn-sm btn-outline-primary quick-flow-btn" type="submit">存</button>
+                <a href="{{ url_for('development_detail', development_id=d.id) }}" class="btn btn-sm btn-outline-primary quick-flow-btn">詳細 / 追蹤</a>
+                <button form="delete-development-{{ d.id }}" type="submit" class="btn btn-sm btn-outline-danger quick-flow-btn">刪除</button>
               </div>
             </form>
             <form id="delete-development-{{ d.id }}" method="post" action="{{ url_for('development_delete', development_id=d.id) }}" onsubmit="return confirm('確定要刪除這筆開發與相關追蹤紀錄嗎？');"></form>
@@ -262,7 +253,7 @@
           <select name="source" class="form-select">
             <option value="">未設定</option>
             <option value="掃街">掃街</option>
-            <option value="踩線">踩線</option>
+            <option value="踩線/屋主自售">踩線/屋主自售</option>
             <option value="LINE">LINE</option>
             <option value="591">591</option>
           </select>
@@ -316,9 +307,44 @@
 .compact-card .card-body { padding: .85rem .95rem; }
 .narrow-text { max-width: 100%; word-break: break-word; }
 .meta-grid { font-size: .9rem; }
+
+.quick-flow-inline {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: .45rem;
+  overflow-x: auto;
+  padding-bottom: .1rem;
+  -webkit-overflow-scrolling: touch;
+}
+.quick-flow-inline::-webkit-scrollbar {
+  height: 6px;
+}
+.quick-flow-select {
+  flex: 0 0 110px;
+  min-width: 110px;
+}
+.quick-flow-next {
+  flex-basis: 118px;
+  min-width: 118px;
+}
+.quick-flow-date {
+  flex: 0 0 128px;
+  min-width: 128px;
+}
+.quick-flow-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 @media (max-width: 576px) {
   .compact-card .card-body { padding: .7rem .75rem; }
   .small, .meta-grid { font-size: .78rem; }
+  .quick-flow-inline { gap: .35rem; }
+  .quick-flow-select { min-width: 102px; flex-basis: 102px; }
+  .quick-flow-next { min-width: 110px; flex-basis: 110px; }
+  .quick-flow-date { min-width: 122px; flex-basis: 122px; }
+  .quick-flow-btn { padding: .25rem .45rem; }
 }
 </style>
 

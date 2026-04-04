@@ -26,6 +26,7 @@ import base64
 import re
 from uuid import uuid4
 from PIL import Image
+from copy import deepcopy
 
 try:
     from docx import Document
@@ -4739,70 +4740,147 @@ def _filter_development_items_from_args(args):
     return items
 
 
-def _build_label_recipient_text(name: str) -> str:
-    name = (name or "").strip()
-    return f"{name} - 負責人收" if name else "負責人收"
+
+def _build_label_recipient_text(item) -> str:
+    """
+    第二行優先顯示使用者輸入的標題，沒有的話才退回姓名。
+    不再自動補「負責人收」。
+    """
+    if isinstance(item, dict):
+        return (item.get("label_title") or item.get("name") or "").strip()
+    return (item or "").strip()
 
 
 def _build_development_label_rows(items):
     rows = []
     for item in items:
-        address = (item.get("registered_address") or "").strip()
+        # 開發列表目前有顯示的資料都要能印。
+        # 優先用戶籍地址；若沒有戶籍地址，就退回一般地址。
+        address = (item.get("registered_address") or item.get("address") or "").strip()
         if not address:
             continue
         rows.append({
             "address": address,
-            "recipient": _build_label_recipient_text(item.get("name", "")),
+            "recipient": _build_label_recipient_text(item),
         })
     return rows
 
 
+def _find_development_label_template_path():
+    """
+    以使用者提供的 Word 標籤模板為準，直接套用原始版型，
+    讓字體、字級、段落間距、表格尺寸都跟模板完全一致。
+    """
+    candidates = []
+    env_path = (os.environ.get("DEVELOPMENT_LABEL_TEMPLATE_PATH") or "").strip()
+    if env_path:
+        candidates.append(env_path)
+
+    candidates.extend([
+        os.path.join(BASE_DIR, "空白標籤輸入表.docx"),
+        os.path.join(BASE_DIR, "development_label_template.docx"),
+        "空白標籤輸入表.docx",
+        "development_label_template.docx",
+    ])
+
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return ""
+
+
+def _clear_paragraph_text_preserve_format(paragraph):
+    for run in paragraph.runs:
+        run.text = ""
+
+
+def _write_text_into_template_paragraph(paragraph, text: str):
+    text = text or ""
+    if paragraph.runs:
+        paragraph.runs[0].text = text
+        for run in paragraph.runs[1:]:
+            run.text = ""
+    else:
+        paragraph.add_run(text)
+
+
+def _fill_label_cell_like_template(cell, address: str, recipient: str):
+    """
+    直接沿用模板 cell 內原有的段落結構：
+    第 1 段空白
+    第 2 段地址
+    第 3 段空白
+    第 4 段標題/姓名
+    這樣字型、字級、粗細、每段之間的距離都會維持跟模板一致。
+    """
+    while len(cell.paragraphs) < 4:
+        cell.add_paragraph()
+
+    for p in cell.paragraphs:
+        _clear_paragraph_text_preserve_format(p)
+
+    _write_text_into_template_paragraph(cell.paragraphs[1], (address or "").strip())
+    _write_text_into_template_paragraph(cell.paragraphs[3], (recipient or "").strip())
+
+
 def _render_development_labels_docx(rows):
+    """
+    使用使用者提供的空白 Word 標籤模板直接填值，
+    讓輸出格式與原模板完全一致（字體 / 字級 / 行距 / 欄距 / 表格尺寸）。
+    """
     if Document is None:
         raise RuntimeError("python-docx 未安裝")
-    doc = Document()
-    section = doc.sections[0]
-    section.top_margin = Mm(7)
-    section.bottom_margin = Mm(7)
-    section.left_margin = Mm(7)
-    section.right_margin = Mm(7)
 
-    page_width = section.page_width - section.left_margin - section.right_margin
-    page_height = section.page_height - section.top_margin - section.bottom_margin
-    col_width = int(page_width / 4)
-    row_height = int(page_height / 4)
+    template_path = _find_development_label_template_path()
+    if not template_path:
+        raise RuntimeError("找不到標籤模板，請把『空白標籤輸入表.docx』放在專案根目錄")
 
-    for offset in range(0, len(rows), 16):
-        chunk = rows[offset:offset + 16]
-        if offset > 0:
-            doc.add_page_break()
-        table = doc.add_table(rows=4, cols=4)
-        table.autofit = False
-        for col in table.columns:
-            for cell in col.cells:
-                cell.width = col_width
-        idx = 0
-        for r in range(4):
-            tr = table.rows[r]
-            tr.height = row_height
-            for c in range(4):
-                cell = tr.cells[c]
-                cell.width = col_width
-                cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP if WD_CELL_VERTICAL_ALIGNMENT else None
-                cell.text = ""
-                if idx < len(chunk):
-                    row = chunk[idx]
-                    p1 = cell.paragraphs[0]
-                    p1.alignment = WD_ALIGN_PARAGRAPH.LEFT if WD_ALIGN_PARAGRAPH else None
-                    run1 = p1.add_run(row["address"])
-                    run1.font.size = Pt(11) if Pt else None
-                    run1.bold = False
-                    p2 = cell.add_paragraph()
-                    p2.alignment = WD_ALIGN_PARAGRAPH.LEFT if WD_ALIGN_PARAGRAPH else None
-                    run2 = p2.add_run(row["recipient"])
-                    run2.font.size = Pt(12) if Pt else None
-                    run2.bold = True
-                idx += 1
+    doc = Document(template_path)
+    body = doc._body._element
+
+    labels_per_page = 16
+    needed_pages = max(1, (len(rows) + labels_per_page - 1) // labels_per_page)
+
+    if not doc.tables:
+        raise RuntimeError("標籤模板內沒有表格，無法產生標籤")
+
+    # 模板結構：每頁 1 個 8x2 表格，表格後接一個分頁段落
+    body_children = list(body)
+    if len(body_children) < 2:
+        raise RuntimeError("標籤模板結構異常，請重新提供模板檔")
+
+    proto_table = deepcopy(body_children[0])
+    proto_separator = deepcopy(body_children[1])
+
+    current_pages = len(doc.tables)
+    while current_pages < needed_pages:
+        insert_at = max(0, len(body) - 2)   # 保留最後的空白段落與 sectPr
+        body.insert(insert_at, deepcopy(proto_table))
+        body.insert(insert_at + 1, deepcopy(proto_separator))
+        current_pages += 1
+
+    # 只保留實際需要的頁數，其餘模板頁刪掉，避免印出空白頁
+    keep_prefix_count = needed_pages * 2
+    for el in list(body)[keep_prefix_count:-2]:
+        body.remove(el)
+
+    all_cells = []
+    for table in doc.tables[:needed_pages]:
+        for row in table.rows:
+            for cell in row.cells:
+                all_cells.append(cell)
+
+    for idx, cell in enumerate(all_cells):
+        if idx < len(rows):
+            row = rows[idx]
+            _fill_label_cell_like_template(
+                cell,
+                row.get("address", ""),
+                row.get("recipient", ""),
+            )
+        else:
+            _fill_label_cell_like_template(cell, "", "")
+
     bio = BytesIO()
     doc.save(bio)
     bio.seek(0)
@@ -4818,7 +4896,7 @@ def development_labels_docx():
     items = _filter_development_items_from_args(args)
     rows = _build_development_label_rows(items)
     if not rows:
-        flash("目前沒有可列印的寄開發信標籤資料（需有戶籍地址）", "warning")
+        flash("目前沒有可列印的寄開發信標籤資料（需有戶籍地址或地址）", "warning")
         return redirect(request.referrer or url_for("developments", **args))
     try:
         bio = _render_development_labels_docx(rows)
