@@ -10752,3 +10752,701 @@ def send_due_line_todo_reminders_by_settings():
     }
 
 # ========= LINE Bot 代辦事項 Patch v7 End =========
+
+
+# ========= LINE Bot 代辦事項 Patch v8：防止重複新增 + 清除既有重複代辦 =========
+# 貼在 v7 patch 的最底部即可。
+# 目的：
+# 1. 同一個 LINE 訊息重送時，不會重複新增代辦。
+# 2. 同一個 LINE 對話、同一天、同一個事項，已經有未完成代辦時，不再新增第二筆。
+# 3. 清單顯示時會自動去重，避免同一事項出現兩次。
+# 4. 可用 #清除重複代辦 一次整理目前 LINE 對話中的重複資料。
+
+LINE_TODO_PROCESSED_COLLECTION = os.environ.get('LINE_TODO_PROCESSED_COLLECTION', 'line_todo_processed_messages')
+
+
+def _line_todo_normalize_title_for_dedupe(value: str) -> str:
+    """把代辦標題正規化，避免空白不同造成重複判斷失敗。"""
+    text = (value or '').strip()
+    text = re.sub(r'\s+', ' ', text)
+    return text.lower()
+
+
+def _line_todo_dedupe_key(target_id: str, todo_date: str, title: str) -> str:
+    return f"{target_id}|{todo_date}|{_line_todo_normalize_title_for_dedupe(title)}"
+
+
+def _line_todo_doc_dedupe_key(doc):
+    data = doc.to_dict() or {}
+    return _line_todo_dedupe_key(
+        data.get('line_target_id', ''),
+        (data.get('todo_date') or '').strip(),
+        data.get('title', ''),
+    )
+
+
+def _find_existing_open_line_todo(target_id: str, todo_date: str, title: str):
+    """找同一對話、同一天、同事項的未完成代辦。"""
+    key = _line_todo_dedupe_key(target_id, todo_date, title)
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        data = doc.to_dict() or {}
+        if data.get('status', 'open') != 'open':
+            continue
+        if data.get('line_target_id', '') != target_id:
+            continue
+        if (data.get('todo_date') or '').strip() != todo_date:
+            continue
+        existing_key = data.get('dedupe_key') or _line_todo_dedupe_key(
+            data.get('line_target_id', ''),
+            (data.get('todo_date') or '').strip(),
+            data.get('title', ''),
+        )
+        if existing_key == key:
+            return doc
+    return None
+
+
+def _line_todo_dedupe_docs_for_display(items):
+    """顯示清單前去重；保留最早建立的那筆。"""
+    sorted_items = sorted(
+        list(items or []),
+        key=lambda d: ((d.to_dict() or {}).get('created_at') or '', d.id)
+    )
+    seen = set()
+    result = []
+    for doc in sorted_items:
+        data = doc.to_dict() or {}
+        if data.get('status', 'open') != 'open':
+            continue
+        key = data.get('dedupe_key') or _line_todo_doc_dedupe_key(doc)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(doc)
+    return result
+
+
+# 覆寫新增單筆：加入「同訊息防重送」與「同日期同事項防重複」。
+def create_line_todo(fields, event):
+    title = (fields.get('title') or '').strip()
+    todo_date = _parse_line_todo_date(fields.get('todo_date') or fields.get('todo_date_raw') or '')
+    note = (fields.get('note') or '').strip()
+    remind_time = (fields.get('remind_time') or '').strip()
+
+    if not title:
+        return {
+            'handled': True,
+            'ok': False,
+            'reply_text': '未新增：請填「事項」。\n\n範例：\n#新增代辦\n日期: 明天\n厝米排版 土地現廣稿\n拍水哥爸爸土地',
+            'parsed_tag': '新增代辦',
+        }
+    if not todo_date:
+        return {'handled': True, 'ok': False, 'reply_text': '未新增：日期格式看不懂，請用 5/29、今天、明天。', 'parsed_tag': '新增代辦'}
+
+    target_id, target_type = _line_todo_target_from_event(event)
+    duplicate_doc = _find_existing_open_line_todo(target_id, todo_date, title)
+    if duplicate_doc:
+        return {
+            'handled': True,
+            'ok': False,
+            'duplicate': True,
+            'reply_text': f'已存在，不重複新增：{_todo_display_md(todo_date)}｜{title}',
+            'parsed_tag': '新增代辦',
+        }
+
+    source = event.get('source') or {}
+    message = event.get('message') or {}
+    sender_display_name = get_line_sender_display_name(event)
+    now = now_taipei().isoformat()
+    dedupe_key = _line_todo_dedupe_key(target_id, todo_date, title)
+
+    doc_ref = db.collection(LINE_TODO_COLLECTION).document()
+    doc_ref.set({
+        'title': title,
+        'todo_date': todo_date,
+        'note': note,
+        'remind_time': remind_time,
+        'status': 'open',
+        'dedupe_key': dedupe_key,
+        'line_message_id': message.get('id', ''),
+        'line_target_id': target_id,
+        'line_target_type': target_type,
+        'line_group_id': source.get('groupId', ''),
+        'line_room_id': source.get('roomId', ''),
+        'line_user_id': source.get('userId', ''),
+        'sender_display_name': sender_display_name,
+        'created_at': now,
+        'created_by_id': 'line_bot',
+        'created_by_name': sender_display_name or 'LINE Bot',
+        'reminder_sent_dates': [],
+        'tomorrow_reminder_sent_dates': [],
+    })
+
+    return {
+        'handled': True,
+        'ok': True,
+        'todo_date': todo_date,
+        'title': title,
+        'reply_text': f"已新增代辦\n日期：{_todo_display_md(todo_date)}\n事項：{title}\n\n查詢請回：#今日代辦",
+        'parsed_tag': '新增代辦',
+    }
+
+
+# 覆寫批次新增：若同批或資料庫已存在相同代辦，就跳過不新增。
+def create_line_todos_bulk(fields_list, event):
+    if not fields_list:
+        return {
+            'handled': True,
+            'ok': False,
+            'reply_text': (
+                '未新增：請在 #新增代辦 下一行開始貼代辦事項。\n\n'
+                '範例一：同一天\n'
+                '#新增代辦\n'
+                '日期: 明天\n'
+                '厝米排版 土地現廣稿\n'
+                '拍水哥爸爸土地\n\n'
+                '範例二：不同天\n'
+                '#新增代辦\n'
+                '5/29 厝米排版 土地現廣稿\n'
+                '5/30 拍水哥爸爸土地'
+            ),
+            'parsed_tag': '新增代辦',
+        }
+
+    ok_items = []
+    skipped = []
+    failed_msgs = []
+    seen_in_this_message = set()
+    target_id, _target_type = _line_todo_target_from_event(event)
+
+    for fields in fields_list:
+        title = (fields.get('title') or '').strip()
+        todo_date = _parse_line_todo_date(fields.get('todo_date') or fields.get('todo_date_raw') or '')
+        local_key = _line_todo_dedupe_key(target_id, todo_date, title)
+        if title and todo_date and local_key in seen_in_this_message:
+            skipped.append(f'{_todo_display_md(todo_date)}｜{title}')
+            continue
+        if title and todo_date:
+            seen_in_this_message.add(local_key)
+
+        result = create_line_todo(fields, event)
+        if result.get('ok'):
+            ok_items.append({
+                'todo_date': result.get('todo_date') or todo_date,
+                'title': result.get('title') or title,
+            })
+        elif result.get('duplicate'):
+            skipped.append(f'{_todo_display_md(todo_date)}｜{title}')
+        else:
+            failed_msgs.append(result.get('reply_text', '新增失敗'))
+
+    lines = []
+    if ok_items:
+        grouped = {}
+        for item in ok_items:
+            d = item.get('todo_date', '') or now_taipei().strftime('%Y-%m-%d')
+            grouped.setdefault(d, []).append(item.get('title', ''))
+
+        lines.append(f'已新增 {len(ok_items)} 筆代辦')
+        if len(grouped) == 1:
+            only_date = next(iter(grouped.keys()))
+            lines.append(f'日期：{_todo_display_md(only_date)}')
+            lines.append('')
+            for idx, title in enumerate(grouped[only_date], 1):
+                lines.append(f'{idx}. {title}')
+        else:
+            lines.append('')
+            running = 1
+            for d in sorted(grouped.keys()):
+                lines.append(f'【{_todo_display_md(d)}】')
+                for title in grouped[d]:
+                    lines.append(f'{running}. {title}')
+                    running += 1
+                lines.append('')
+            if lines and lines[-1] == '':
+                lines.pop()
+
+    if skipped:
+        if lines:
+            lines.append('')
+        lines.append(f'已跳過 {len(skipped)} 筆重複代辦')
+        for item in skipped[:8]:
+            lines.append(f'- {item}')
+        if len(skipped) > 8:
+            lines.append(f'...另有 {len(skipped) - 8} 筆')
+
+    if failed_msgs:
+        if lines:
+            lines.append('')
+        lines.append('有部分未新增：')
+        lines.extend(failed_msgs[:3])
+
+    if lines:
+        lines.append('')
+        lines.append('查詢請回：#今日代辦')
+        lines.append('完成可回：#完成代辦 1')
+        return {'handled': True, 'ok': bool(ok_items), 'reply_text': '\n'.join(lines)[:5000], 'parsed_tag': '新增代辦'}
+
+    return {'handled': True, 'ok': False, 'reply_text': '沒有新增任何代辦。', 'parsed_tag': '新增代辦'}
+
+
+# 覆寫清單格式：顯示前去重，避免舊資料中已有重複時畫面重複。
+def _format_line_todo_sections(overdue_items, today_items, title, today_label='今天'):
+    overdue_items = _line_todo_dedupe_docs_for_display(overdue_items)
+    today_items = _line_todo_dedupe_docs_for_display(today_items)
+
+    if not overdue_items and not today_items:
+        return f'{title}\n目前沒有未完成代辦。'
+
+    lines = [title]
+    idx = 1
+
+    if overdue_items:
+        lines.append('')
+        lines.append('【尚未完成】')
+        for doc in overdue_items:
+            data = doc.to_dict() or {}
+            note = (data.get('note') or '').strip()
+            date_text = _todo_display_md(data.get('todo_date', ''))
+            lines.append(f"{idx}. {date_text}｜{data.get('title', '')}")
+            if note:
+                lines.append(f'   備註: {note}')
+            idx += 1
+
+    if today_items:
+        lines.append('')
+        lines.append(f'【{today_label}要做】')
+        for doc in today_items:
+            data = doc.to_dict() or {}
+            note = (data.get('note') or '').strip()
+            lines.append(f"{idx}. {data.get('title', '')}")
+            if note:
+                lines.append(f'   備註: {note}')
+            idx += 1
+
+    lines.append('')
+    lines.append('完成請回：#完成代辦 1')
+    lines.append('一次完成多筆：#完成代辦 1 3')
+    lines.append('清除請回：#清除代辦 1')
+    return '\n'.join(lines)[:5000]
+
+
+def _cleanup_duplicate_line_todos_for_target(event):
+    """刪除目前 LINE 對話中重複的未完成代辦，保留最早建立的一筆。"""
+    target_id, _target_type = _line_todo_target_from_event(event)
+    docs = []
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        data = doc.to_dict() or {}
+        if data.get('status', 'open') != 'open':
+            continue
+        if data.get('line_target_id') != target_id:
+            continue
+        docs.append(doc)
+
+    docs = sorted(docs, key=lambda d: ((d.to_dict() or {}).get('created_at') or '', d.id))
+    seen = {}
+    deleted_titles = []
+    updated_keys = 0
+
+    for doc in docs:
+        data = doc.to_dict() or {}
+        key = data.get('dedupe_key') or _line_todo_doc_dedupe_key(doc)
+        # 順手補上舊資料沒有的 dedupe_key，之後更好判斷。
+        if not data.get('dedupe_key'):
+            try:
+                doc.reference.update({'dedupe_key': key})
+                updated_keys += 1
+            except Exception:
+                pass
+
+        if key in seen:
+            title = data.get('title', '')
+            date_text = _todo_display_md(data.get('todo_date', ''))
+            doc.reference.delete()
+            deleted_titles.append(f'{date_text}｜{title}')
+        else:
+            seen[key] = doc.id
+
+    if not deleted_titles:
+        msg = '目前沒有找到重複的未完成代辦。'
+        if updated_keys:
+            msg += f'\n已順手整理 {updated_keys} 筆代辦索引。'
+        return {'handled': True, 'ok': True, 'reply_text': msg, 'parsed_tag': '清除重複代辦'}
+
+    lines = [f'已清除 {len(deleted_titles)} 筆重複代辦']
+    for item in deleted_titles[:12]:
+        lines.append(f'- {item}')
+    if len(deleted_titles) > 12:
+        lines.append(f'...另有 {len(deleted_titles) - 12} 筆')
+    lines.append('')
+    lines.append('查詢請回：#今日代辦')
+    return {'handled': True, 'ok': True, 'reply_text': '\n'.join(lines)[:5000], 'parsed_tag': '清除重複代辦'}
+
+
+# 先攔截「清除重複代辦」與「同一 LINE 訊息重送」。
+_process_line_todo_message_event_before_duplicate_guard = process_line_todo_message_event
+
+
+def process_line_todo_message_event(event):
+    message = event.get('message') or {}
+    if message.get('type') != 'text':
+        return {'handled': False}
+
+    raw_text = (message.get('text') or '').strip()
+    if not raw_text.startswith('#'):
+        return {'handled': False}
+
+    if raw_text.startswith('#清除重複代辦') or raw_text.startswith('#整理代辦'):
+        result = _cleanup_duplicate_line_todos_for_target(event)
+        save_line_log(
+            {'tag': result.get('parsed_tag', '清除重複代辦'), 'action': 'line_todo_cleanup_duplicates', 'fields': {}, 'raw_text': raw_text},
+            event,
+            'success' if result.get('ok') else 'failed',
+            note=result.get('reply_text', ''),
+            sender_display_name=get_line_sender_display_name(event),
+        )
+        return result
+
+    # LINE webhook 有時會 retry，同一 message_id 若已處理過，就不要再新增一次。
+    if raw_text.startswith('#新增代辦'):
+        message_id = message.get('id', '')
+        if message_id:
+            processed_ref = db.collection(LINE_TODO_PROCESSED_COLLECTION).document(str(message_id))
+            processed_doc = processed_ref.get()
+            if processed_doc.exists:
+                return {
+                    'handled': True,
+                    'ok': True,
+                    'reply_text': '這則新增代辦已經處理過，為避免重複新增，本次不再新增。\n\n查詢請回：#今日代辦',
+                    'parsed_tag': '新增代辦',
+                }
+
+            result = _process_line_todo_message_event_before_duplicate_guard(event)
+            try:
+                processed_ref.set({
+                    'message_id': message_id,
+                    'raw_text': raw_text[:2000],
+                    'ok': bool(result.get('ok')),
+                    'created_at': now_taipei().isoformat(),
+                }, merge=True)
+            except Exception:
+                pass
+            return result
+
+    return _process_line_todo_message_event_before_duplicate_guard(event)
+
+# ========= LINE Bot 代辦事項 Patch v8 End =========
+
+
+# ========= LINE Bot 代辦事項 Patch v9：台灣時間確認 + 設定後重置提醒標記 + 診斷指令 =========
+# 使用方式：貼在 v8 patch 的最底部。
+# 目的：
+# 1. 明確顯示「目前台灣時間」與提醒時間判斷。
+# 2. 設定提醒時間後，會清除該對話今天/明天的已提醒標記，避免你改時間後因為已提醒過而不再跳出。
+# 3. 提供 #測試代辦時間 / #檢查代辦時間 指令，確認設定是否真的存到目前 LINE 對話。
+# 4. /line/todos/reminder-check 回傳結果也會顯示 taipei_now 與 timezone。
+
+from datetime import timezone
+
+
+def _line_todo_taipei_now_text():
+    dt = now_taipei()
+    return dt.strftime('%m/%d %H:%M')
+
+
+def _line_todo_current_minutes_taipei():
+    dt = now_taipei()
+    return dt.hour * 60 + dt.minute
+
+
+def _line_todo_time_status_text(hhmm: str, default: str):
+    now_minutes = _line_todo_current_minutes_taipei()
+    target_minutes = _time_to_minutes(hhmm, default=default)
+    return '已到提醒時間' if now_minutes >= target_minutes else '尚未到提醒時間'
+
+
+def _line_todo_reset_sent_markers_for_target(target_id: str, reset_today=False, reset_tomorrow=False):
+    """設定提醒時間後，清除目前對話的已提醒標記，避免改時間後被舊標記擋住。"""
+    if not target_id:
+        return 0
+
+    now_dt = now_taipei()
+    today = now_dt.strftime('%Y-%m-%d')
+    tomorrow = (now_dt.date() + timedelta(days=1)).strftime('%Y-%m-%d')
+    count = 0
+
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        data = doc.to_dict() or {}
+        if data.get('status', 'open') != 'open':
+            continue
+        if data.get('line_target_id') != target_id:
+            continue
+
+        updates = {}
+        if reset_today:
+            updates['reminder_sent_dates'] = firestore.ArrayRemove([today])
+        if reset_tomorrow:
+            updates['tomorrow_reminder_sent_dates'] = firestore.ArrayRemove([tomorrow])
+
+        if updates:
+            try:
+                doc.reference.update(updates)
+                count += 1
+            except Exception as e:
+                print('⚠️ 重置代辦提醒標記失敗：', e)
+
+    return count
+
+
+def _line_todo_count_open_items_for_target(target_id: str):
+    now_dt = now_taipei()
+    today = now_dt.strftime('%Y-%m-%d')
+    tomorrow = (now_dt.date() + timedelta(days=1)).strftime('%Y-%m-%d')
+    overdue_or_today = 0
+    tomorrow_count = 0
+
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        data = doc.to_dict() or {}
+        if data.get('status', 'open') != 'open':
+            continue
+        if data.get('line_target_id') != target_id:
+            continue
+        todo_date = (data.get('todo_date') or '').strip()
+        if todo_date and todo_date <= today:
+            overdue_or_today += 1
+        if todo_date == tomorrow:
+            tomorrow_count += 1
+
+    return overdue_or_today, tomorrow_count
+
+
+def _line_todo_settings_debug_text(event):
+    target_id, target_type = _line_todo_target_from_event(event)
+    settings = _get_line_todo_reminder_settings(target_id, target_type)
+    today_count, tomorrow_count = _line_todo_count_open_items_for_target(target_id)
+
+    today_time = settings.get('today_reminder_time', '08:00')
+    tomorrow_time = settings.get('tomorrow_reminder_time', '23:00')
+
+    lines = [
+        '目前固定每日代辦提醒設定',
+        f'現在台灣時間：{_line_todo_taipei_now_text()}',
+        '時區：Asia/Taipei',
+        '',
+        f"今日代辦提醒：{'開啟' if settings.get('today_enabled', True) else '關閉'}｜{today_time}｜{_line_todo_time_status_text(today_time, '08:00')}",
+        f"今日開頭：{_line_todo_preview_opening(settings.get('today_opening_text', ''))}",
+        f'今日＋尚未完成筆數：{today_count}',
+        '',
+        f"明天代辦提醒：{'開啟' if settings.get('tomorrow_enabled', True) else '關閉'}｜{tomorrow_time}｜{_line_todo_time_status_text(tomorrow_time, '23:00')}",
+        f"明天開頭：{_line_todo_preview_opening(settings.get('tomorrow_opening_text', ''))}",
+        f'明天代辦筆數：{tomorrow_count}',
+        '',
+        '提醒是用台灣時間判斷；如果到了時間仍沒跳，請確認排程器有每 5 分鐘呼叫：',
+        '/line/todos/reminder-check?key=你的密鑰',
+    ]
+    return '\n'.join(lines)[:5000]
+
+
+# 覆寫查詢設定：直接顯示台灣時間與是否已到提醒時間。
+def query_line_todo_reminder_settings(event):
+    return {
+        'handled': True,
+        'ok': True,
+        'reply_text': _line_todo_settings_debug_text(event),
+        'parsed_tag': '代辦提醒設定',
+    }
+
+
+# 覆寫設定提醒：設定時間後重置已提醒標記，並回覆目前台灣時間與判斷狀態。
+def set_line_todo_reminder_settings_from_command(raw_text: str, event):
+    target_id, target_type = _line_todo_target_from_event(event)
+    updates, errors = _parse_line_todo_reminder_setting_command(raw_text)
+
+    if not updates:
+        msg = (
+            '請告訴我要設定的固定每日提醒時間或開頭。\n\n'
+            '範例：\n'
+            '#設定代辦提醒\n'
+            '今日提醒: 08:00\n'
+            '今日開頭: 各位厝米的夥伴早安 ☀️\n'
+            '明天提醒: 23:00\n'
+            '明天開頭: 各位厝米的夥伴晚安 🌙'
+        )
+        if errors:
+            msg += '\n\n' + '\n'.join(errors[:3])
+        return {'handled': True, 'ok': False, 'reply_text': msg[:5000], 'parsed_tag': '設定代辦提醒'}
+
+    ok, err = _save_line_todo_reminder_settings(target_id, target_type, updates, event=event)
+    if not ok:
+        return {'handled': True, 'ok': False, 'reply_text': err, 'parsed_tag': '設定代辦提醒'}
+
+    reset_today = 'today_reminder_time' in updates
+    reset_tomorrow = 'tomorrow_reminder_time' in updates
+    reset_count = _line_todo_reset_sent_markers_for_target(target_id, reset_today=reset_today, reset_tomorrow=reset_tomorrow)
+
+    lines = ['已更新固定每日代辦提醒設定']
+    if reset_count:
+        lines.append(f'已重新開放 {reset_count} 筆代辦的提醒判斷')
+    lines.append('')
+    lines.append(_line_todo_settings_debug_text(event))
+    lines.append('')
+    lines.append('如果現在已經超過設定時間，等排程器下一次呼叫 reminder-check 就會推播。')
+    return {'handled': True, 'ok': True, 'reply_text': '\n'.join(lines)[:5000], 'parsed_tag': '設定代辦提醒'}
+
+
+# 新增診斷指令：#測試代辦時間 / #檢查代辦時間 / #確認代辦時間。
+_process_line_todo_reminder_settings_message_event_before_v9_time_debug = process_line_todo_reminder_settings_message_event
+
+
+def process_line_todo_reminder_settings_message_event(event):
+    message = event.get('message') or {}
+    if message.get('type') != 'text':
+        return {'handled': False}
+
+    raw_text = (message.get('text') or '').strip()
+    if raw_text.startswith(('#測試代辦時間', '#檢查代辦時間', '#確認代辦時間', '#代辦時間')):
+        result = query_line_todo_reminder_settings(event)
+        save_line_log(
+            {'tag': '代辦提醒時間診斷', 'action': 'line_todo_reminder_time_debug', 'fields': {}, 'raw_text': raw_text},
+            event,
+            'success',
+            note=result.get('reply_text', ''),
+            sender_display_name=get_line_sender_display_name(event),
+        )
+        return result
+
+    return _process_line_todo_reminder_settings_message_event_before_v9_time_debug(event)
+
+
+# 覆寫 reminder-check route：回傳台灣時間，方便你用瀏覽器確認是不是用台灣時間。
+# 注意：如果你原本已經有同 endpoint route，Flask 不允許重複註冊 endpoint。
+# 所以這裡不重複註冊 route，只覆寫 view_functions 裡的 endpoint 函式。
+def line_todos_reminder_check_v9():
+    secret = os.environ.get('TODO_REMINDER_SECRET', '').strip()
+    key = request.args.get('key', '').strip() or request.form.get('key', '').strip()
+    if secret and key != secret:
+        return {
+            'ok': False,
+            'message': 'Invalid key',
+            'taipei_now': now_taipei().strftime('%Y-%m-%d %H:%M:%S'),
+            'timezone': 'Asia/Taipei',
+        }, 403
+
+    result = send_due_line_todo_reminders_by_settings()
+    result['taipei_now'] = now_taipei().strftime('%Y-%m-%d %H:%M:%S')
+    result['timezone'] = 'Asia/Taipei'
+    return {'ok': True, 'result': result}, 200
+
+
+try:
+    app.view_functions['line_todos_reminder_check'] = line_todos_reminder_check_v9
+except Exception as e:
+    print('⚠️ 套用 reminder-check v9 view 覆寫失敗：', e)
+
+# ========= LINE Bot 代辦事項 Patch v9 End =========
+
+
+# ========= LINE Bot 待辦事項 Patch v10：用字修正（代辦 → 待辦） =========
+# 使用方式：貼在目前 v9 patch 的最底部。
+# 目的：
+# 1. LINE 顯示文字統一改成「待辦 / 待辦事項」。
+# 2. 指令支援新寫法：#新增待辦、#今日待辦、#完成待辦、#清除待辦、#設定待辦提醒。
+# 3. 舊指令仍相容：#新增代辦、#今日代辦、#完成代辦、#清除代辦、#設定代辦提醒。
+# 4. Firestore collection / 既有資料不改，避免資料搬移風險。
+
+
+def _line_todo_wording_fix_text(value):
+    """只修正使用者看得到的文字，不動資料庫欄位。"""
+    if not isinstance(value, str):
+        return value
+    return value.replace('代辦事項', '待辦事項').replace('代辦', '待辦')
+
+
+def _line_todo_normalize_command_wording(value):
+    """讓使用者輸入「待辦」時，內部仍可走原本 v9 的「代辦」判斷。"""
+    if not isinstance(value, str):
+        return value
+    return value.replace('待辦事項', '代辦事項').replace('待辦', '代辦')
+
+
+# 1) LINE push 推播文字修正，例如早上 / 晚上固定提醒。
+try:
+    _push_line_text_before_v10_wording = push_line_text
+
+    def push_line_text(to_id: str, text_message: str):
+        return _push_line_text_before_v10_wording(to_id, _line_todo_wording_fix_text(text_message))
+except Exception as e:
+    print('⚠️ 套用 push_line_text 待辦用字修正失敗：', e)
+
+
+# 2) reply_line_text 保險修正：如果有直接呼叫 reply_line_text，也會顯示待辦。
+try:
+    _reply_line_text_before_v10_wording = reply_line_text
+
+    def reply_line_text(reply_token: str, text_message: str):
+        return _reply_line_text_before_v10_wording(reply_token, _line_todo_wording_fix_text(text_message))
+except Exception as e:
+    print('⚠️ 套用 reply_line_text 待辦用字修正失敗：', e)
+
+
+# 3) 使用者輸入 #新增待辦 / #今日待辦 時，轉成舊版可辨識的 #新增代辦；回覆再改回待辦。
+try:
+    _process_line_message_event_before_v10_wording = process_line_message_event
+
+    def process_line_message_event(event):
+        patched_event = event
+        try:
+            message = (event or {}).get('message') or {}
+            if message.get('type') == 'text':
+                raw_text = message.get('text') or ''
+                normalized_text = _line_todo_normalize_command_wording(raw_text)
+                if normalized_text != raw_text:
+                    # 複製 event，避免影響原始 webhook 內容太多。
+                    patched_event = dict(event)
+                    patched_message = dict(message)
+                    patched_message['text'] = normalized_text
+                    patched_event['message'] = patched_message
+        except Exception as e:
+            print('⚠️ 待辦指令文字正規化失敗：', e)
+            patched_event = event
+
+        result = _process_line_message_event_before_v10_wording(patched_event)
+        try:
+            if isinstance(result, dict) and 'reply_text' in result:
+                result = dict(result)
+                result['reply_text'] = _line_todo_wording_fix_text(result.get('reply_text', ''))
+                if 'parsed_tag' in result:
+                    result['parsed_tag'] = _line_todo_wording_fix_text(result.get('parsed_tag', ''))
+        except Exception as e:
+            print('⚠️ 待辦回覆文字修正失敗：', e)
+        return result
+except Exception as e:
+    print('⚠️ 套用 process_line_message_event 待辦用字修正失敗：', e)
+
+
+# 4) reminder-check 的 JSON 回傳也修正顯示文字，方便瀏覽器測試時看到「待辦」。
+try:
+    _line_todos_reminder_check_before_v10_wording = app.view_functions.get('line_todos_reminder_check')
+
+    def line_todos_reminder_check_v10_wording():
+        response = _line_todos_reminder_check_before_v10_wording()
+        try:
+            # Flask view 可能回傳 (dict, status_code) 或 dict。
+            if isinstance(response, tuple) and response and isinstance(response[0], dict):
+                data = response[0]
+                status = response[1] if len(response) > 1 else 200
+                data_text = _line_todo_wording_fix_text(json.dumps(data, ensure_ascii=False))
+                return json.loads(data_text), status
+            if isinstance(response, dict):
+                data_text = _line_todo_wording_fix_text(json.dumps(response, ensure_ascii=False))
+                return json.loads(data_text)
+        except Exception as e:
+            print('⚠️ reminder-check 待辦用字修正失敗：', e)
+        return response
+
+    if _line_todos_reminder_check_before_v10_wording:
+        app.view_functions['line_todos_reminder_check'] = line_todos_reminder_check_v10_wording
+except Exception as e:
+    print('⚠️ 套用 reminder-check 待辦用字修正失敗：', e)
+
+# ========= LINE Bot 待辦事項 Patch v10 End =========
