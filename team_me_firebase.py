@@ -11450,3 +11450,964 @@ except Exception as e:
     print('⚠️ 套用 reminder-check 待辦用字修正失敗：', e)
 
 # ========= LINE Bot 待辦事項 Patch v10 End =========
+# ========= LINE Bot 待辦事項 Patch v11：新增「未來待辦」區塊 =========
+# 使用方式：貼在目前 v10 patch 的最底部。
+# 功能：
+# 1. #今日待辦 會多一區「未來待辦」，預設顯示未來 7 天。
+# 2. 早上今日提醒也會一起帶出「未來待辦」。
+# 3. 新增指令：#未來待辦，可查未來 7 天；#未來待辦 14 可查未來 14 天。
+# 4. 完成 / 清除仍可用畫面序號；如果未來待辦顯示成第 5 筆，就可用 #完成待辦 5。
+# 5. Firestore 資料欄位不搬移；只新增 future_reminder_sent_dates 用於避免同一天重複提醒。
+
+LINE_TODO_FUTURE_DAYS_DEFAULT = int(os.environ.get('LINE_TODO_FUTURE_DAYS_DEFAULT', '7') or '7')
+LINE_TODO_FUTURE_DAYS_MAX = int(os.environ.get('LINE_TODO_FUTURE_DAYS_MAX', '30') or '30')
+
+
+def _line_todo_parse_days_from_text(raw_text: str, default_days=None):
+    """從 #未來代辦 7 或 天數: 14 取出查詢天數。"""
+    default_days = default_days or LINE_TODO_FUTURE_DAYS_DEFAULT
+    text = raw_text or ''
+    m = re.search(r'(?:天數|未來|查詢天數)\s*[:：]?\s*(\d{1,2})', text)
+    if not m:
+        # 例如：#未來代辦 14
+        parts = re.split(r'\s+', text.strip())
+        if len(parts) >= 2 and re.fullmatch(r'\d{1,2}', parts[1]):
+            m_value = parts[1]
+        else:
+            m_value = ''
+    else:
+        m_value = m.group(1)
+
+    try:
+        days = int(m_value) if m_value else int(default_days)
+    except Exception:
+        days = int(default_days)
+    return max(1, min(LINE_TODO_FUTURE_DAYS_MAX, days))
+
+
+def _get_future_line_todos(start_date='', target_id='', days=None):
+    """取得 start_date 之後、days 天內的未完成待辦。"""
+    days = days or LINE_TODO_FUTURE_DAYS_DEFAULT
+    start_date = start_date or now_taipei().strftime('%Y-%m-%d')
+    try:
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
+    except Exception:
+        start_dt = now_taipei().date()
+        start_date = start_dt.strftime('%Y-%m-%d')
+
+    end_date = (start_dt + timedelta(days=int(days))).strftime('%Y-%m-%d')
+    result = []
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        if not _is_open_todo_doc(doc, target_id=target_id):
+            continue
+        d = _todo_date_value(doc)
+        if start_date < d <= end_date:
+            result.append(doc)
+    return _sort_line_todo_docs(result)
+
+
+def _line_todo_group_docs_by_date(items):
+    grouped = {}
+    for doc in _sort_line_todo_docs(items or []):
+        data = doc.to_dict() or {}
+        d = (data.get('todo_date') or '').strip()
+        if not d:
+            continue
+        grouped.setdefault(d, []).append(doc)
+    return grouped
+
+
+def _format_line_todo_sections(overdue_items, today_items, title, today_label='今天', future_items=None, future_days=None):
+    """覆寫清單格式：新增「未來待辦」區塊。"""
+    overdue_items = _line_todo_dedupe_docs_for_display(overdue_items or [])
+    today_items = _line_todo_dedupe_docs_for_display(today_items or [])
+    future_items = _line_todo_dedupe_docs_for_display(future_items or [])
+    future_days = future_days or LINE_TODO_FUTURE_DAYS_DEFAULT
+
+    if not overdue_items and not today_items and not future_items:
+        return f'{title}\n目前沒有未完成代辦。'
+
+    lines = [title]
+    idx = 1
+
+    if overdue_items:
+        lines.append('')
+        lines.append('【尚未完成】')
+        for doc in overdue_items:
+            data = doc.to_dict() or {}
+            note = (data.get('note') or '').strip()
+            date_text = _todo_display_md(data.get('todo_date', ''))
+            lines.append(f"{idx}. {date_text}｜{data.get('title', '')}")
+            if note:
+                lines.append(f'   備註: {note}')
+            idx += 1
+
+    if today_items:
+        lines.append('')
+        lines.append(f'【{today_label}要做】')
+        for doc in today_items:
+            data = doc.to_dict() or {}
+            note = (data.get('note') or '').strip()
+            lines.append(f"{idx}. {data.get('title', '')}")
+            if note:
+                lines.append(f'   備註: {note}')
+            idx += 1
+
+    if future_items:
+        lines.append('')
+        lines.append(f'【未來待辦｜未來 {future_days} 天】')
+        grouped = _line_todo_group_docs_by_date(future_items)
+        for d in sorted(grouped.keys()):
+            lines.append(f'〔{_todo_display_md(d)}〕')
+            for doc in grouped[d]:
+                data = doc.to_dict() or {}
+                note = (data.get('note') or '').strip()
+                lines.append(f"{idx}. {data.get('title', '')}")
+                if note:
+                    lines.append(f'   備註: {note}')
+                idx += 1
+
+    lines.append('')
+    lines.append('完成請回：#完成代辦 1')
+    lines.append('一次完成多筆：#完成代辦 1 3')
+    lines.append('清除請回：#清除代辦 1')
+    lines.append('查未來請回：#未來代辦')
+    return '\n'.join(lines)[:5000]
+
+
+def _get_display_line_todos(todo_date='', target_id='', include_future=True, future_days=None):
+    """畫面顯示順序：尚未完成 → 指定日期 → 未來待辦。序號完成會依這個順序。"""
+    query_date = todo_date or now_taipei().strftime('%Y-%m-%d')
+    overdue_items = _get_overdue_line_todos(query_date, target_id=target_id)
+    today_items = _get_open_line_todos(query_date, target_id=target_id, include_overdue=False)
+    items = overdue_items + today_items
+
+    # 只有查今天時，才把未來待辦接在同一份清單後面，避免查指定日期時序號混亂。
+    if include_future and query_date == now_taipei().strftime('%Y-%m-%d'):
+        items += _get_future_line_todos(start_date=query_date, target_id=target_id, days=future_days or LINE_TODO_FUTURE_DAYS_DEFAULT)
+    return items
+
+
+def _find_line_todo_v2(todo_key: str, target_id='', todo_date=''):
+    """覆寫序號完成邏輯：支援完成「未來待辦」區塊的序號。"""
+    key = (todo_key or '').strip()
+    if not key:
+        return None, '請提供待辦序號、ID 或事項關鍵字。'
+
+    query_date = _parse_line_todo_date(todo_date or '') or now_taipei().strftime('%Y-%m-%d')
+
+    if re.fullmatch(r'\d+', key):
+        items = _get_display_line_todos(todo_date=query_date, target_id=target_id, include_future=True)
+        idx = int(key) - 1
+        if 0 <= idx < len(items):
+            return items[idx], ''
+        return None, f'找不到第 {key} 筆待辦，請先輸入 #今日待辦 確認序號。'
+
+    return _find_line_todo(key, target_id=target_id)
+
+
+def query_line_todos(fields, event, force_today=False):
+    """覆寫查詢：今天清單會附上未來待辦。"""
+    target_id, _ = _line_todo_target_from_event(event)
+    todo_date = now_taipei().strftime('%Y-%m-%d') if force_today else _parse_line_todo_date(fields.get('todo_date') or fields.get('todo_date_raw') or '')
+    if not todo_date:
+        todo_date = now_taipei().strftime('%Y-%m-%d')
+
+    overdue_items = _get_overdue_line_todos(todo_date=todo_date, target_id=target_id)
+    today_items = _get_open_line_todos(todo_date=todo_date, target_id=target_id, include_overdue=False)
+    future_items = []
+    future_days = LINE_TODO_FUTURE_DAYS_DEFAULT
+
+    if todo_date == now_taipei().strftime('%Y-%m-%d'):
+        future_items = _get_future_line_todos(start_date=todo_date, target_id=target_id, days=future_days)
+        title = f'{_todo_display_md(todo_date)} 代辦清單'
+        today_label = '今天'
+    else:
+        title = f'{_todo_display_md(todo_date)} 代辦清單'
+        today_label = _todo_display_md(todo_date)
+
+    return {
+        'handled': True,
+        'ok': True,
+        'reply_text': _format_line_todo_sections(overdue_items, today_items, title, today_label=today_label, future_items=future_items, future_days=future_days),
+        'parsed_tag': '查詢代辦',
+    }
+
+
+def query_future_line_todos(event, days=None):
+    """查詢未來待辦，不含今天、不含逾期。"""
+    target_id, _ = _line_todo_target_from_event(event)
+    days = days or LINE_TODO_FUTURE_DAYS_DEFAULT
+    today = now_taipei().strftime('%Y-%m-%d')
+    future_items = _get_future_line_todos(start_date=today, target_id=target_id, days=days)
+
+    if not future_items:
+        return {
+            'handled': True,
+            'ok': True,
+            'reply_text': f'未來 {days} 天目前沒有未完成待辦。',
+            'parsed_tag': '未來代辦',
+        }
+
+    lines = [f'未來 {days} 天待辦']
+    idx = 1
+    grouped = _line_todo_group_docs_by_date(future_items)
+    for d in sorted(grouped.keys()):
+        lines.append('')
+        lines.append(f'【{_todo_display_md(d)}】')
+        for doc in grouped[d]:
+            data = doc.to_dict() or {}
+            note = (data.get('note') or '').strip()
+            lines.append(f"{idx}. {data.get('title', '')}")
+            if note:
+                lines.append(f'   備註: {note}')
+            idx += 1
+
+    lines.append('')
+    lines.append('完成請先回 #今日代辦 看完整序號，或用事項關鍵字完成。')
+    return {'handled': True, 'ok': True, 'reply_text': '\n'.join(lines)[:5000], 'parsed_tag': '未來代辦'}
+
+
+_process_line_todo_message_event_before_v11_future = process_line_todo_message_event
+
+
+def process_line_todo_message_event(event):
+    """新增 #未來代辦；其它指令照原本 v10 流程。"""
+    message = event.get('message') or {}
+    if message.get('type') != 'text':
+        return {'handled': False}
+
+    raw_text = (message.get('text') or '').strip()
+    if not raw_text.startswith('#'):
+        return {'handled': False}
+
+    if raw_text.startswith(('#未來代辦', '#近期代辦', '#未來清單')):
+        days = _line_todo_parse_days_from_text(raw_text, default_days=LINE_TODO_FUTURE_DAYS_DEFAULT)
+        result = query_future_line_todos(event, days=days)
+        save_line_log(
+            {'tag': result.get('parsed_tag', '未來代辦'), 'action': 'line_todo_future_query', 'fields': {'days': days}, 'raw_text': raw_text},
+            event,
+            'success' if result.get('ok') else 'failed',
+            note=result.get('reply_text', ''),
+            sender_display_name=get_line_sender_display_name(event),
+        )
+        return result
+
+    return _process_line_todo_message_event_before_v11_future(event)
+
+
+def send_due_line_todo_reminders_by_settings():
+    """
+    覆寫每日提醒：今日提醒加入「未來待辦」。
+    - 今日提醒：尚未完成 + 今天要做 + 未來 7 天。
+    - 明天提醒：維持只提醒明天要做。
+    - 未來待辦使用 future_reminder_sent_dates 防止同一天重複推播。
+    """
+    now_dt = now_taipei()
+    today = now_dt.strftime('%Y-%m-%d')
+    tomorrow = (now_dt.date() + timedelta(days=1)).strftime('%Y-%m-%d')
+    current_minutes = now_dt.hour * 60 + now_dt.minute
+
+    targets = _collect_line_todo_targets_with_open_items()
+    sent_count = 0
+    failed = []
+    checked_targets = 0
+    future_days = LINE_TODO_FUTURE_DAYS_DEFAULT
+
+    for target_id, target_type in targets.items():
+        checked_targets += 1
+        settings = _get_line_todo_reminder_settings(target_id, target_type)
+
+        # 今日提醒：尚未完成 + 今日要做 + 未來待辦。
+        if settings.get('today_enabled', True):
+            today_time = settings.get('today_reminder_time', '08:00')
+            if current_minutes >= _time_to_minutes(today_time, default='08:00'):
+                due_items = []
+                future_items_for_push = []
+
+                for doc in db.collection(LINE_TODO_COLLECTION).stream():
+                    data = doc.to_dict() or {}
+                    if data.get('status', 'open') != 'open':
+                        continue
+                    if data.get('line_target_id') != target_id:
+                        continue
+                    todo_date = (data.get('todo_date') or '').strip()
+                    if not todo_date:
+                        continue
+
+                    # 尚未完成 + 今天要做：每天各待辦提醒一次。
+                    if todo_date <= today:
+                        sent_dates = data.get('reminder_sent_dates') or []
+                        if today not in sent_dates:
+                            due_items.append(doc)
+                        continue
+
+                    # 未來待辦：每天提醒清單可以帶一次，不影響該待辦到當天時的正式提醒。
+                    try:
+                        end_date = (now_dt.date() + timedelta(days=future_days)).strftime('%Y-%m-%d')
+                    except Exception:
+                        end_date = today
+                    if today < todo_date <= end_date:
+                        sent_dates = data.get('future_reminder_sent_dates') or []
+                        if today not in sent_dates:
+                            future_items_for_push.append(doc)
+
+                if due_items or future_items_for_push:
+                    overdue_items = _sort_line_todo_docs([d for d in due_items if _todo_date_value(d) < today])
+                    today_items = _sort_line_todo_docs([d for d in due_items if _todo_date_value(d) == today])
+                    future_items = _sort_line_todo_docs(future_items_for_push)
+                    body = _format_line_todo_sections(
+                        overdue_items,
+                        today_items,
+                        f'{_todo_display_md(today)} 今日代辦',
+                        today_label='今天',
+                        future_items=future_items,
+                        future_days=future_days,
+                    )
+                    text = _line_todo_add_opening(settings.get('today_opening_text', ''), body)
+                    ok, msg = push_line_text(target_id, text)
+                    if ok:
+                        sent_count += 1
+                        for doc in due_items:
+                            doc.reference.update({
+                                'reminder_sent_dates': firestore.ArrayUnion([today]),
+                                'last_reminded_at': now_taipei().isoformat(),
+                            })
+                        for doc in future_items_for_push:
+                            doc.reference.update({
+                                'future_reminder_sent_dates': firestore.ArrayUnion([today]),
+                                'last_future_reminded_at': now_taipei().isoformat(),
+                            })
+                    else:
+                        failed.append({'target_id': target_id, 'type': 'today_with_future', 'error': msg})
+
+        # 明天提醒：維持明天要做。
+        if settings.get('tomorrow_enabled', True):
+            tomorrow_time = settings.get('tomorrow_reminder_time', '23:00')
+            if current_minutes >= _time_to_minutes(tomorrow_time, default='23:00'):
+                items = []
+                for doc in db.collection(LINE_TODO_COLLECTION).stream():
+                    data = doc.to_dict() or {}
+                    if data.get('status', 'open') != 'open':
+                        continue
+                    if data.get('line_target_id') != target_id:
+                        continue
+                    todo_date = (data.get('todo_date') or '').strip()
+                    if todo_date != tomorrow:
+                        continue
+                    sent_dates = data.get('tomorrow_reminder_sent_dates') or []
+                    if tomorrow in sent_dates:
+                        continue
+                    items.append(doc)
+
+                if items:
+                    tomorrow_items = _sort_line_todo_docs(items)
+                    body = _format_line_todo_sections(
+                        [],
+                        tomorrow_items,
+                        f'{_todo_display_md(tomorrow)} 明天代辦',
+                        today_label='明天',
+                    )
+                    text = _line_todo_add_opening(settings.get('tomorrow_opening_text', ''), body)
+                    ok, msg = push_line_text(target_id, text)
+                    if ok:
+                        sent_count += 1
+                        for doc in items:
+                            doc.reference.update({
+                                'tomorrow_reminder_sent_dates': firestore.ArrayUnion([tomorrow]),
+                                'last_tomorrow_reminded_at': now_taipei().isoformat(),
+                            })
+                    else:
+                        failed.append({'target_id': target_id, 'type': 'tomorrow', 'error': msg})
+
+    return {
+        'now': now_dt.strftime('%Y-%m-%d %H:%M:%S'),
+        'checked_targets': checked_targets,
+        'sent_count': sent_count,
+        'future_days': future_days,
+        'failed': failed,
+    }
+
+# ========= LINE Bot 待辦事項 Patch v11 End =========
+
+
+# ========= LINE Bot 待辦事項 Patch v12：未來待辦「提前幾天提醒」設定 =========
+# 使用方式：貼在目前 v11 patch 的最底部。
+# 功能：
+# 1. 可用 LINE 指令設定未來待辦提前幾天開始出現在每日提醒。
+#    例如：未來提醒: 3天前，代表未來 3 天內的待辦會在早上提醒中顯示。
+# 2. 支援 #設定未來待辦提醒 3天前。
+# 3. 支援 #關閉待辦提醒 未來 / #開啟待辦提醒 未來。
+# 4. #待辦提醒設定 / #測試待辦時間 會顯示未來提醒設定與筆數。
+# 5. Firestore 新增欄位：future_enabled、future_reminder_days。
+
+LINE_TODO_FUTURE_REMINDER_DAYS_DEFAULT = int(
+    os.environ.get(
+        'LINE_TODO_FUTURE_REMINDER_DAYS_DEFAULT',
+        os.environ.get('LINE_TODO_FUTURE_DAYS_DEFAULT', '7')
+    ) or '7'
+)
+LINE_TODO_FUTURE_REMINDER_DAYS_MAX = int(
+    os.environ.get(
+        'LINE_TODO_FUTURE_REMINDER_DAYS_MAX',
+        os.environ.get('LINE_TODO_FUTURE_DAYS_MAX', '30')
+    ) or '30'
+)
+
+
+def _line_todo_clamp_future_days(value, default=None):
+    default = default or LINE_TODO_FUTURE_REMINDER_DAYS_DEFAULT
+    try:
+        days = int(str(value).strip())
+    except Exception:
+        days = int(default)
+    return max(1, min(LINE_TODO_FUTURE_REMINDER_DAYS_MAX, days))
+
+
+def _line_todo_get_future_reminder_days(settings=None):
+    settings = settings or {}
+    return _line_todo_clamp_future_days(
+        settings.get('future_reminder_days', LINE_TODO_FUTURE_REMINDER_DAYS_DEFAULT),
+        default=LINE_TODO_FUTURE_REMINDER_DAYS_DEFAULT,
+    )
+
+
+def _line_todo_is_future_enabled(settings=None):
+    settings = settings or {}
+    return bool(settings.get('future_enabled', True))
+
+
+def _line_todo_extract_days_number(text: str):
+    text = str(text or '').strip()
+    m = re.search(r'(\d{1,2})\s*(?:天前|天|日|days?|d)?', text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _line_todo_parse_future_reminder_updates(raw_text: str):
+    """解析未來待辦提醒設定，例如：未來提醒: 3天前 / 未來提醒: 關閉 / #設定未來待辦提醒 3天前。"""
+    text = (raw_text or '').strip()
+    normalized = _line_todo_normalize_command_wording(text) if '_line_todo_normalize_command_wording' in globals() else text
+    lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
+    joined = ' '.join(lines)
+
+    updates = {}
+    errors = []
+
+    def apply_value(label, value):
+        v = str(value or '').strip()
+        compact = re.sub(r'\s+', '', v).lower()
+        if any(x in compact for x in ['關閉', '停用', '取消', '不要', 'off', 'false', 'no']):
+            updates['future_enabled'] = False
+            return
+        if any(x in compact for x in ['開啟', '啟用', '恢復', 'on', 'true', 'yes']):
+            updates['future_enabled'] = True
+            # 如果同時有數字，例如「開啟 3天前」，也一起更新天數。
+        days = _line_todo_extract_days_number(v)
+        if days is not None:
+            if days <= 0:
+                updates['future_enabled'] = False
+            else:
+                updates['future_enabled'] = True
+                updates['future_reminder_days'] = _line_todo_clamp_future_days(days)
+            return
+        if label:
+            errors.append(f'{label} 的天數看不懂：{value}')
+
+    future_key_words = ['未來提醒', '未來代辦提醒', '未來代辦', '提前提醒', '提前天數', '幾天前提醒', '提前幾天']
+
+    # 多行 key: value 格式。
+    for line in lines:
+        m = re.match(r'^([^:：]+)\s*[:：]\s*(.+)$', line)
+        if not m:
+            continue
+        key = re.sub(r'\s+', '', m.group(1).strip())
+        value = m.group(2).strip()
+        if any(k in key for k in future_key_words):
+            apply_value(key, value)
+
+    # 一行格式，例如：#設定待辦提醒 未來提醒 3天前 / #設定未來待辦提醒 3天前。
+    if any(k in joined for k in future_key_words) or normalized.startswith(('#設定未來代辦提醒', '#設定未來提醒', '#設定提前提醒')):
+        # 優先找「3天前」這種清楚格式。
+        m = re.search(r'(\d{1,2})\s*天前', joined)
+        if not m:
+            m = re.search(r'(?:未來(?:代辦)?提醒|未來代辦|未來提醒|提前(?:提醒|天數|幾天)?|幾天前提醒)\D{0,12}(\d{1,2})', joined)
+        if m:
+            days = int(m.group(1))
+            if days <= 0:
+                updates['future_enabled'] = False
+            else:
+                updates['future_enabled'] = True
+                updates['future_reminder_days'] = _line_todo_clamp_future_days(days)
+        elif re.search(r'(?:未來|提前).*(關閉|停用|取消|不要|off|false|no)', joined, flags=re.IGNORECASE):
+            updates['future_enabled'] = False
+        elif re.search(r'(?:未來|提前).*(開啟|啟用|恢復|on|true|yes)', joined, flags=re.IGNORECASE):
+            updates['future_enabled'] = True
+
+    return updates, errors
+
+
+_parse_line_todo_reminder_setting_command_before_v12_future_days = _parse_line_todo_reminder_setting_command
+
+
+def _parse_line_todo_reminder_setting_command(raw_text: str):
+    updates, errors = _parse_line_todo_reminder_setting_command_before_v12_future_days(raw_text)
+    future_updates, future_errors = _line_todo_parse_future_reminder_updates(raw_text)
+    updates.update(future_updates)
+    errors.extend(future_errors)
+    return updates, errors
+
+
+def _line_todo_days_until_text(date_str: str):
+    try:
+        target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        diff = (target_date - now_taipei().date()).days
+        if diff == 1:
+            return '明天'
+        if diff == 2:
+            return '後天'
+        if diff > 0:
+            return f'{diff}天後'
+    except Exception:
+        pass
+    return ''
+
+
+def _format_line_todo_sections(overdue_items, today_items, title, today_label='今天', future_items=None, future_days=None):
+    """覆寫清單格式：未來待辦改成「提前 N 天提醒」。"""
+    overdue_items = _line_todo_dedupe_docs_for_display(overdue_items or [])
+    today_items = _line_todo_dedupe_docs_for_display(today_items or [])
+    future_items = _line_todo_dedupe_docs_for_display(future_items or [])
+    future_days = _line_todo_clamp_future_days(future_days or LINE_TODO_FUTURE_REMINDER_DAYS_DEFAULT)
+
+    if not overdue_items and not today_items and not future_items:
+        return f'{title}\n目前沒有未完成代辦。'
+
+    lines = [title]
+    idx = 1
+
+    if overdue_items:
+        lines.append('')
+        lines.append('【尚未完成】')
+        for doc in overdue_items:
+            data = doc.to_dict() or {}
+            note = (data.get('note') or '').strip()
+            date_text = _todo_display_md(data.get('todo_date', ''))
+            lines.append(f"{idx}. {date_text}｜{data.get('title', '')}")
+            if note:
+                lines.append(f'   備註: {note}')
+            idx += 1
+
+    if today_items:
+        lines.append('')
+        lines.append(f'【{today_label}要做】')
+        for doc in today_items:
+            data = doc.to_dict() or {}
+            note = (data.get('note') or '').strip()
+            lines.append(f"{idx}. {data.get('title', '')}")
+            if note:
+                lines.append(f'   備註: {note}')
+            idx += 1
+
+    if future_items:
+        lines.append('')
+        lines.append(f'【未來待辦｜提前 {future_days} 天提醒】')
+        grouped = _line_todo_group_docs_by_date(future_items)
+        for d in sorted(grouped.keys()):
+            days_text = _line_todo_days_until_text(d)
+            if days_text:
+                lines.append(f'〔{_todo_display_md(d)}｜{days_text}〕')
+            else:
+                lines.append(f'〔{_todo_display_md(d)}〕')
+            for doc in grouped[d]:
+                data = doc.to_dict() or {}
+                note = (data.get('note') or '').strip()
+                lines.append(f"{idx}. {data.get('title', '')}")
+                if note:
+                    lines.append(f'   備註: {note}')
+                idx += 1
+
+    lines.append('')
+    lines.append('完成請回：#完成待辦 1')
+    lines.append('一次完成多筆：#完成待辦 1 3')
+    lines.append('清除請回：#清除待辦 1')
+    lines.append('查未來請回：#未來待辦')
+    return '\n'.join(lines)[:5000]
+
+
+def _line_todo_count_future_items_for_target(target_id: str, days=None):
+    days = _line_todo_clamp_future_days(days or LINE_TODO_FUTURE_REMINDER_DAYS_DEFAULT)
+    today_date = now_taipei().date()
+    today = today_date.strftime('%Y-%m-%d')
+    end_date = (today_date + timedelta(days=days)).strftime('%Y-%m-%d')
+    count = 0
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        data = doc.to_dict() or {}
+        if data.get('status', 'open') != 'open':
+            continue
+        if data.get('line_target_id') != target_id:
+            continue
+        todo_date = (data.get('todo_date') or '').strip()
+        if today < todo_date <= end_date:
+            count += 1
+    return count
+
+
+def _line_todo_reset_future_sent_markers_for_target(target_id: str):
+    """設定未來提醒天數 / 開關後，清除今天的未來提醒標記，讓新設定可重新判斷。"""
+    if not target_id:
+        return 0
+    today = now_taipei().strftime('%Y-%m-%d')
+    count = 0
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        data = doc.to_dict() or {}
+        if data.get('status', 'open') != 'open':
+            continue
+        if data.get('line_target_id') != target_id:
+            continue
+        try:
+            doc.reference.update({'future_reminder_sent_dates': firestore.ArrayRemove([today])})
+            count += 1
+        except Exception as e:
+            print('⚠️ 重置未來待辦提醒標記失敗：', e)
+    return count
+
+
+def _line_todo_settings_debug_text(event):
+    target_id, target_type = _line_todo_target_from_event(event)
+    settings = _get_line_todo_reminder_settings(target_id, target_type)
+    today_count, tomorrow_count = _line_todo_count_open_items_for_target(target_id)
+
+    today_time = settings.get('today_reminder_time', '08:00')
+    tomorrow_time = settings.get('tomorrow_reminder_time', '23:00')
+    future_days = _line_todo_get_future_reminder_days(settings)
+    future_count = _line_todo_count_future_items_for_target(target_id, days=future_days)
+
+    lines = [
+        '目前固定每日待辦提醒設定',
+        f'現在台灣時間：{_line_todo_taipei_now_text()}',
+        '時區：Asia/Taipei',
+        '',
+        f"今日待辦提醒：{'開啟' if settings.get('today_enabled', True) else '關閉'}｜{today_time}｜{_line_todo_time_status_text(today_time, '08:00')}",
+        f"今日開頭：{_line_todo_preview_opening(settings.get('today_opening_text', ''))}",
+        f'今日＋尚未完成筆數：{today_count}',
+        '',
+        f"未來待辦提醒：{'開啟' if _line_todo_is_future_enabled(settings) else '關閉'}｜提前 {future_days} 天開始提醒",
+        f'未來 {future_days} 天待辦筆數：{future_count}',
+        '',
+        f"明天待辦提醒：{'開啟' if settings.get('tomorrow_enabled', True) else '關閉'}｜{tomorrow_time}｜{_line_todo_time_status_text(tomorrow_time, '23:00')}",
+        f"明天開頭：{_line_todo_preview_opening(settings.get('tomorrow_opening_text', ''))}",
+        f'明天待辦筆數：{tomorrow_count}',
+        '',
+        '提醒是用台灣時間判斷；排程器仍需要每 5 分鐘呼叫：',
+        '/line/todos/reminder-check?key=你的密鑰',
+    ]
+    return '\n'.join(lines)[:5000]
+
+
+def query_line_todo_reminder_settings(event):
+    return {
+        'handled': True,
+        'ok': True,
+        'reply_text': _line_todo_settings_debug_text(event),
+        'parsed_tag': '待辦提醒設定',
+    }
+
+
+def set_line_todo_reminder_settings_from_command(raw_text: str, event):
+    target_id, target_type = _line_todo_target_from_event(event)
+    updates, errors = _parse_line_todo_reminder_setting_command(raw_text)
+
+    if not updates:
+        msg = (
+            '請告訴我要設定的固定每日提醒時間、開頭或未來待辦提前天數。\n\n'
+            '範例：\n'
+            '#設定待辦提醒\n'
+            '今日提醒: 08:00\n'
+            '今日開頭: 各位厝米的夥伴早安 ☀️\n'
+            '未來提醒: 3天前\n'
+            '明天提醒: 23:00\n'
+            '明天開頭: 各位厝米的夥伴晚安 🌙\n\n'
+            '也可以：#設定未來待辦提醒 3天前'
+        )
+        if errors:
+            msg += '\n\n' + '\n'.join(errors[:3])
+        return {'handled': True, 'ok': False, 'reply_text': msg[:5000], 'parsed_tag': '設定待辦提醒'}
+
+    ok, err = _save_line_todo_reminder_settings(target_id, target_type, updates, event=event)
+    if not ok:
+        return {'handled': True, 'ok': False, 'reply_text': err, 'parsed_tag': '設定待辦提醒'}
+
+    reset_today = 'today_reminder_time' in updates
+    reset_tomorrow = 'tomorrow_reminder_time' in updates
+    reset_future = any(k in updates for k in ['future_enabled', 'future_reminder_days'])
+    reset_count = _line_todo_reset_sent_markers_for_target(target_id, reset_today=reset_today, reset_tomorrow=reset_tomorrow)
+    if reset_future:
+        reset_count += _line_todo_reset_future_sent_markers_for_target(target_id)
+
+    lines = ['已更新固定每日待辦提醒設定']
+    if reset_count:
+        lines.append(f'已重新開放 {reset_count} 筆待辦的提醒判斷')
+    lines.append('')
+    lines.append(_line_todo_settings_debug_text(event))
+    lines.append('')
+    lines.append('未來提醒說明：例如設定 3天前，代表未來 3 天內的待辦會出現在每日提醒的【未來待辦】區塊。')
+    return {'handled': True, 'ok': True, 'reply_text': '\n'.join(lines)[:5000], 'parsed_tag': '設定待辦提醒'}
+
+
+_switch_line_todo_reminder_before_v12_future_days = switch_line_todo_reminder
+
+
+def switch_line_todo_reminder(raw_text: str, event, enabled: bool):
+    target_id, target_type = _line_todo_target_from_event(event)
+    normalized = _line_todo_normalize_command_wording(raw_text) if '_line_todo_normalize_command_wording' in globals() else raw_text
+    body = normalized.replace('#關閉代辦提醒', '', 1).replace('#開啟代辦提醒', '', 1).strip()
+    body = body or '全部'
+
+    updates = {}
+    if any(x in body for x in ['今日', '今天']):
+        updates['today_enabled'] = enabled
+    if any(x in body for x in ['明日', '明天']):
+        updates['tomorrow_enabled'] = enabled
+    if any(x in body for x in ['未來', '提前']):
+        updates['future_enabled'] = enabled
+    if not updates or '全部' in body or '全開' in body or '全關' in body:
+        updates = {'today_enabled': enabled, 'tomorrow_enabled': enabled, 'future_enabled': enabled}
+
+    ok, err = _save_line_todo_reminder_settings(target_id, target_type, updates, event=event)
+    if not ok:
+        return {'handled': True, 'ok': False, 'reply_text': err, 'parsed_tag': '待辦提醒設定'}
+
+    if 'future_enabled' in updates:
+        _line_todo_reset_future_sent_markers_for_target(target_id)
+
+    current = _get_line_todo_reminder_settings(target_id, target_type)
+    action = '開啟' if enabled else '關閉'
+    future_days = _line_todo_get_future_reminder_days(current)
+    lines = [
+        f'已{action}待辦提醒',
+        f"今日待辦提醒：{'開啟' if current.get('today_enabled', True) else '關閉'}｜{current.get('today_reminder_time', '08:00')}",
+        f"未來待辦提醒：{'開啟' if _line_todo_is_future_enabled(current) else '關閉'}｜提前 {future_days} 天開始提醒",
+        f"明天待辦提醒：{'開啟' if current.get('tomorrow_enabled', True) else '關閉'}｜{current.get('tomorrow_reminder_time', '23:00')}",
+    ]
+    return {'handled': True, 'ok': True, 'reply_text': '\n'.join(lines), 'parsed_tag': '待辦提醒設定'}
+
+
+_process_line_todo_reminder_settings_message_event_before_v12_future_days = process_line_todo_reminder_settings_message_event
+
+
+def process_line_todo_reminder_settings_message_event(event):
+    message = event.get('message') or {}
+    if message.get('type') != 'text':
+        return {'handled': False}
+
+    raw_text = (message.get('text') or '').strip()
+    normalized = _line_todo_normalize_command_wording(raw_text) if '_line_todo_normalize_command_wording' in globals() else raw_text
+
+    if normalized.startswith(('#設定未來代辦提醒', '#設定未來提醒', '#設定提前提醒')):
+        result = set_line_todo_reminder_settings_from_command(normalized, event)
+        save_line_log(
+            {'tag': result.get('parsed_tag', '設定待辦提醒'), 'action': 'line_todo_future_reminder_setting_update', 'fields': {}, 'raw_text': raw_text},
+            event,
+            'success' if result.get('ok') else 'failed',
+            note=result.get('reply_text', ''),
+            sender_display_name=get_line_sender_display_name(event),
+        )
+        return result
+
+    if normalized.startswith(('#關閉未來代辦提醒', '#開啟未來代辦提醒')):
+        enabled = normalized.startswith('#開啟')
+        fake_text = ('#開啟代辦提醒 未來' if enabled else '#關閉代辦提醒 未來')
+        result = switch_line_todo_reminder(fake_text, event, enabled=enabled)
+        save_line_log(
+            {'tag': result.get('parsed_tag', '待辦提醒設定'), 'action': 'line_todo_future_reminder_switch', 'fields': {'enabled': enabled}, 'raw_text': raw_text},
+            event,
+            'success' if result.get('ok') else 'failed',
+            note=result.get('reply_text', ''),
+            sender_display_name=get_line_sender_display_name(event),
+        )
+        return result
+
+    return _process_line_todo_reminder_settings_message_event_before_v12_future_days(event)
+
+
+def _get_display_line_todos(todo_date='', target_id='', include_future=True, future_days=None):
+    """畫面顯示順序：尚未完成 → 指定日期 → 未來待辦。序號完成會依這個順序。"""
+    query_date = todo_date or now_taipei().strftime('%Y-%m-%d')
+    overdue_items = _get_overdue_line_todos(query_date, target_id=target_id)
+    today_items = _get_open_line_todos(query_date, target_id=target_id, include_overdue=False)
+    items = overdue_items + today_items
+
+    if include_future and query_date == now_taipei().strftime('%Y-%m-%d'):
+        settings = _get_line_todo_reminder_settings(target_id, '')
+        if _line_todo_is_future_enabled(settings):
+            days = future_days or _line_todo_get_future_reminder_days(settings)
+            items += _get_future_line_todos(start_date=query_date, target_id=target_id, days=days)
+    return items
+
+
+def query_line_todos(fields, event, force_today=False):
+    """覆寫查詢：今天清單會依設定附上未來待辦。"""
+    target_id, target_type = _line_todo_target_from_event(event)
+    todo_date = now_taipei().strftime('%Y-%m-%d') if force_today else _parse_line_todo_date(fields.get('todo_date') or fields.get('todo_date_raw') or '')
+    if not todo_date:
+        todo_date = now_taipei().strftime('%Y-%m-%d')
+
+    overdue_items = _get_overdue_line_todos(todo_date=todo_date, target_id=target_id)
+    today_items = _get_open_line_todos(todo_date=todo_date, target_id=target_id, include_overdue=False)
+    future_items = []
+    settings = _get_line_todo_reminder_settings(target_id, target_type)
+    future_days = _line_todo_get_future_reminder_days(settings)
+
+    if todo_date == now_taipei().strftime('%Y-%m-%d'):
+        if _line_todo_is_future_enabled(settings):
+            future_items = _get_future_line_todos(start_date=todo_date, target_id=target_id, days=future_days)
+        title = f'{_todo_display_md(todo_date)} 待辦清單'
+        today_label = '今天'
+    else:
+        title = f'{_todo_display_md(todo_date)} 待辦清單'
+        today_label = _todo_display_md(todo_date)
+
+    return {
+        'handled': True,
+        'ok': True,
+        'reply_text': _format_line_todo_sections(overdue_items, today_items, title, today_label=today_label, future_items=future_items, future_days=future_days),
+        'parsed_tag': '查詢待辦',
+    }
+
+
+def send_due_line_todo_reminders_by_settings():
+    """
+    覆寫每日提醒：今日提醒加入「未來待辦」，且可依設定控制提前幾天開始提醒。
+    - 今日提醒：尚未完成 + 今天要做 + 未來 N 天。
+    - 明天提醒：維持只提醒明天要做。
+    """
+    now_dt = now_taipei()
+    today = now_dt.strftime('%Y-%m-%d')
+    tomorrow = (now_dt.date() + timedelta(days=1)).strftime('%Y-%m-%d')
+    current_minutes = now_dt.hour * 60 + now_dt.minute
+
+    targets = _collect_line_todo_targets_with_open_items()
+    sent_count = 0
+    failed = []
+    checked_targets = 0
+
+    for target_id, target_type in targets.items():
+        checked_targets += 1
+        settings = _get_line_todo_reminder_settings(target_id, target_type)
+        future_days = _line_todo_get_future_reminder_days(settings)
+
+        # 今日提醒：尚未完成 + 今日要做 + 未來待辦。
+        if settings.get('today_enabled', True):
+            today_time = settings.get('today_reminder_time', '08:00')
+            if current_minutes >= _time_to_minutes(today_time, default='08:00'):
+                due_items = []
+                future_items_for_push = []
+
+                for doc in db.collection(LINE_TODO_COLLECTION).stream():
+                    data = doc.to_dict() or {}
+                    if data.get('status', 'open') != 'open':
+                        continue
+                    if data.get('line_target_id') != target_id:
+                        continue
+                    todo_date = (data.get('todo_date') or '').strip()
+                    if not todo_date:
+                        continue
+
+                    # 尚未完成 + 今天要做：每天各待辦提醒一次。
+                    if todo_date <= today:
+                        sent_dates = data.get('reminder_sent_dates') or []
+                        if today not in sent_dates:
+                            due_items.append(doc)
+                        continue
+
+                    # 未來待辦：依設定提前 N 天開始顯示；每天最多提醒一次。
+                    if _line_todo_is_future_enabled(settings):
+                        end_date = (now_dt.date() + timedelta(days=future_days)).strftime('%Y-%m-%d')
+                        if today < todo_date <= end_date:
+                            sent_dates = data.get('future_reminder_sent_dates') or []
+                            if today not in sent_dates:
+                                future_items_for_push.append(doc)
+
+                if due_items or future_items_for_push:
+                    overdue_items = _sort_line_todo_docs([d for d in due_items if _todo_date_value(d) < today])
+                    today_items = _sort_line_todo_docs([d for d in due_items if _todo_date_value(d) == today])
+                    future_items = _sort_line_todo_docs(future_items_for_push)
+                    body = _format_line_todo_sections(
+                        overdue_items,
+                        today_items,
+                        f'{_todo_display_md(today)} 今日待辦',
+                        today_label='今天',
+                        future_items=future_items,
+                        future_days=future_days,
+                    )
+                    text = _line_todo_add_opening(settings.get('today_opening_text', ''), body)
+                    ok, msg = push_line_text(target_id, text)
+                    if ok:
+                        sent_count += 1
+                        for doc in due_items:
+                            doc.reference.update({
+                                'reminder_sent_dates': firestore.ArrayUnion([today]),
+                                'last_reminded_at': now_taipei().isoformat(),
+                            })
+                        for doc in future_items_for_push:
+                            doc.reference.update({
+                                'future_reminder_sent_dates': firestore.ArrayUnion([today]),
+                                'last_future_reminded_at': now_taipei().isoformat(),
+                            })
+                    else:
+                        failed.append({'target_id': target_id, 'type': 'today_with_future', 'error': msg})
+
+        # 明天提醒：維持明天要做。
+        if settings.get('tomorrow_enabled', True):
+            tomorrow_time = settings.get('tomorrow_reminder_time', '23:00')
+            if current_minutes >= _time_to_minutes(tomorrow_time, default='23:00'):
+                items = []
+                for doc in db.collection(LINE_TODO_COLLECTION).stream():
+                    data = doc.to_dict() or {}
+                    if data.get('status', 'open') != 'open':
+                        continue
+                    if data.get('line_target_id') != target_id:
+                        continue
+                    todo_date = (data.get('todo_date') or '').strip()
+                    if todo_date != tomorrow:
+                        continue
+                    sent_dates = data.get('tomorrow_reminder_sent_dates') or []
+                    if tomorrow in sent_dates:
+                        continue
+                    items.append(doc)
+
+                if items:
+                    tomorrow_items = _sort_line_todo_docs(items)
+                    body = _format_line_todo_sections(
+                        [],
+                        tomorrow_items,
+                        f'{_todo_display_md(tomorrow)} 明天待辦',
+                        today_label='明天',
+                    )
+                    text = _line_todo_add_opening(settings.get('tomorrow_opening_text', ''), body)
+                    ok, msg = push_line_text(target_id, text)
+                    if ok:
+                        sent_count += 1
+                        for doc in items:
+                            doc.reference.update({
+                                'tomorrow_reminder_sent_dates': firestore.ArrayUnion([tomorrow]),
+                                'last_tomorrow_reminded_at': now_taipei().isoformat(),
+                            })
+                    else:
+                        failed.append({'target_id': target_id, 'type': 'tomorrow', 'error': msg})
+
+    return {
+        'now': now_dt.strftime('%Y-%m-%d %H:%M:%S'),
+        'timezone': 'Asia/Taipei',
+        'checked_targets': checked_targets,
+        'sent_count': sent_count,
+        'future_reminder_days_default': LINE_TODO_FUTURE_REMINDER_DAYS_DEFAULT,
+        'failed': failed,
+    }
+
+# ========= LINE Bot 待辦事項 Patch v12 End =========
