@@ -12434,9 +12434,9 @@ CALENDAR_CATEGORY_OPTIONS = [
     "開發",
     "簽約",
     "拍照",
-    "收服務費",
+    "簽委託",
     "待辦",
-    "其他",
+    "開會",
 ]
 
 CALENDAR_CATEGORY_COLOR_MAP = {
@@ -12445,9 +12445,9 @@ CALENDAR_CATEGORY_COLOR_MAP = {
     "開發": "#5E9F45",
     "簽約": "#7B61FF",
     "拍照": "#8A63D2",
-    "收服務費": "#B36B00",
+    "簽委託": "#B36B00",
     "待辦": "#6C757D",
-    "其他": "#8B8B8B",
+    "開會": "#8B8B8B",
 }
 
 DEFAULT_LINE_CARD_SETTINGS = {
@@ -13175,6 +13175,85 @@ def flex_info_row(label, value):
     }
 
 
+
+
+def get_app_public_base_url():
+    """取得 LINE 卡片按鈕要用的公開網址。
+    優先使用 Render / ngrok 設定的 APP_BASE_URL；沒有設定時，後台預覽可用目前 request 的網址。
+    """
+    base = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return base
+    try:
+        return request.url_root.strip().rstrip("/")
+    except Exception:
+        return ""
+
+
+def build_app_url(path: str) -> str:
+    base = get_app_public_base_url()
+    if not base or not path:
+        return ""
+    path = str(path)
+    if not path.startswith("/"):
+        path = "/" + path
+    return base + path
+
+
+def calendar_event_edit_path(event):
+    event_id = (event or {}).get("id", "")
+    if not event_id:
+        return ""
+    return f"/calendar/{event_id}/edit"
+
+
+def calendar_related_edit_path_and_label(event):
+    """回傳行程關聯的後台編輯網址與按鈕文字。
+    若有 related_type + related_id：直接進入對應編輯頁。
+    若只有電話：先帶到客需搜尋頁，避免沒有 ID 時無法直接判斷是哪一筆。
+    """
+    event = event or {}
+    related_type = (event.get("related_type") or "").strip()
+    related_id = (event.get("related_id") or "").strip()
+    phone = (event.get("phone") or "").strip()
+
+    if related_type in ("buyer", "buyers", "客需", "買方"):
+        if related_id:
+            return f"/buyers/{related_id}/edit", "編輯客需"
+        if phone:
+            return f"/buyers?q={quote_plus(phone)}", "搜尋客需"
+
+    if related_type in ("seller", "sellers", "委託", "賣方", "屋主"):
+        if related_id:
+            return f"/sellers/{related_id}/edit", "編輯委託"
+        if phone:
+            return f"/sellers?q={quote_plus(phone)}", "搜尋委託"
+
+    if related_type in ("development", "developments", "開發"):
+        if related_id:
+            return f"/developments/{related_id}/edit", "編輯開發"
+        if phone:
+            return f"/developments?q={quote_plus(phone)}", "搜尋開發"
+
+    # 沒有設定關聯類型時，用電話先帶到客需搜尋，避免錯連。
+    if phone:
+        return f"/buyers?q={quote_plus(phone)}", "搜尋客需"
+
+    return "", ""
+
+
+def calendar_related_button_label(event):
+    return calendar_related_edit_path_and_label(event)[1]
+
+
+def calendar_related_edit_url(event):
+    path, _label = calendar_related_edit_path_and_label(event)
+    return build_app_url(path)
+
+
+def calendar_event_edit_url(event):
+    return build_app_url(calendar_event_edit_path(event))
+
 def build_calendar_event_bubble(event, settings=None):
     settings = settings or get_line_card_settings()
     category = event.get("category") or "行程"
@@ -13212,8 +13291,9 @@ def build_calendar_event_bubble(event, settings=None):
         info_box["contents"].append(flex_text(time_text, size="sm", color="#666666"))
 
     footer_contents = []
-    base_url = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
-    if base_url and event.get("id"):
+
+    event_edit_url = calendar_event_edit_url(event)
+    if event_edit_url:
         footer_contents.append({
             "type": "button",
             "style": "primary",
@@ -13221,8 +13301,22 @@ def build_calendar_event_bubble(event, settings=None):
             "height": "sm",
             "action": {
                 "type": "uri",
-                "label": "查看詳情",
-                "uri": f"{base_url}/calendar/{event.get('id')}/edit",
+                "label": "編輯行程",
+                "uri": event_edit_url,
+            },
+        })
+
+    related_url = calendar_related_edit_url(event)
+    related_label = calendar_related_button_label(event)
+    if related_url and related_label:
+        footer_contents.append({
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "action": {
+                "type": "uri",
+                "label": related_label,
+                "uri": related_url,
             },
         })
 
@@ -13275,7 +13369,7 @@ def build_calendar_event_bubble(event, settings=None):
             "type": "box",
             "layout": "vertical",
             "spacing": "sm",
-            "contents": footer_contents[:3],
+            "contents": footer_contents[:4],
         },
         "styles": {
             "footer": {"separator": True},
@@ -13745,8 +13839,11 @@ def line_card_preview():
               {% if settings.show_location %}<div class="event-line"><span class="label">地點</span><span>{{ e.location or '-' }}</span></div>{% endif %}
               {% if settings.show_note %}<div class="event-line"><span class="label">備註</span><span>{{ e.note or '-' }}</span></div>{% endif %}
               <div class="event-buttons">
-                <div class="mock-btn primary">查看詳情</div>
-                <div class="mock-btn">查看地圖</div>
+                <div class="mock-btn primary">編輯行程</div>
+                {% set related_label = calendar_related_button_label(e) %}
+                {% if related_label %}<div class="mock-btn">{{ related_label }}</div>{% endif %}
+                {% if e.location %}<div class="mock-btn">查看地圖</div>{% endif %}
+                {% if e.phone %}<div class="mock-btn">撥打電話</div>{% endif %}
               </div>
             </div>
           {% endfor %}
@@ -13789,6 +13886,7 @@ def line_card_preview():
     quick_reply_text=quick_reply_text,
     page_title=page_title,
     back_query=back_query,
+    calendar_related_button_label=calendar_related_button_label,
     )
 
 if __name__ == "__main__":
