@@ -15487,6 +15487,303 @@ print('✅ LINE 待辦事項已升級：同一張卡片 + 點擊勾選直接更�
 # =============================================================================
 
 
+
+# =============================================================================
+# LINE 待辦事項查詢修正 Patch v20260621M
+# - LINE #今日待辦 / #待辦 會抓得到後台 /todos 原本新增的待辦
+# - 後台新增的待辦通常沒有 line_target_id，視為「共用待辦」，所有群組可查詢
+# - LINE 群組自己新增的待辦只顯示在該群組，避免別群資料混在一起
+# - 顯示規則：指定日期以前未完成 + 指定日期當天未完成；不顯示未來待辦
+# - 點 LINE 卡片左側 ☐ 一樣直接更新 Firestore 後台 status=done
+# =============================================================================
+
+
+def _line_todo_visible_for_target(data: dict, target_id: str = '') -> bool:
+    """判斷一筆待辦是否應該在目前 LINE 對話中顯示。
+
+    規則：
+    1. 後台新增的待辦通常沒有 line_target_id，視為共用待辦，LINE 查詢要看得到。
+    2. LINE 群組 / 個人對話新增的待辦有 line_target_id，只顯示在同一個 target。
+    """
+    item_target = (data.get('line_target_id') or '').strip()
+    target_id = (target_id or '').strip()
+
+    # 後台待辦 / 舊資料：沒有 target，視為共用待辦
+    if not item_target:
+        return True
+
+    # 沒有目標限制時也可顯示
+    if not target_id:
+        return True
+
+    return item_target == target_id
+
+
+def _is_open_todo_doc(doc, target_id=''):
+    """覆寫：LINE 查詢要包含後台共用待辦。"""
+    data = doc.to_dict() or {}
+    if data.get('status', 'open') != 'open':
+        return False
+    if not _line_todo_visible_for_target(data, target_id=target_id):
+        return False
+    if not (data.get('todo_date') or '').strip():
+        return False
+    return True
+
+
+def _line_todo_doc_note(data: dict) -> str:
+    """兼容後台欄位：後台舊資料可能把備註存在 content，不是 note。"""
+    return (data.get('note') or data.get('content') or '').strip()
+
+
+def _get_open_line_todos(todo_date='', target_id='', include_overdue=False):
+    """指定日期待辦。include_overdue=True 時包含指定日期以前。"""
+    query_date = _parse_line_todo_date(todo_date or '') or now_taipei().strftime('%Y-%m-%d')
+    result = []
+
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        if not _is_open_todo_doc(doc, target_id=target_id):
+            continue
+        d = _todo_date_value(doc)
+        if include_overdue:
+            if d <= query_date:
+                result.append(doc)
+        else:
+            if d == query_date:
+                result.append(doc)
+
+    return _sort_line_todo_docs(result)
+
+
+def _get_overdue_line_todos(todo_date='', target_id=''):
+    """指定日期以前尚未完成的待辦；會持續顯示直到完成或刪除。"""
+    query_date = _parse_line_todo_date(todo_date or '') or now_taipei().strftime('%Y-%m-%d')
+    result = []
+
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        if not _is_open_todo_doc(doc, target_id=target_id):
+            continue
+        d = _todo_date_value(doc)
+        if d < query_date:
+            result.append(doc)
+
+    return _sort_line_todo_docs(result)
+
+
+def _get_display_line_todos(todo_date='', target_id=''):
+    """LINE 畫面使用：逾期未完成在前，當日待辦在後。"""
+    query_date = _parse_line_todo_date(todo_date or '') or now_taipei().strftime('%Y-%m-%d')
+    return _get_overdue_line_todos(query_date, target_id=target_id) + _get_open_line_todos(query_date, target_id=target_id, include_overdue=False)
+
+
+def _line_todo_item_box(doc, todo_date='', section_label=''):
+    """覆寫卡片列：備註相容 note/content，日期顯示 M/D。"""
+    data = _line_todo_doc_payload(doc)
+    title = data.get('title') or data.get('content') or '未命名待辦'
+    note = _line_todo_doc_note(data)
+    date_label = _todo_display_md(data.get('todo_date') or todo_date or '') if '_todo_display_md' in globals() else (data.get('todo_date') or todo_date or '')
+    created_by = data.get('created_by_name') or data.get('sender_display_name') or ''
+    source = data.get('source') or ''
+
+    detail_lines = []
+    if date_label and section_label not in ('今天', '今日', '今天待辦'):
+        detail_lines.append(date_label)
+    if note:
+        detail_lines.append(_line_todo_flex_truncate(note, 55))
+    if created_by:
+        detail_lines.append(f'建立：{created_by}')
+    if source == '後台' and not (data.get('line_target_id') or '').strip():
+        detail_lines.append('共用')
+    detail_text = '｜'.join(detail_lines)
+
+    text_contents = [
+        {'type': 'text', 'text': _line_todo_flex_truncate(title, 68), 'size': 'sm', 'color': '#222222', 'wrap': True, 'weight': 'bold'},
+    ]
+    if detail_text:
+        text_contents.append({'type': 'text', 'text': _line_todo_flex_truncate(detail_text, 92), 'size': 'xs', 'color': '#888888', 'wrap': True, 'margin': 'xs'})
+
+    return {
+        'type': 'box',
+        'layout': 'horizontal',
+        'spacing': 'sm',
+        'paddingTop': 'sm',
+        'paddingBottom': 'sm',
+        'contents': [
+            {
+                'type': 'button',
+                'style': 'secondary',
+                'height': 'sm',
+                'flex': 2,
+                'action': _line_todo_complete_postback_action(data.get('id', ''), data.get('todo_date') or todo_date),
+            },
+            {
+                'type': 'box',
+                'layout': 'vertical',
+                'flex': 8,
+                'contents': text_contents,
+            },
+        ],
+    }
+
+
+def _line_todo_get_card_docs(todo_date, target_id=''):
+    """覆寫：只顯示逾期未完成 + 當日未完成，不顯示未來待辦。"""
+    todo_date = _parse_line_todo_date(todo_date or '') or now_taipei().strftime('%Y-%m-%d')
+    overdue_items = _get_overdue_line_todos(todo_date=todo_date, target_id=target_id)
+    today_items = _get_open_line_todos(todo_date=todo_date, target_id=target_id, include_overdue=False)
+    future_items = []
+    return overdue_items, today_items, future_items
+
+
+def build_line_todo_flex_card(todo_date='', target_id='', title_prefix='待辦事項'):
+    """覆寫 LINE 待辦卡片：包含後台共用待辦 + 未完成延續顯示。"""
+    todo_date = _parse_line_todo_date(todo_date or '') or now_taipei().strftime('%Y-%m-%d')
+    display_date = _todo_display_md(todo_date) if '_todo_display_md' in globals() else todo_date
+    overdue_items, today_items, future_items = _line_todo_get_card_docs(todo_date, target_id=target_id)
+    total_open = len(overdue_items) + len(today_items)
+
+    body_contents = [
+        {
+            'type': 'box',
+            'layout': 'horizontal',
+            'contents': [
+                {'type': 'text', 'text': f'📌 {title_prefix}', 'size': 'lg', 'weight': 'bold', 'color': '#222222', 'flex': 5},
+                {'type': 'text', 'text': f'{display_date}', 'size': 'sm', 'color': '#C9874A', 'align': 'end', 'gravity': 'center', 'flex': 3, 'weight': 'bold'},
+            ],
+        },
+        {'type': 'text', 'text': f'未完成 {total_open} 筆｜包含今日與過去尚未完成｜點左側 ☐ 可完成並更新後台', 'size': 'xs', 'color': '#888888', 'wrap': True, 'margin': 'sm'},
+        {'type': 'separator', 'margin': 'md'},
+    ]
+
+    if not overdue_items and not today_items:
+        body_contents.append({
+            'type': 'box',
+            'layout': 'vertical',
+            'margin': 'lg',
+            'contents': [
+                {'type': 'text', 'text': '目前沒有未完成待辦。', 'size': 'sm', 'color': '#666666', 'wrap': True},
+            ],
+        })
+    else:
+        if overdue_items:
+            body_contents.append(_line_todo_section_box('尚未完成', overdue_items, todo_date=todo_date, empty_text='', max_items=20))
+        if today_items:
+            body_contents.append(_line_todo_section_box('今天待辦', today_items, todo_date=todo_date, empty_text='', max_items=20))
+
+    footer_contents = []
+    todos_url = build_app_url(f'/todos?date={todo_date}') if 'build_app_url' in globals() else ''
+    if todos_url:
+        footer_contents.append({
+            'type': 'button',
+            'style': 'primary',
+            'height': 'sm',
+            'color': '#C9874A',
+            'action': {'type': 'uri', 'label': '查看後台', 'uri': todos_url},
+        })
+    footer_contents.append({
+        'type': 'button',
+        'style': 'secondary',
+        'height': 'sm',
+        'action': {'type': 'message', 'label': '新增待辦', 'text': '#新增待辦\n日期: 今天\n事項: '},
+    })
+
+    return {
+        'type': 'bubble',
+        'size': 'mega',
+        'body': {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'sm',
+            'contents': body_contents,
+        },
+        'footer': {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'sm',
+            'contents': footer_contents,
+        },
+        'styles': {'footer': {'separator': True}},
+    }
+
+
+def query_line_todos(fields, event, force_today=False):
+    """覆寫 LINE 查詢：#今日待辦 會顯示今日 + 過去未完成，並包含後台共用待辦。"""
+    target_id, _target_type = _line_todo_target_from_event(event)
+    todo_date = now_taipei().strftime('%Y-%m-%d') if force_today else _parse_line_todo_date(fields.get('todo_date') or fields.get('todo_date_raw') or '')
+    if not todo_date:
+        todo_date = now_taipei().strftime('%Y-%m-%d')
+    flex = build_line_todo_flex_card(todo_date=todo_date, target_id=target_id, title_prefix='待辦事項')
+    return {
+        'handled': True,
+        'ok': True,
+        'reply_text': f'{_todo_display_md(todo_date) if "_todo_display_md" in globals() else todo_date} 待辦事項',
+        'reply_flex': flex,
+        'parsed_tag': '查詢待辦',
+    }
+
+
+def _line_todo_mark_done_from_postback(todo_id, event=None):
+    """點 LINE 卡片 ☐ 後直接完成後台資料。"""
+    todo_id = (todo_id or '').strip()
+    if not todo_id:
+        return False, '缺少待辦 ID', ''
+
+    ref = db.collection(LINE_TODO_COLLECTION).document(todo_id)
+    snap = ref.get()
+    if not snap.exists:
+        return False, '找不到這筆待辦，可能已刪除。', ''
+
+    data = snap.to_dict() or {}
+    sender = get_line_sender_display_name(event) if event else ''
+    now_iso = now_taipei().isoformat()
+    ref.update({
+        'status': 'done',
+        'completed_at': now_iso,
+        'done_at': now_iso,
+        'completed_by_id': ((event or {}).get('source') or {}).get('userId', ''),
+        'completed_by_name': sender or 'LINE',
+        'done_by_id': ((event or {}).get('source') or {}).get('userId', ''),
+        'done_by_name': sender or 'LINE',
+        'updated_at': now_iso,
+    })
+    return True, f'已完成：{data.get("title", "待辦")}', data.get('todo_date') or now_taipei().strftime('%Y-%m-%d')
+
+
+# 後台新增待辦時，兩個欄位都存，避免 LINE 讀不到備註。
+def todos_new_line_compatible():
+    title = (request.form.get('title') or '').strip()
+    todo_date = calendar_safe_date(request.form.get('todo_date') or '')
+    note = (request.form.get('note') or '').strip()
+    if not title:
+        flash('請輸入待辦事項', 'warning')
+        return redirect(url_for('todos_page', date=todo_date))
+    db.collection(LINE_TODO_COLLECTION).add({
+        'title': title,
+        'content': note,
+        'note': note,
+        'todo_date': todo_date,
+        'status': 'open',
+        'source': '後台',
+        # line_target_id 留空：代表共用待辦，LINE 群組查詢要能看得到。
+        'line_target_id': '',
+        'line_target_type': 'backend_shared',
+        'created_at': now_taipei().isoformat(),
+        'created_by_id': session.get('user_id'),
+        'created_by_name': session.get('user_name'),
+    })
+    flash('已新增待辦事項', 'success')
+    return redirect(url_for('todos_page', date=todo_date))
+
+try:
+    app.view_functions['todos_new'] = login_required(todos_new_line_compatible)
+    print('✅ LINE 待辦查詢已修正：包含後台共用待辦 + 未完成延續顯示')
+except Exception as e:
+    print('⚠️ LINE 待辦查詢修正套用失敗：', e)
+# =============================================================================
+# LINE 待辦事項查詢修正 Patch End
+# =============================================================================
+
+
 if __name__ == "__main__":
     print("✅ FULL_READY_20260621 已載入")
     print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
