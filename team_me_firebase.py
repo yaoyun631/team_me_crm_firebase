@@ -12434,9 +12434,9 @@ CALENDAR_CATEGORY_OPTIONS = [
     "開發",
     "簽約",
     "拍照",
-    "簽委託",
+    "收服務費",
     "待辦",
-    "開會",
+    "其他",
 ]
 
 CALENDAR_CATEGORY_COLOR_MAP = {
@@ -12445,9 +12445,9 @@ CALENDAR_CATEGORY_COLOR_MAP = {
     "開發": "#5E9F45",
     "簽約": "#7B61FF",
     "拍照": "#8A63D2",
-    "簽委託": "#B36B00",
+    "收服務費": "#B36B00",
     "待辦": "#6C757D",
-    "開會": "#8B8B8B",
+    "其他": "#8B8B8B",
 }
 
 DEFAULT_LINE_CARD_SETTINGS = {
@@ -12611,6 +12611,58 @@ def fetch_calendar_events(start_date: str, end_date: str = None, line_only: bool
     events.sort(key=lambda x: (x.get("event_date", ""), x.get("start_time", ""), x.get("created_at", "")))
     return events
 
+
+
+
+def calc_calendar_slot_span(start_time: str, end_time: str):
+    """計算一筆行程要橫跨幾個 30 分鐘格。"""
+    start_minutes = calendar_time_to_minutes(start_time)
+    end_minutes = calendar_time_to_minutes(end_time)
+    if end_minutes <= start_minutes:
+        end_minutes = start_minutes + 30
+    span = (end_minutes - start_minutes + 29) // 30
+    return max(1, span)
+
+
+def build_calendar_slot_cells(events, slots):
+    """建立行事曆表格資料，讓長行程可以用 rowspan 橫跨多個 30 分鐘格。"""
+    cells = {slot: {"event": None, "span": 1, "skip": False, "extra_events": []} for slot in slots}
+    slot_index = {slot: idx for idx, slot in enumerate(slots)}
+
+    # 同一個起始時間可能有多筆；第一筆用 rowspan，其餘顯示在同一張卡下方，避免資料消失。
+    grouped = {}
+    outside_events = []
+    for event in events:
+        start = (event.get("start_time") or "").strip()
+        if start in slot_index:
+            grouped.setdefault(start, []).append(event)
+        else:
+            outside_events.append(event)
+
+    for start, group in grouped.items():
+        main_event = group[0]
+        span = calc_calendar_slot_span(main_event.get("start_time"), main_event.get("end_time"))
+        start_idx = slot_index[start]
+        max_span = max(1, min(span, len(slots) - start_idx))
+        cells[start] = {"event": main_event, "span": max_span, "skip": False, "extra_events": group[1:]}
+
+        for offset in range(1, max_span):
+            idx = start_idx + offset
+            if idx < len(slots):
+                covered_slot = slots[idx]
+                # 如果該時段本來也有行程，保留到起始卡片的 extra_events，不讓它消失。
+                if cells.get(covered_slot, {}).get("event"):
+                    cells[start]["extra_events"].append(cells[covered_slot]["event"])
+                cells[covered_slot] = {"event": None, "span": 1, "skip": True, "extra_events": []}
+
+    if outside_events and slots:
+        first_slot = slots[0]
+        if cells[first_slot].get("event"):
+            cells[first_slot].setdefault("extra_events", []).extend(outside_events)
+        else:
+            cells[first_slot] = {"event": outside_events[0], "span": 1, "skip": False, "extra_events": outside_events[1:]}
+
+    return cells
 
 def build_calendar_event_payload(form, existing=None):
     existing = existing or {}
@@ -12977,26 +13029,20 @@ LINE_CARD_SETTINGS_TEMPLATE = r'''
 def calendar_page():
     selected_date = calendar_safe_date(request.args.get("date", ""))
     events = fetch_calendar_events(selected_date)
-
-    event_map = {}
-    floating_events = []
     slots = build_30_min_slots()
-    slot_set = set(slots)
-    for e in events:
-        if e.get("start_time") in slot_set:
-            event_map.setdefault(e.get("start_time"), []).append(e)
-        else:
-            floating_events.append(e)
+    slot_cells = build_calendar_slot_cells(events, slots)
 
-    # 不在時段內的行程放在最接近起始位置，避免消失。
-    if floating_events:
-        event_map.setdefault(slots[0], []).extend(floating_events)
+    # 舊版 calendar.html 若仍使用 event_map，也保留傳入，避免模板尚未覆蓋時出錯。
+    event_map = {}
+    for e in events:
+        event_map.setdefault(e.get("start_time"), []).append(e)
 
     dates = calendar_prev_next_dates(selected_date)
-    return render_template_string(
-        CALENDAR_PAGE_TEMPLATE,
+    return render_template(
+        "calendar.html",
         selected_date=selected_date,
         slots=slots,
+        slot_cells=slot_cells,
         event_map=event_map,
         events=events,
         category_options=CALENDAR_CATEGORY_OPTIONS,

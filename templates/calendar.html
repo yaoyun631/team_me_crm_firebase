@@ -2,90 +2,127 @@
 {% block content %}
 
 <style>
-  .calendar-toolbar {
-    gap: .5rem;
-  }
-  .calendar-slot {
-    border-left: 4px solid #e6d2bd;
-    background: #fff;
-    border-radius: 12px;
-  }
-  .calendar-time {
-    min-width: 82px;
-    font-weight: 700;
-    color: #7A4E2D;
-  }
-  .event-card {
+  .calendar-toolbar { gap: .5rem; }
+  .calendar-table-wrap {
     border: 1px solid #eadfd0;
+    border-radius: 18px;
+    overflow: hidden;
+    background: #fff;
+  }
+  .calendar-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    table-layout: fixed;
+    margin: 0;
+  }
+  .calendar-table tr { height: 64px; }
+  .calendar-time-cell {
+    width: 88px;
+    background: #fff8f1;
+    color: #8b5e34;
+    font-weight: 700;
+    font-size: 14px;
+    padding: 10px 12px;
+    border-bottom: 1px solid #f0e0cf;
+    vertical-align: top;
+  }
+  .calendar-slot-cell {
+    border-bottom: 1px solid #f0e0cf;
+    padding: 10px 12px;
+    vertical-align: top;
+    background: #fff;
+  }
+  .calendar-slot-cell.empty {
+    color: #b6a18d;
+    font-size: 13px;
+  }
+  .calendar-event-card {
+    height: 100%;
+    min-height: 54px;
+    border: 1px solid #eadfd0;
+    border-left: 7px solid var(--cat, #C9874A);
     border-radius: 14px;
     background: #fffdf9;
-    transition: .15s ease;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    box-shadow: 0 4px 14px rgba(120,80,40,.06);
   }
-  .event-card:hover {
-    box-shadow: 0 6px 18px rgba(0,0,0,.08);
-    transform: translateY(-1px);
+  .calendar-event-title {
+    font-weight: 800;
+    color: #2f241e;
+    font-size: 16px;
+    margin-bottom: 4px;
   }
-  .event-badge {
-    border-radius: 999px;
-    padding: .25rem .6rem;
-    font-size: .78rem;
-    color: #fff;
-    display: inline-block;
+  .calendar-event-time {
+    color: #8b5e34;
+    font-size: 13px;
+    margin-bottom: 5px;
   }
-  .event-meta {
-    color: #6c757d;
-    font-size: .9rem;
-    line-height: 1.7;
+  .calendar-event-meta {
+    color: #6c5f55;
+    font-size: 13px;
+    line-height: 1.6;
   }
-  .event-note {
+  .calendar-event-note {
+    color: #6c5f55;
+    font-size: 13px;
+    line-height: 1.6;
     white-space: pre-wrap;
+    word-break: break-word;
   }
-  .empty-slot {
-    color: #adb5bd;
-    font-size: .92rem;
+  .calendar-category-badge {
+    border-radius: 999px;
+    padding: 3px 9px;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
   }
-  .calendar-summary .badge {
-    font-size: .82rem;
+  .calendar-extra-card {
+    border-top: 1px dashed #e8d8c7;
+    margin-top: 10px;
+    padding-top: 10px;
+  }
+  .calendar-empty-line {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
   }
   @media (max-width: 768px) {
-    .calendar-time {
-      min-width: 100%;
-      margin-bottom: .5rem;
-    }
+    .calendar-time-cell { width: 68px; padding: 8px; }
+    .calendar-slot-cell { padding: 8px; }
+    .calendar-table tr { height: 70px; }
+    .calendar-event-card { padding: 10px; }
   }
 </style>
 
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <div>
-    <h3 class="mb-0">行事曆</h3>
+    <h3 class="mb-0">{{ selected_date }} 行程</h3>
     <div class="small text-muted mt-1">
-      日期：<span class="badge bg-dark">{{ selected_date }}</span>
+      每 30 分鐘一格，長行程會自動跨格顯示。
       今日行程 <span class="badge bg-primary">{{ events|length }}</span>
     </div>
   </div>
 
   <div class="d-flex flex-wrap calendar-toolbar">
     <a href="{{ url_for('calendar_page', date=prev_date) }}" class="btn btn-outline-secondary btn-sm">← 前一天</a>
+    <form method="get" action="{{ url_for('calendar_page') }}" class="d-flex gap-2">
+      <input type="date" name="date" class="form-control form-control-sm" value="{{ selected_date }}">
+      <button type="submit" class="btn btn-outline-secondary btn-sm text-nowrap">切換日期</button>
+    </form>
     <a href="{{ url_for('calendar_page', date=today) }}" class="btn btn-outline-dark btn-sm">今天</a>
     <a href="{{ url_for('calendar_page', date=next_date) }}" class="btn btn-outline-secondary btn-sm">後一天 →</a>
     <a href="{{ url_for('calendar_new', date=selected_date) }}" class="btn btn-primary btn-sm">＋ 新增行程</a>
   </div>
 </div>
 
-<form class="row g-2 mb-3" method="get" action="{{ url_for('calendar_page') }}">
-  <div class="col-12 col-md-auto">
-    <input type="date" name="date" class="form-control" value="{{ selected_date }}">
-  </div>
-  <div class="col-6 col-md-auto">
-    <button type="submit" class="btn btn-outline-secondary w-100">切換日期</button>
-  </div>
-  <div class="col-6 col-md-auto">
-    <a href="{{ url_for('calendar_new', date=selected_date) }}" class="btn btn-outline-primary w-100">新增本日行程</a>
-  </div>
-</form>
-
 {% if events %}
-  <div class="calendar-summary mb-3 d-flex flex-wrap gap-2">
+  <div class="mb-3 d-flex flex-wrap gap-2">
     {% for category in category_options %}
       {% set count = events|selectattr('category', 'equalto', category)|list|length %}
       {% if count > 0 %}
@@ -95,88 +132,90 @@
   </div>
 {% endif %}
 
-<div class="card shadow-sm">
-  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <strong>30 分鐘時段表</strong>
-    <span class="small text-muted">可從空白時段快速新增行程</span>
-  </div>
+<div class="calendar-table-wrap shadow-sm">
+  <table class="calendar-table">
+    <tbody>
+      {% for slot in slots %}
+        {% set cell = slot_cells.get(slot) if slot_cells else None %}
+        <tr>
+          <td class="calendar-time-cell">{{ slot }}</td>
 
-  <div class="card-body">
-    {% for slot in slots %}
-      {% set slot_events = event_map.get(slot, []) %}
-      <div class="calendar-slot p-3 mb-3">
-        <div class="d-flex flex-wrap align-items-start gap-3">
-          <div class="calendar-time">
-            {{ slot }}
-          </div>
-
-          <div class="flex-grow-1">
-            {% if slot_events %}
-              <div class="row g-3">
-                {% for e in slot_events %}
-                  <div class="col-12 col-lg-6">
-                    <div class="event-card p-3 h-100">
-                      <div class="d-flex justify-content-between align-items-start gap-2 mb-2">
-                        <div>
-                          <span class="event-badge" style="background: {{ e.category_color or '#8B8B8B' }};">
-                            {{ e.category or '其他' }}
-                          </span>
-                          {% if e.line_enabled %}
-                            <span class="badge bg-success ms-1">LINE顯示</span>
-                          {% else %}
-                            <span class="badge bg-secondary ms-1">LINE隱藏</span>
-                          {% endif %}
-                        </div>
-                        <div class="small text-muted text-nowrap">
-                          {{ e.start_time }} - {{ e.end_time }}
-                        </div>
+          {% if cell and cell.skip %}
+            {# 這一格已被上一筆長行程 rowspan 佔用，所以不輸出第二欄 #}
+          {% else %}
+            {% if cell and cell.event %}
+              {% set e = cell.event %}
+              <td class="calendar-slot-cell" rowspan="{{ cell.span }}">
+                <div class="calendar-event-card" style="--cat: {{ e.category_color or '#C9874A' }}; min-height: {{ (cell.span * 64) - 20 }}px;">
+                  <div>
+                    <div class="d-flex justify-content-between align-items-start gap-2 mb-1">
+                      <div>
+                        <div class="calendar-event-title">{{ e.title or '未命名行程' }}</div>
+                        <div class="calendar-event-time">{{ e.start_time }} - {{ e.end_time }}</div>
                       </div>
-
-                      <h5 class="mb-2">{{ e.title or '未命名行程' }}</h5>
-
-                      <div class="event-meta">
-                        {% if e.customer_name %}
-                          <div>👤 {{ e.customer_name }}</div>
-                        {% endif %}
-                        {% if e.phone %}
-                          <div>☎ {{ e.phone }}</div>
-                        {% endif %}
-                        {% if e.location %}
-                          <div>📍 {{ e.location }}</div>
-                        {% endif %}
-                        {% if e.related_type or e.related_id %}
-                          <div>🔗 {{ e.related_type or '-' }}{% if e.related_id %}｜{{ e.related_id }}{% endif %}</div>
-                        {% endif %}
-                      </div>
-
-                      {% if e.note %}
-                        <div class="event-note mt-2 small text-muted border-top pt-2">{{ e.note }}</div>
-                      {% endif %}
-
-                      <div class="d-flex gap-2 mt-3 flex-wrap">
-                        <a href="{{ url_for('calendar_edit', event_id=e.id) }}" class="btn btn-sm btn-outline-primary">編輯</a>
-                        <form method="post" action="{{ url_for('calendar_delete', event_id=e.id) }}" onsubmit="return confirm('確定要刪除這筆行程嗎？');">
-                          <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
-                        </form>
-                        {% if e.location %}
-                          <a class="btn btn-sm btn-outline-success" target="_blank" href="https://www.google.com/maps/search/?api=1&query={{ e.location|urlencode }}">地圖</a>
+                      <div class="text-end">
+                        <span class="calendar-category-badge" style="background: {{ e.category_color or '#C9874A' }};">
+                          {{ e.display_category or e.category or '其他' }}
+                        </span>
+                        {% if e.line_enabled %}
+                          <span class="badge bg-success ms-1">LINE</span>
                         {% endif %}
                       </div>
                     </div>
+
+                    <div class="calendar-event-meta">
+                      {% if e.customer_name %}<div>客戶：{{ e.customer_name }}</div>{% endif %}
+                      {% if e.phone %}<div>電話：{{ e.phone }}</div>{% endif %}
+                      {% if e.location %}<div>地點：{{ e.location }}</div>{% endif %}
+                      {% if e.related_type or e.related_id %}<div>關聯：{{ e.related_type or '-' }}{% if e.related_id %}｜{{ e.related_id }}{% endif %}</div>{% endif %}
+                    </div>
+
+                    {% if e.note %}
+                      <div class="calendar-event-note mt-2">備註：{{ e.note }}</div>
+                    {% endif %}
+
+                    {% if cell.extra_events %}
+                      {% for ex in cell.extra_events %}
+                        <div class="calendar-extra-card">
+                          <div class="fw-bold">{{ ex.title or '未命名行程' }}</div>
+                          <div class="small text-muted">{{ ex.start_time }} - {{ ex.end_time }}｜{{ ex.category or '其他' }}</div>
+                          {% if ex.customer_name %}<div class="small">客戶：{{ ex.customer_name }}</div>{% endif %}
+                          {% if ex.location %}<div class="small">地點：{{ ex.location }}</div>{% endif %}
+                          <div class="mt-2 d-flex gap-2 flex-wrap">
+                            <a href="{{ url_for('calendar_edit', event_id=ex.id) }}" class="btn btn-sm btn-outline-primary">編輯</a>
+                            <form method="post" action="{{ url_for('calendar_delete', event_id=ex.id) }}" onsubmit="return confirm('確定要刪除這筆行程嗎？');">
+                              <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
+                            </form>
+                          </div>
+                        </div>
+                      {% endfor %}
+                    {% endif %}
                   </div>
-                {% endfor %}
-              </div>
+
+                  <div class="d-flex gap-2 mt-3 flex-wrap justify-content-end">
+                    <a href="{{ url_for('calendar_edit', event_id=e.id) }}" class="btn btn-sm btn-outline-primary">編輯</a>
+                    <form method="post" action="{{ url_for('calendar_delete', event_id=e.id) }}" onsubmit="return confirm('確定要刪除這筆行程嗎？');">
+                      <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
+                    </form>
+                    {% if e.location %}
+                      <a class="btn btn-sm btn-outline-success" target="_blank" href="https://www.google.com/maps/search/?api=1&query={{ e.location|urlencode }}">地圖</a>
+                    {% endif %}
+                  </div>
+                </div>
+              </td>
             {% else %}
-              <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
-                <span class="empty-slot">目前沒有行程</span>
-                <a href="{{ url_for('calendar_new', date=selected_date, start=slot) }}" class="btn btn-sm btn-outline-secondary">＋ 新增 {{ slot }}</a>
-              </div>
+              <td class="calendar-slot-cell empty">
+                <div class="calendar-empty-line">
+                  <span>空</span>
+                  <a href="{{ url_for('calendar_new', date=selected_date, start=slot) }}" class="btn btn-sm btn-outline-secondary">＋ 新增 {{ slot }}</a>
+                </div>
+              </td>
             {% endif %}
-          </div>
-        </div>
-      </div>
-    {% endfor %}
-  </div>
+          {% endif %}
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </div>
 
 {% endblock %}
