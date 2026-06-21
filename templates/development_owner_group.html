@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-0">同屋主物件分類</h3>
+    <div class="small text-muted mt-1">
+      {{ owner_name or '未填姓名' }}｜{{ owner_phone or '-' }}｜共 <span class="badge bg-warning text-dark">{{ items|length }}</span> 筆物件
+    </div>
+  </div>
+  <div>
+    <a href="{{ url_for('developments', q=owner_phone) }}" class="btn btn-outline-primary">回開發列表</a>
+  </div>
+</div>
+
+<div class="alert alert-warning small">
+  同一支電話會視為同一位屋主；同屋主可以有多筆地址 / 物件。新增開發時，若「電話相同但地址不同」，會新增成同屋主的新物件；若「電話相同且地址相同」，會更新原本那筆物件。
+</div>
+
+{% if items %}
+  <div class="row g-3">
+    {% for item in items %}
+      <div class="col-md-6">
+        <div class="card h-100 shadow-sm">
+          <div class="card-body">
+            <div class="d-flex justify-content-between align-items-start gap-2 mb-2">
+              <div>
+                <h5 class="mb-1">物件 {{ loop.index }}</h5>
+                <div class="fw-bold text-break">{{ item.address or item.registered_address or '未填地址' }}</div>
+              </div>
+              <div class="text-end">
+                <span class="badge bg-secondary d-block mb-1">{{ item.current_stage or item.stage or '-' }}</span>
+                {% if item.source %}<span class="badge bg-light text-dark border">{{ item.source }}</span>{% endif %}
+              </div>
+            </div>
+
+            <div class="small mb-2">
+              <div><span class="text-muted">屋主：</span>{{ item.name or '-' }}｜{{ item.phone or '-' }}</div>
+              <div><span class="text-muted">下一步：</span>{{ item.next_action or '-' }}</div>
+              <div><span class="text-muted">下次時間：</span>{{ item.next_action_date or '-' }}</div>
+              <div><span class="text-muted">戶籍地址：</span>{{ item.registered_address or '-' }}</div>
+            </div>
+
+            {% if item.note %}
+              <div class="p-2 bg-light rounded small text-break mb-3">{{ item.note[:120] }}{% if item.note|length > 120 %}...{% endif %}</div>
+            {% endif %}
+
+            <div class="d-flex gap-2 flex-wrap">
+              <a href="{{ url_for('development_detail', development_id=item.id) }}" class="btn btn-sm btn-outline-primary">詳細 / 追蹤</a>
+              <a href="{{ url_for('calendar_new', related_type='development', related_id=item.id, title=((item.name or item.address or '開發') ~ ' 開發追蹤'), customer_name=item.name, phone=item.phone, location=(item.address or item.registered_address), note=item.note) }}" class="btn btn-sm btn-outline-success">加入行事曆</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="text-muted text-center">目前沒有同屋主物件。</p>
+{% endif %}
+
+{% endblock %}

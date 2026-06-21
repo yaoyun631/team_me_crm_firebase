@@ -1,57 +1,232 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+<style>
+  .todo-page-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 18px;
+  }
+  .todo-stat-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border-radius: 999px;
+    padding: 3px 9px;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .todo-form-card,
+  .todo-list-card {
+    border: 0;
+    border-radius: 18px;
+    box-shadow: 0 8px 24px rgba(120, 86, 50, .08);
+    overflow: hidden;
+  }
+  .todo-list-card .card-header {
+    background: #fff;
+    border-bottom: 1px solid #eadfd3;
+  }
+  .todo-row {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    gap: 12px;
+    padding: 16px 18px;
+    border-bottom: 1px solid #f0e4d8;
+    background: #fff;
+    transition: background .12s ease, opacity .12s ease;
+  }
+  .todo-row:last-child { border-bottom: 0; }
+  .todo-row:hover { background: #fffaf5; }
+  .todo-row.done {
+    opacity: .68;
+    background: #f8fafc;
+  }
+  .todo-check {
+    width: 23px;
+    height: 23px;
+    margin-top: 2px;
+    cursor: pointer;
+    accent-color: #C9874A;
+  }
+  .todo-title {
+    font-size: 17px;
+    font-weight: 800;
+    line-height: 1.35;
+    color: #222;
+    word-break: break-word;
+  }
+  .todo-row.done .todo-title {
+    color: #7b8794;
+    text-decoration: line-through;
+  }
+  .todo-meta {
+    color: #6b7280;
+    font-size: 13px;
+  }
+  .todo-note {
+    color: #374151;
+    background: #f9fafb;
+    border-radius: 12px;
+    padding: 8px 10px;
+    font-size: 13px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .todo-side {
+    min-width: 108px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+  }
+  .todo-status-pill {
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .todo-date-nav {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  @media (max-width: 576px) {
+    .todo-date-nav { width: 100%; }
+    .todo-date-nav input[type="date"] { flex: 1 1 auto; }
+    .todo-row {
+      grid-template-columns: 30px minmax(0, 1fr);
+      gap: 10px;
+      padding: 14px;
+    }
+    .todo-side {
+      grid-column: 2 / 3;
+      flex-direction: row;
+      justify-content: space-between;
+      align-items: center;
+      min-width: 0;
+      margin-top: 4px;
+    }
+  }
+</style>
+
+<div class="todo-page-head">
   <div>
-    <h3 class="mb-0">待辦事項</h3>
-    <div class="small text-muted mt-1">{{ selected_date_label or selected_date }}｜可管理 LINE Bot 待辦提醒。</div>
+    <h3 class="mb-1">待辦事項</h3>
+    <div class="small text-muted">
+      {{ selected_date_label or selected_date }}｜所有待辦集中在同一張卡片，勾選完成後會直接更新後台。
+    </div>
+    <div class="mt-2 d-flex gap-2 flex-wrap">
+      <span class="todo-stat-badge bg-dark text-white">總筆數 {{ total_count or 0 }}</span>
+      <span class="todo-stat-badge bg-warning text-dark">待處理 {{ open_count or 0 }}</span>
+      <span class="todo-stat-badge bg-success text-white">已完成 {{ done_count or 0 }}</span>
+    </div>
   </div>
-  <form method="get" class="d-flex gap-2 align-items-center">
+
+  <form method="get" class="todo-date-nav">
     <input type="date" name="date" class="form-control form-control-sm" value="{{ selected_date }}">
-    <label class="form-check-label small text-nowrap">
-      <input type="checkbox" name="show_done" value="1" {% if show_done %}checked{% endif %}> 顯示完成
+    <label class="form-check-label small text-nowrap d-flex align-items-center gap-1">
+      <input type="checkbox" name="show_done" value="1" {% if show_done %}checked{% endif %}>
+      顯示完成
     </label>
     <button class="btn btn-outline-secondary btn-sm">切換</button>
+    <a href="{{ url_for('todos_page') }}" class="btn btn-outline-primary btn-sm">今天</a>
   </form>
 </div>
 
-<div class="card shadow-sm mb-4">
-  <div class="card-header fw-bold">新增待辦事項</div>
+<div class="card todo-form-card mb-4">
+  <div class="card-header fw-bold bg-white">＋ 新增待辦事項</div>
   <div class="card-body">
-    <form method="post" action="{{ url_for('todos_new') }}" class="row g-2">
-      <div class="col-md-3"><input type="date" name="todo_date" class="form-control" value="{{ selected_date }}"></div>
-      <div class="col-md-5"><input type="text" name="title" class="form-control" placeholder="待辦事項，例如：提醒客戶補資料" required></div>
-      <div class="col-md-3"><input type="text" name="note" class="form-control" placeholder="備註（可空白）"></div>
-      <div class="col-md-1 d-grid"><button class="btn btn-primary">新增</button></div>
+    <form method="post" action="{{ url_for('todos_new') }}" class="row g-2 align-items-end">
+      <div class="col-md-3">
+        <label class="form-label small text-muted">日期</label>
+        <input type="date" name="todo_date" class="form-control" value="{{ selected_date }}">
+      </div>
+      <div class="col-md-5">
+        <label class="form-label small text-muted">待辦事項</label>
+        <input type="text" name="title" class="form-control" placeholder="例如：提醒客戶補資料" required>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small text-muted">備註</label>
+        <input type="text" name="note" class="form-control" placeholder="可空白">
+      </div>
+      <div class="col-md-1 d-grid">
+        <button class="btn btn-primary">新增</button>
+      </div>
     </form>
   </div>
 </div>
 
-<div class="card shadow-sm">
-  <div class="card-header fw-bold">待辦清單</div>
-  <div class="card-body p-0">
-    <table class="table table-hover align-middle mb-0">
-      <thead class="table-light"><tr><th style="width:120px;">日期</th><th>事項</th><th>備註</th><th style="width:120px;">狀態</th><th style="width:180px;">操作</th></tr></thead>
-      <tbody>
-        {% for item in items %}
-          <tr>
-            <td>{{ item.todo_date or '-' }}</td>
-            <td class="fw-bold">{{ item.title or item.content or '-' }}</td>
-            <td class="text-muted small">{{ item.content if item.title else '' }}</td>
-            <td>{% if item.status == 'done' %}<span class="badge bg-success">已完成</span>{% else %}<span class="badge bg-warning text-dark">待處理</span>{% endif %}</td>
-            <td>
-              <div class="d-flex gap-2">
-                {% if item.status != 'done' %}
-                  <form method="post" action="{{ url_for('todos_done', todo_id=item.id) }}"><button class="btn btn-sm btn-outline-success">完成</button></form>
-                {% endif %}
-                <form method="post" action="{{ url_for('todos_delete', todo_id=item.id) }}" onsubmit="return confirm('確定刪除？');"><button class="btn btn-sm btn-outline-danger">刪除</button></form>
-              </div>
-            </td>
-          </tr>
-        {% else %}
-          <tr><td colspan="5" class="text-center text-muted py-4">目前沒有待辦事項</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
+<div class="card todo-list-card">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <div class="fw-bold">{{ selected_date_label or selected_date }} 待辦清單</div>
+    <div class="small text-muted">共 {{ items|length if items else 0 }} 筆</div>
   </div>
+
+  {% if items %}
+    <div class="todo-list">
+      {% for item in items %}
+        {% set is_done = item.status == 'done' %}
+        {% set note_text = item.note or item.content or '' %}
+        <div class="todo-row {% if is_done %}done{% endif %}">
+          <form method="post"
+                action="{{ url_for('todos_toggle', todo_id=item.id) }}"
+                class="todo-toggle-form">
+            <input type="hidden" name="date" value="{{ selected_date }}">
+            <input type="hidden" name="show_done" value="{{ '1' if show_done else '' }}">
+            <input type="hidden" name="next" value="{{ request.full_path }}">
+            <input type="hidden" name="status" value="{{ 'open' if is_done else 'done' }}" class="todo-status-input">
+            <input class="form-check-input todo-check" type="checkbox" {% if is_done %}checked{% endif %}
+                   title="勾選完成 / 取消完成">
+          </form>
+
+          <div>
+            <div class="todo-title">{{ item.title or item.content or '未命名待辦' }}</div>
+            <div class="todo-meta mt-1">
+              📅 {{ item.todo_date or '-' }}
+              {% if item.created_by_name %}｜建立：{{ item.created_by_name }}{% endif %}
+              {% if is_done %}｜完成：{{ item.completed_by_name or item.done_by_name or '-' }}{% endif %}
+            </div>
+            <div class="todo-note mt-2 {% if not note_text %}text-muted{% endif %}">
+              {{ note_text or '沒有備註' }}
+            </div>
+          </div>
+
+          <div class="todo-side">
+            {% if is_done %}
+              <span class="todo-status-pill bg-success text-white">已完成</span>
+            {% else %}
+              <span class="todo-status-pill bg-warning text-dark">待處理</span>
+            {% endif %}
+            <form method="post" action="{{ url_for('todos_delete', todo_id=item.id) }}"
+                  onsubmit="return confirm('確定刪除這筆待辦事項嗎？');">
+              <button class="btn btn-sm btn-outline-danger">刪除</button>
+            </form>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="card-body text-center text-muted py-5">
+      目前沒有待辦事項。可以先新增一筆，或切換日期查看。
+    </div>
+  {% endif %}
 </div>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  document.querySelectorAll(".todo-toggle-form .todo-check").forEach(function (checkbox) {
+    checkbox.addEventListener("change", function () {
+      const form = checkbox.closest("form");
+      const statusInput = form.querySelector(".todo-status-input");
+      statusInput.value = checkbox.checked ? "done" : "open";
+      form.submit();
+    });
+  });
+});
+</script>
 {% endblock %}

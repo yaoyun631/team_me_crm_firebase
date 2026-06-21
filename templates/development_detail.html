@@ -1,13 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+<div class="d-flex justify-content-between align-items-center mb-3">
   <h3 class="mb-0">開發詳細資料</h3>
-  <div class="d-flex justify-content-end align-items-center flex-wrap gap-2">
-    <a href="{{ url_for('calendar_new', related_type='development', related_id=development.id, title=((development.name or development.address or '開發') ~ ' 開發追蹤'), customer_name=development.name, phone=development.phone, location=(development.address or development.registered_address), note=development.note) }}" class="btn btn-outline-success">加入行事曆</a>
-    <form method="post" action="{{ url_for('development_send_to_line', development_id=development.id) }}" class="m-0" onsubmit="return confirm('確定要把這筆開發資料傳到 LINE 群組嗎？');">
-      <button type="submit" class="btn btn-outline-info">傳到群組</button>
+  <div>
+    <a href="{{ url_for('calendar_new', related_type='development', related_id=development.id, title=((development.name or development.address or '開發') ~ ' 開發追蹤'), customer_name=development.name, phone=development.phone, location=(development.address or development.registered_address), note=development.note) }}" class="btn btn-outline-success me-2">加入行事曆</a>
+    <form method="post" action="{{ url_for('development_send_to_line', development_id=development.id) }}" style="display:inline;" onsubmit="return confirm('確定要把這筆開發資料傳到 LINE 群組嗎？');">
+      <button type="submit" class="btn btn-outline-info me-2">傳到群組</button>
     </form>
-    <a href="{{ url_for('development_edit', development_id=development.id) }}" class="btn btn-warning">編輯資料</a>
+    <a href="{{ url_for('development_edit', development_id=development.id) }}" class="btn btn-warning me-2">編輯資料</a>
     <a href="{{ session.get('developments_return_url') or url_for('developments') }}" class="btn btn-secondary">返回列表</a>
   </div>
 </div>
@@ -38,6 +38,34 @@
     <p class="mb-1"><strong>內部備註：</strong>{{ development.note or "-" }}</p>
   </div>
 </div>
+
+{% if same_owner_items and same_owner_items|length > 1 %}
+  <div class="card mb-4 border-warning">
+    <div class="card-header bg-warning bg-opacity-25 d-flex justify-content-between align-items-center">
+      <strong>同屋主物件分類</strong>
+      <span class="badge bg-warning text-dark">共 {{ same_owner_items|length }} 筆物件</span>
+    </div>
+    <div class="card-body">
+      <div class="small text-muted mb-2">同一支電話可能對應多筆物件，這裡會集中顯示，避免資料互相覆蓋。</div>
+      <div class="list-group list-group-flush">
+        {% for item in same_owner_items %}
+          <a class="list-group-item list-group-item-action {% if item.id == development.id %}active{% endif %}"
+             href="{{ url_for('development_detail', development_id=item.id) }}">
+            <div class="d-flex justify-content-between gap-2">
+              <div class="text-break">
+                <strong>物件 {{ loop.index }}｜{{ item.address or item.registered_address or '未填地址' }}</strong>
+                <div class="small {% if item.id == development.id %}text-white-50{% else %}text-muted{% endif %}">
+                  {{ item.source or '-' }}｜{{ item.current_stage or item.stage or '-' }}｜下一步：{{ item.next_action or '-' }}
+                </div>
+              </div>
+              {% if item.id == development.id %}<span class="badge bg-light text-dark align-self-start">目前這筆</span>{% endif %}
+            </div>
+          </a>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+{% endif %}
 
 <div class="row">
   <div class="col-md-6 mb-4">

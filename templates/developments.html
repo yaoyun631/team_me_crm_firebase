@@ -163,10 +163,18 @@
                   <span class="small text-muted">{{ d.phone or "-" }}</span>
                 </div>
                 <div class="small text-muted text-break">{{ d.address or "-" }}</div>
+                {% if d.owner_group_count and d.owner_group_count > 1 %}
+                  <div class="mt-1">
+                    <a href="{{ url_for('development_owner_group', owner_key=d.owner_key) }}" class="badge bg-warning text-dark text-decoration-none">
+                      同屋主 {{ d.owner_group_count }} 筆物件｜第 {{ d.owner_group_index }} 筆
+                    </a>
+                  </div>
+                {% endif %}
               </div>
               <div class="text-end">
                 {% if d.current_stage %}<span class="badge bg-secondary d-block mb-1">{{ d.current_stage }}</span>{% endif %}
-                {% if d.source %}<span class="badge bg-light text-dark border">{{ d.source }}</span>{% endif %}
+                {% if d.source %}<span class="badge bg-light text-dark border d-block mb-1">{{ d.source }}</span>{% endif %}
+                {% if d.owner_group_count and d.owner_group_count > 1 %}<span class="badge bg-outline-dark border text-dark">多物件屋主</span>{% endif %}
               </div>
             </div>
 

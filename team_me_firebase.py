@@ -14452,6 +14452,1041 @@ except Exception as e:
 # =============================================================================
 
 
+# =============================================================================
+# 同電話多物件：屋主/物件分組 Patch v20260621D
+# - 電話用來判斷「同一個屋主」
+# - 地址用來判斷「同一個物件」
+# - 同電話不同地址時，不再覆蓋原本開發資料，改成新增同屋主底下的新物件
+# =============================================================================
+
+def development_owner_key_from_phone(phone: str) -> str:
+    return normalize_phone(phone or "")
+
+
+def development_address_key(address: str) -> str:
+    return re.sub(r"\s+", "", (address or "").strip())
+
+
+def attach_development_owner_groups(items):
+    """替開發清單補上同屋主分組資訊，不需要先搬移資料庫。"""
+    groups = {}
+    for item in items:
+        key = development_owner_key_from_phone(item.get("phone", ""))
+        if not key:
+            continue
+        groups.setdefault(key, []).append(item)
+
+    for key, group in groups.items():
+        # 同屋主物件依建立時間排序，方便標出第幾筆物件
+        group.sort(key=lambda x: x.get("created_at") or "")
+        for idx, item in enumerate(group, start=1):
+            item["owner_key"] = key
+            item["property_group"] = key
+            item["owner_group_count"] = len(group)
+            item["owner_group_index"] = idx
+            item["owner_group_label"] = f"同屋主 {len(group)} 筆物件" if len(group) > 1 else "單一物件"
+            item["same_owner_properties"] = [
+                {
+                    "id": x.get("id", ""),
+                    "address": x.get("address") or x.get("registered_address") or "未填地址",
+                    "current_stage": x.get("current_stage") or x.get("stage") or "-",
+                    "next_action": x.get("next_action") or "-",
+                    "source": x.get("source") or "-",
+                }
+                for x in group
+            ]
+    return items
+
+
+def get_development_same_owner_items(phone: str, exclude_id: str = ""):
+    key = development_owner_key_from_phone(phone)
+    if not key:
+        return []
+    result = []
+    for doc in db.collection("developments").stream():
+        item = doc_to_dict(doc)
+        item_key = item.get("owner_key") or development_owner_key_from_phone(item.get("phone", ""))
+        if item_key == key:
+            result.append(item)
+    result.sort(key=lambda x: (x.get("created_at") or "", x.get("address") or ""))
+    attach_development_owner_groups(result)
+    return result
+
+
+def find_same_development_property(phone: str = "", address: str = "", registered_address: str = ""):
+    """同電話 + 同地址/戶籍地址才視為同一個物件。"""
+    phone_key = development_owner_key_from_phone(phone)
+    addr_keys = {development_address_key(address), development_address_key(registered_address)}
+    addr_keys = {x for x in addr_keys if x}
+    if not phone_key or not addr_keys:
+        return None
+
+    for doc in db.collection("developments").stream():
+        item = doc.to_dict() or {}
+        item_phone_key = item.get("owner_key") or development_owner_key_from_phone(item.get("phone", ""))
+        if item_phone_key != phone_key:
+            continue
+        item_addr_keys = {
+            development_address_key(item.get("address", "")),
+            development_address_key(item.get("registered_address", "")),
+        }
+        item_addr_keys = {x for x in item_addr_keys if x}
+        if addr_keys & item_addr_keys:
+            return doc
+    return None
+
+
+def enrich_development_owner_payload(payload: dict):
+    phone_key = development_owner_key_from_phone(payload.get("phone", ""))
+    if phone_key:
+        payload["owner_key"] = phone_key
+        payload["property_group"] = phone_key
+        payload["owner_name"] = payload.get("name", "")
+        payload["owner_phone"] = payload.get("phone", "")
+    return payload
+
+
+# 覆蓋開發列表：加入同屋主分組欄位。
+def developments_grouped_view():
+    q = request.args.get("q", "").strip()
+    current_stage = request.args.get("current_stage", "").strip()
+    next_action = request.args.get("next_action", "").strip()
+    source = request.args.get("source", "").strip()
+    sort_by = request.args.get("sort_by", "created_at_desc")
+    show_done = request.args.get("show_done", "").strip()
+
+    docs = db.collection("developments").stream()
+    all_items = [doc_to_dict(d) for d in docs]
+    total_count = len(all_items)
+    source_options = sorted({(x.get("source") or "").strip() for x in all_items if (x.get("source") or "").strip()})
+
+    # 所有資料先補分組，篩選後也保留完整 group count
+    attach_development_owner_groups(all_items)
+    items = list(all_items)
+
+    if q:
+        q_key = development_owner_key_from_phone(q)
+        items = [
+            x for x in items
+            if q in (x.get("name") or "")
+            or q in (x.get("phone") or "")
+            or q in (x.get("address") or "")
+            or q in (x.get("registered_address") or "")
+            or (q_key and q_key == (x.get("owner_key") or development_owner_key_from_phone(x.get("phone", ""))))
+        ]
+
+    if current_stage:
+        items = [x for x in items if (x.get("current_stage") or x.get("stage") or "") == current_stage]
+    if next_action:
+        items = [x for x in items if (x.get("next_action") or "") == next_action]
+    if source:
+        items = [x for x in items if (x.get("source") or "") == source]
+    if show_done != "1":
+        items = [x for x in items if (x.get("current_stage") or x.get("stage") or "") not in DEVELOPMENT_HIDDEN_BY_DEFAULT]
+
+    if sort_by == "created_at_asc":
+        items.sort(key=lambda x: x.get("created_at") or "")
+    elif sort_by == "created_at_desc":
+        items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    elif sort_by == "name_asc":
+        items.sort(key=lambda x: (x.get("name") or ""))
+    elif sort_by == "name_desc":
+        items.sort(key=lambda x: (x.get("name") or ""), reverse=True)
+    else:
+        items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+
+    return render_template(
+        "developments.html",
+        developments=items,
+        q=q,
+        current_stage=current_stage,
+        next_action=next_action,
+        source=source,
+        source_options=source_options,
+        show_done=show_done,
+        sort_by=sort_by,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+        total_count=total_count,
+        filtered_count=len(items),
+        label_docx_enabled=(next_action == "寄開發信"),
+        label_docx_count=len([x for x in items if (x.get("registered_address") or "").strip()]),
+    )
+
+app.view_functions["developments"] = login_required(developments_grouped_view)
+
+
+# 覆蓋新增開發：新增 owner_key；同電話同地址提示並更新，反之新增成同屋主多物件。
+def developments_new_owner_grouped():
+    form = request.form
+    phone = form.get("phone", "").strip()
+    address = form.get("address", "").strip()
+    registered_address = form.get("registered_address", "").strip()
+    existing_doc = find_same_development_property(phone=phone, address=address, registered_address=registered_address)
+
+    current_stage = normalize_development_status(form.get("current_stage", "").strip() or form.get("stage", "").strip() or "待聯繫")
+    next_action = normalize_development_next_action(form.get("next_action", "").strip())
+    next_action_date = form.get("next_action_date", "").strip()
+    _manual_url = form.get("url", "").strip()
+    nav_url = _make_google_nav_url(registered_address or address)
+
+    data = {
+        "name": form.get("name", "").strip() or "未填姓名",
+        "phone": phone,
+        "source": infer_development_source(form.get("source", "").strip(), _manual_url),
+        "address": address,
+        "registered_address": registered_address,
+        "registered_address_google_maps_url": nav_url,
+        "url": _manual_url,
+        "current_stage": current_stage,
+        "stage": current_stage,
+        "next_action": next_action,
+        "next_action_date": next_action_date,
+        "note": form.get("note", "").strip(),
+        "record_date": now_taipei().strftime("%Y-%m-%d"),
+        "updated_at": now_taipei().isoformat(),
+        "updated_by_id": session.get("user_id"),
+        "updated_by_name": session.get("user_name"),
+    }
+    enrich_development_owner_payload(data)
+
+    if not (data["name"] or data["phone"] or data["address"] or data["url"]):
+        flash("至少請填姓名、電話、地址、網址其中一項", "danger")
+        return redirect(url_for("developments"))
+
+    if existing_doc:
+        doc_ref = db.collection("developments").document(existing_doc.id)
+        doc_ref.update({k: v for k, v in data.items() if v not in (None, "")})
+        doc_id = existing_doc.id
+        flash("已找到同電話同地址物件，已更新原資料", "success")
+    else:
+        data.update({
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": session.get("user_id"),
+            "created_by_name": session.get("user_name"),
+        })
+        doc_ref = db.collection("developments").document()
+        doc_ref.set(data)
+        doc_id = doc_ref.id
+        if phone and len(get_development_same_owner_items(phone)) > 1:
+            flash("已新增同屋主的新物件", "success")
+        else:
+            flash("已新增開發", "success")
+
+    if data["note"]:
+        db.collection("development_followups").add({
+            "development_id": doc_id,
+            "contact_time": now_taipei().strftime("%Y-%m-%d %H:%M"),
+            "channel": "手動新增",
+            "current_stage": current_stage,
+            "stage": current_stage,
+            "next_action": next_action,
+            "next_action_date": next_action_date,
+            "registered_address": data["registered_address"],
+            "content": data["note"],
+            "next_contact_date": next_action_date,
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": session.get("user_id"),
+            "created_by_name": session.get("user_name"),
+            "sender_display_name": session.get("user_name"),
+        })
+    return redirect(url_for("developments", q=phone or address))
+
+app.view_functions["developments_new"] = login_required(developments_new_owner_grouped)
+
+
+# 覆蓋 LINE 新增開發：同電話不同地址新增，不再擋住；同電話同地址才更新。
+def create_development(fields, event):
+    phone = (fields.get('phone') or '').strip()
+    name = (fields.get('name') or '').strip() or '未填姓名'
+    url = (fields.get('url') or '').strip()
+    source_value = infer_development_source(fields.get('source', ''), url)
+    address = (fields.get('address') or '').strip()
+    registered_address = (fields.get('registered_address') or '').strip()
+    nav_url = _make_google_nav_url(registered_address or address)
+
+    exact_doc = find_same_development_property(phone=phone, address=address, registered_address=registered_address)
+    if not exact_doc and not phone and address:
+        exact_doc = find_development_record(address=address)
+
+    labels = build_development_labels(fields.get('labels'))
+    content_text = (fields.get('content') or '').strip() or registered_address or address or url or '新增開發'
+    note_content = build_line_summary(content_text, event)
+    current_stage = normalize_development_status((fields.get('current_stage') or '').strip() or (fields.get('stage') or '').strip() or '待聯繫')
+
+    payload = {
+        'name': name,
+        'phone': phone,
+        'source': source_value,
+        'url': url,
+        'address': address,
+        'registered_address': registered_address,
+        'registered_address_google_maps_url': nav_url,
+        'current_stage': current_stage,
+        'stage': current_stage,
+        'next_action': normalize_development_next_action((fields.get('next_action') or '').strip()),
+        'next_action_date': (fields.get('next_action_date') or '').strip() or (fields.get('next_contact_date') or '').strip(),
+        'record_date': (fields.get('record_date') or '').strip() or now_taipei().strftime('%Y-%m-%d'),
+        'labels': labels,
+        'updated_at': now_taipei().isoformat(),
+        'updated_by_id': 'line_bot',
+        'updated_by_name': 'LINE Bot',
+        'sender_display_name': get_line_sender_display_name(event) or '',
+    }
+    enrich_development_owner_payload(payload)
+
+    if exact_doc:
+        doc_ref = db.collection('developments').document(exact_doc.id)
+        update_customer_note_and_labels(target_type='development', doc_ref=doc_ref, content=note_content, labels=labels, stage=payload['stage'], source=source_value, event=event, registered_address=registered_address)
+        clean_updates = {k: v for k, v in payload.items() if v not in ('', None)}
+        doc_ref.update(clean_updates)
+        add_customer_followup(target_type='development', customer_id=exact_doc.id, content=note_content, next_action=payload.get('next_action', ''), next_contact_date=payload.get('next_action_date', ''), labels=labels, line_event=event)
+        updated_doc = doc_ref.get().to_dict() or {}
+        reply_text = f"已更新同屋主同物件：{updated_doc.get('name', '')}（{updated_doc.get('phone', '-') or '-'}）"
+        return {'handled': True, 'ok': True, 'reply_text': reply_text[:5000], 'target_type': 'development', 'target_id': exact_doc.id, 'customer_name': updated_doc.get('name', ''), 'phone': updated_doc.get('phone', ''), 'parsed_tag': '新增開發'}
+
+    now = now_taipei().isoformat()
+    payload.update({'created_at': now, 'created_by_id': 'line_bot', 'created_by_name': 'LINE Bot', 'note': append_note_block('', note_content, build_line_operator_label(event))})
+    doc_ref = db.collection('developments').document()
+    doc_ref.set(payload)
+    add_customer_followup(target_type='development', customer_id=doc_ref.id, content=note_content, next_action=payload.get('next_action', ''), next_contact_date=payload.get('next_action_date', ''), labels=labels, line_event=event)
+
+    group_count = len(get_development_same_owner_items(phone)) if phone else 1
+    reply_text = f"已新增開發物件：{name}（{phone or '-'}）"
+    if group_count > 1:
+        reply_text += f"\n同屋主目前共有 {group_count} 筆物件"
+    return {'handled': True, 'ok': True, 'reply_text': reply_text[:5000], 'target_type': 'development', 'target_id': doc_ref.id, 'customer_name': name, 'phone': phone, 'parsed_tag': '新增開發'}
+
+
+# 詳細頁補同屋主物件清單。
+def development_detail_owner_grouped(development_id):
+    doc = db.collection("developments").document(development_id).get()
+    if not doc.exists:
+        flash("找不到這筆開發", "danger")
+        return redirect(url_for("developments"))
+
+    development = doc_to_dict(doc)
+    same_owner_items = get_development_same_owner_items(development.get("phone", ""))
+    followups_ref = db.collection("development_followups").where("development_id", "==", development_id)
+    followups = [doc_to_dict(f) for f in followups_ref.stream()]
+    followups.sort(key=lambda x: x.get("contact_time", ""), reverse=True)
+    return render_template(
+        "development_detail.html",
+        development=development,
+        same_owner_items=same_owner_items,
+        followups=followups,
+        status_options=DEVELOPMENT_STATUS_OPTIONS,
+        next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+    )
+
+app.view_functions["development_detail"] = login_required(development_detail_owner_grouped)
+
+
+@app.route("/developments/owner/<owner_key>")
+@login_required
+def development_owner_group(owner_key):
+    owner_key = development_owner_key_from_phone(owner_key)
+    items = []
+    owner_name = "同屋主"
+    owner_phone = owner_key
+    for doc in db.collection("developments").stream():
+        item = doc_to_dict(doc)
+        item_key = item.get("owner_key") or development_owner_key_from_phone(item.get("phone", ""))
+        if item_key == owner_key:
+            items.append(item)
+            owner_name = item.get("name") or owner_name
+            owner_phone = item.get("phone") or owner_phone
+    items.sort(key=lambda x: (x.get("created_at") or "", x.get("address") or ""))
+    attach_development_owner_groups(items)
+    return render_template(
+        "development_owner_group.html",
+        owner_key=owner_key,
+        owner_name=owner_name,
+        owner_phone=owner_phone,
+        items=items,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+    )
+
+# =============================================================================
+# 同電話多物件：屋主/物件分組 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# LINE 回覆追蹤：預填輸入框 + 送出後寫回後台 Patch v20260621E
+# - 修正舊版 message action 會直接把空白範本送出
+# - 改成 postback + openKeyboard + fillInText：點按鈕只預填，不直接送出
+# - 使用者補上「內容」後送出，仍由 #買方追蹤/#賣方追蹤/#開發追蹤 寫回後台
+# =============================================================================
+
+def _followup_prefill_text(record_type: str, record_id: str) -> str:
+    if record_type == "buyer":
+        return f"#買方追蹤\n客戶ID: {record_id}\n內容: "
+    if record_type == "seller":
+        return f"#賣方追蹤\n客戶ID: {record_id}\n內容: "
+    if record_type == "development":
+        return f"#開發追蹤\nID: {record_id}\n內容: "
+    return f"#查詢紀錄\nID: {record_id}\n"
+
+
+def _followup_postback_action(record_type: str, record_id: str, label: str = "回覆追蹤"):
+    # LINE postback action 支援 inputOption=openKeyboard + fillInText。
+    # 注意：部分 LINE 電腦版可能不支援預填，手機 LINE 測試最準。
+    return {
+        "type": "postback",
+        "label": label,
+        "data": f"action=followup_input&record_type={record_type}&record_id={record_id}",
+        "inputOption": "openKeyboard",
+        "fillInText": _followup_prefill_text(record_type, record_id),
+    }
+
+
+def process_line_postback_event(event):
+    try:
+        postback = event.get("postback") or {}
+        data = postback.get("data", "") or ""
+        if "action=followup_input" in data:
+            # 只打開鍵盤 / 預填文字，不需要回覆任何訊息。
+            return {"handled": True, "ok": True, "reply_text": ""}
+    except Exception as e:
+        print("⚠️ process_line_postback_event 發生錯誤：", e)
+    return {"handled": False}
+
+
+# 重新覆蓋群組卡片：保留原欄位與按鈕，但「回覆追蹤」必定使用 postback/fillInText。
+def _build_record_flex_bubble(record_type: str, record_id: str, data: dict, title_prefix="CRM 資料"):
+    label_map = {"buyer": "客需", "seller": "委託", "development": "開發"}
+    label = label_map.get(record_type, "CRM")
+    name = data.get("name") or "未填姓名"
+    phone = data.get("phone") or "-"
+    source = data.get("source") or "-"
+    status = data.get("current_stage") or data.get("stage") or "-"
+    next_action = data.get("next_action") or "-"
+    area = data.get("preferred_areas") or data.get("address") or data.get("registered_address") or "-"
+    note = data.get("note") or data.get("requirement_must") or "-"
+
+    if record_type == "development":
+        reply_label = "回覆開發"
+    else:
+        reply_label = "回覆追蹤"
+
+    btns = [
+        {
+            "type": "button",
+            "style": "primary",
+            "height": "sm",
+            "color": "#C9874A",
+            "action": {
+                "type": "uri",
+                "label": f"編輯{label}",
+                "uri": _record_edit_url(record_type, record_id),
+            },
+        },
+        {
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "action": {
+                "type": "uri",
+                "label": "加入行事曆",
+                "uri": _record_calendar_url(record_type, record_id, data),
+            },
+        },
+        {
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "action": {
+                "type": "uri",
+                "label": "查看後台",
+                "uri": _record_detail_url(record_type, record_id),
+            },
+        },
+        {
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "action": _followup_postback_action(record_type, record_id, reply_label),
+        },
+    ]
+
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": f"{title_prefix}｜{label}", "size": "xs", "color": "#C9874A", "weight": "bold"},
+                {"type": "text", "text": line_truncate(name, 45), "size": "lg", "weight": "bold", "wrap": True, "color": "#222222"},
+                {"type": "separator", "margin": "md"},
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "margin": "md",
+                    "contents": [
+                        flex_info_row("電話", phone),
+                        flex_info_row("來源", source),
+                        flex_info_row("狀態", status),
+                        flex_info_row("下一步", next_action),
+                        flex_info_row("區域/地址", area),
+                        flex_info_row("備註", note),
+                    ],
+                },
+            ],
+        },
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": btns},
+        "styles": {"footer": {"separator": True}},
+    }
+
+
+# 重新覆寫 webhook：先處理 postback，再處理文字訊息。
+def line_webhook_with_postback_followup():
+    raw_body = request.get_data(cache=False, as_text=False)
+    signature = request.headers.get("x-line-signature", "")
+
+    if not verify_line_signature(raw_body, signature):
+        return "Invalid signature", 400
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception as e:
+        print("⚠️ LINE webhook JSON 解析失敗：", e)
+        return "Bad Request", 400
+
+    events = payload.get("events", [])
+    for event in events:
+        try:
+            if event.get("type") == "postback":
+                result = process_line_postback_event(event)
+            else:
+                result = process_line_message_event(event)
+
+            if not result or not result.get("handled"):
+                continue
+
+            reply_result = None
+            reply_token = event.get("replyToken")
+            if not reply_token:
+                continue
+
+            if result.get("reply_messages"):
+                reply_result = reply_line_messages(reply_token, result.get("reply_messages") or [])
+            elif result.get("reply_flex"):
+                reply_result = reply_line_flex(
+                    reply_token,
+                    result.get("reply_text", "CRM 卡片"),
+                    result.get("reply_flex"),
+                    quick_reply_items=result.get("reply_quick_reply"),
+                )
+            elif result.get("reply_text"):
+                reply_result = reply_line_text(
+                    reply_token,
+                    result["reply_text"] if result.get("ok") else result["reply_text"],
+                )
+
+            if result.get("ok") and result.get("target_type") and result.get("target_id") and reply_result:
+                for sent in reply_result.get("sent_messages", []):
+                    sent_id = str(sent.get("id", "")).strip()
+                    if sent_id:
+                        save_line_message_link(
+                            sent_id,
+                            result["target_type"],
+                            result["target_id"],
+                            tag=result.get("parsed_tag", ""),
+                            action="bot_reply",
+                            customer_name=result.get("customer_name", ""),
+                            phone=result.get("phone", ""),
+                            source_event=event,
+                        )
+        except Exception as e:
+            print("⚠️ 處理 LINE event 發生錯誤：", e)
+
+    return "OK", 200
+
+try:
+    app.view_functions["line_webhook"] = line_webhook_with_postback_followup
+    print("✅ LINE 回覆追蹤已修正：postback + fillInText 預填輸入框")
+except Exception as e:
+    print("⚠️ LINE 回覆追蹤修正套用失敗：", e)
+
+# =============================================================================
+# LINE 回覆追蹤 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# 待辦事項後台卡片式 + 勾選完成即時更新 Patch v20260621D
+# =============================================================================
+
+def _todo_item_sort_key(item):
+    status = item.get("status", "open")
+    return (
+        1 if status == "done" else 0,
+        item.get("todo_date", ""),
+        item.get("created_at", ""),
+        item.get("id", ""),
+    )
+
+
+def todos_page_card_view():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    show_done = request.args.get("show_done", "") == "1"
+
+    docs = db.collection(LINE_TODO_COLLECTION).where("todo_date", "==", selected_date).stream()
+    all_items = [_todo_doc_to_dict(d) for d in docs]
+    all_items.sort(key=_todo_item_sort_key)
+
+    open_count = len([x for x in all_items if x.get("status", "open") != "done"])
+    done_count = len([x for x in all_items if x.get("status", "open") == "done"])
+
+    items = all_items if show_done else [x for x in all_items if x.get("status", "open") != "done"]
+
+    return render_template(
+        "todos.html",
+        items=items,
+        selected_date=selected_date,
+        selected_date_label=format_calendar_date_label(selected_date),
+        show_done=show_done,
+        open_count=open_count,
+        done_count=done_count,
+        total_count=len(all_items),
+    )
+
+
+try:
+    app.view_functions["todos_page"] = login_required(todos_page_card_view)
+    print("✅ 待辦事項後台已升級：卡片式 + 勾選完成")
+except Exception as e:
+    print("⚠️ 待辦事項後台升級失敗：", e)
+
+
+@app.route("/todos/<todo_id>/toggle", methods=["POST"])
+@login_required
+def todos_toggle(todo_id):
+    ref = db.collection(LINE_TODO_COLLECTION).document(todo_id)
+    snap = ref.get()
+
+    fallback_date = calendar_safe_date(request.form.get("date") or "")
+    show_done = request.form.get("show_done", "") == "1"
+    next_url = request.form.get("next") or ""
+    desired_status = (request.form.get("status") or "").strip()
+
+    if snap.exists:
+        data = snap.to_dict() or {}
+        fallback_date = data.get("todo_date") or fallback_date
+
+        if desired_status == "done":
+            ref.update({
+                "status": "done",
+                "completed_at": now_taipei().isoformat(),
+                "done_at": now_taipei().isoformat(),
+                "completed_by_id": session.get("user_id", ""),
+                "completed_by_name": session.get("user_name", ""),
+                "done_by_id": session.get("user_id", ""),
+                "done_by_name": session.get("user_name", ""),
+                "updated_at": now_taipei().isoformat(),
+            })
+            flash("已完成待辦事項", "success")
+        else:
+            ref.update({
+                "status": "open",
+                "completed_at": "",
+                "done_at": "",
+                "completed_by_id": "",
+                "completed_by_name": "",
+                "done_by_id": "",
+                "done_by_name": "",
+                "updated_at": now_taipei().isoformat(),
+            })
+            flash("已改回待處理", "info")
+
+    if next_url.startswith("/todos"):
+        return redirect(next_url)
+    return redirect(url_for("todos_page", date=fallback_date, show_done="1" if show_done else ""))
+
+# =============================================================================
+# 待辦事項後台卡片式 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# LINE 待辦事項卡片版 + 點擊勾選直接更新後台 Patch v20260621L
+# - #今日待辦 / #待辦 / #查詢待辦 會回覆同一張 Flex 卡片
+# - 每筆待辦的「☐」按鈕是 LINE postback，點擊後直接更新 Firestore status=done
+# - 點擊完成後會立即回覆更新後的待辦卡片
+# - LINE 沒有真正的 checkbox 元件，這裡用 postback button 模擬勾選效果
+# =============================================================================
+
+def _line_todo_flex_safe_text(value, fallback='-'):
+    value = str(value or '').strip()
+    return value if value else fallback
+
+
+def _line_todo_flex_truncate(value, max_len=80):
+    value = _line_todo_flex_safe_text(value, '')
+    if len(value) <= max_len:
+        return value
+    return value[:max_len - 1] + '…'
+
+
+def _line_todo_doc_payload(doc):
+    data = doc.to_dict() or {}
+    data['id'] = doc.id
+    return data
+
+
+def _line_todo_complete_postback_action(todo_id, todo_date=''):
+    return {
+        'type': 'postback',
+        'label': '☐',
+        'data': f'action=todo_done&todo_id={todo_id}&date={todo_date or ""}',
+        'displayText': '完成待辦',
+    }
+
+
+def _line_todo_done_text_row(title='已完成'):
+    return {
+        'type': 'box',
+        'layout': 'horizontal',
+        'spacing': 'sm',
+        'contents': [
+            {'type': 'text', 'text': '☑', 'size': 'sm', 'color': '#16A34A', 'flex': 1, 'align': 'center'},
+            {'type': 'text', 'text': _line_todo_flex_truncate(title, 68), 'size': 'sm', 'color': '#777777', 'flex': 8, 'wrap': True, 'decoration': 'line-through'},
+        ],
+    }
+
+
+def _line_todo_item_box(doc, todo_date='', section_label=''):
+    data = _line_todo_doc_payload(doc)
+    title = data.get('title') or data.get('content') or '未命名待辦'
+    note = (data.get('note') or '').strip()
+    date_label = _todo_display_md(data.get('todo_date') or todo_date or '') if '_todo_display_md' in globals() else (data.get('todo_date') or todo_date or '')
+    created_by = data.get('created_by_name') or data.get('sender_display_name') or ''
+
+    detail_lines = []
+    if date_label and section_label not in ('今天', '今日'):
+        detail_lines.append(date_label)
+    if note:
+        detail_lines.append(_line_todo_flex_truncate(note, 55))
+    if created_by:
+        detail_lines.append(f'建立：{created_by}')
+    detail_text = '｜'.join(detail_lines)
+
+    text_contents = [
+        {'type': 'text', 'text': _line_todo_flex_truncate(title, 68), 'size': 'sm', 'color': '#222222', 'wrap': True, 'weight': 'bold'},
+    ]
+    if detail_text:
+        text_contents.append({'type': 'text', 'text': _line_todo_flex_truncate(detail_text, 92), 'size': 'xs', 'color': '#888888', 'wrap': True, 'margin': 'xs'})
+
+    return {
+        'type': 'box',
+        'layout': 'horizontal',
+        'spacing': 'sm',
+        'paddingTop': 'sm',
+        'paddingBottom': 'sm',
+        'contents': [
+            {
+                'type': 'button',
+                'style': 'secondary',
+                'height': 'sm',
+                'flex': 2,
+                'action': _line_todo_complete_postback_action(data.get('id', ''), data.get('todo_date') or todo_date),
+            },
+            {
+                'type': 'box',
+                'layout': 'vertical',
+                'flex': 8,
+                'contents': text_contents,
+            },
+        ],
+    }
+
+
+def _line_todo_section_box(section_title, docs, todo_date='', empty_text='目前沒有待辦', max_items=20):
+    docs = list(docs or [])
+    contents = [
+        {'type': 'text', 'text': section_title, 'size': 'xs', 'color': '#C9874A', 'weight': 'bold'},
+    ]
+
+    if not docs:
+        contents.append({'type': 'text', 'text': empty_text, 'size': 'sm', 'color': '#999999', 'margin': 'sm'})
+    else:
+        for doc in docs[:max_items]:
+            contents.append(_line_todo_item_box(doc, todo_date=todo_date, section_label=section_title))
+        if len(docs) > max_items:
+            contents.append({
+                'type': 'text',
+                'text': f'還有 {len(docs) - max_items} 筆，請到後台查看。',
+                'size': 'xs',
+                'color': '#999999',
+                'margin': 'sm',
+                'wrap': True,
+            })
+
+    return {
+        'type': 'box',
+        'layout': 'vertical',
+        'spacing': 'xs',
+        'margin': 'md',
+        'contents': contents,
+    }
+
+
+def _line_todo_get_card_docs(todo_date, target_id=''):
+    todo_date = _parse_line_todo_date(todo_date or '') or now_taipei().strftime('%Y-%m-%d')
+    overdue_items = []
+    today_items = []
+    future_items = []
+
+    try:
+        overdue_items = _get_overdue_line_todos(todo_date=todo_date, target_id=target_id)
+    except Exception as e:
+        print('⚠️ 取得逾期待辦失敗：', e)
+
+    try:
+        today_items = _get_open_line_todos(todo_date=todo_date, target_id=target_id, include_overdue=False)
+    except Exception as e:
+        print('⚠️ 取得當日待辦失敗：', e)
+
+    try:
+        # 若目前版本有未來待辦功能，卡片也一起顯示未來待辦。
+        if '_get_future_line_todos' in globals():
+            future_days = int(globals().get('LINE_TODO_FUTURE_DAYS_DEFAULT', 7) or 7)
+            future_items = _get_future_line_todos(start_date=todo_date, target_id=target_id, days=future_days)
+    except Exception as e:
+        print('⚠️ 取得未來待辦失敗：', e)
+        future_items = []
+
+    return overdue_items, today_items, future_items
+
+
+def build_line_todo_flex_card(todo_date='', target_id='', title_prefix='待辦事項'):
+    todo_date = _parse_line_todo_date(todo_date or '') or now_taipei().strftime('%Y-%m-%d')
+    display_date = _todo_display_md(todo_date) if '_todo_display_md' in globals() else todo_date
+    overdue_items, today_items, future_items = _line_todo_get_card_docs(todo_date, target_id=target_id)
+    total_open = len(overdue_items) + len(today_items) + len(future_items)
+
+    body_contents = [
+        {
+            'type': 'box',
+            'layout': 'horizontal',
+            'contents': [
+                {'type': 'text', 'text': f'📌 {title_prefix}', 'size': 'lg', 'weight': 'bold', 'color': '#222222', 'flex': 5},
+                {'type': 'text', 'text': f'{display_date}', 'size': 'sm', 'color': '#C9874A', 'align': 'end', 'gravity': 'center', 'flex': 3, 'weight': 'bold'},
+            ],
+        },
+        {'type': 'text', 'text': f'未完成 {total_open} 筆｜點左側 ☐ 可直接完成並更新後台', 'size': 'xs', 'color': '#888888', 'wrap': True, 'margin': 'sm'},
+        {'type': 'separator', 'margin': 'md'},
+    ]
+
+    if not overdue_items and not today_items and not future_items:
+        body_contents.append({
+            'type': 'box',
+            'layout': 'vertical',
+            'margin': 'lg',
+            'contents': [
+                {'type': 'text', 'text': '目前沒有未完成待辦。', 'size': 'sm', 'color': '#666666', 'wrap': True},
+            ],
+        })
+    else:
+        if overdue_items:
+            body_contents.append(_line_todo_section_box('尚未完成', overdue_items, todo_date=todo_date, empty_text='', max_items=20))
+        if today_items:
+            body_contents.append(_line_todo_section_box('今天待辦', today_items, todo_date=todo_date, empty_text='', max_items=20))
+        if future_items:
+            body_contents.append(_line_todo_section_box('未來待辦', future_items, todo_date=todo_date, empty_text='', max_items=10))
+
+    footer_contents = []
+    todos_url = build_app_url(f'/todos?date={todo_date}') if 'build_app_url' in globals() else ''
+    if todos_url:
+        footer_contents.append({
+            'type': 'button',
+            'style': 'primary',
+            'height': 'sm',
+            'color': '#C9874A',
+            'action': {'type': 'uri', 'label': '查看後台', 'uri': todos_url},
+        })
+    footer_contents.append({
+        'type': 'button',
+        'style': 'secondary',
+        'height': 'sm',
+        'action': {'type': 'message', 'label': '新增待辦', 'text': '#新增待辦\n日期: 今天\n事項: '},
+    })
+
+    return {
+        'type': 'bubble',
+        'size': 'mega',
+        'body': {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'sm',
+            'contents': body_contents,
+        },
+        'footer': {
+            'type': 'box',
+            'layout': 'vertical',
+            'spacing': 'sm',
+            'contents': footer_contents,
+        },
+        'styles': {'footer': {'separator': True}},
+    }
+
+
+# 覆寫查詢待辦：文字指令回覆 Flex 卡片。
+def query_line_todos(fields, event, force_today=False):
+    target_id, _target_type = _line_todo_target_from_event(event)
+    todo_date = now_taipei().strftime('%Y-%m-%d') if force_today else _parse_line_todo_date(fields.get('todo_date') or fields.get('todo_date_raw') or '')
+    if not todo_date:
+        todo_date = now_taipei().strftime('%Y-%m-%d')
+    flex = build_line_todo_flex_card(todo_date=todo_date, target_id=target_id, title_prefix='待辦事項')
+    return {
+        'handled': True,
+        'ok': True,
+        'reply_text': f'{_todo_display_md(todo_date) if "_todo_display_md" in globals() else todo_date} 待辦事項',
+        'reply_flex': flex,
+        'parsed_tag': '查詢待辦',
+    }
+
+
+def _line_todo_mark_done_from_postback(todo_id, event=None):
+    todo_id = (todo_id or '').strip()
+    if not todo_id:
+        return False, '缺少待辦 ID', ''
+
+    ref = db.collection(LINE_TODO_COLLECTION).document(todo_id)
+    snap = ref.get()
+    if not snap.exists:
+        return False, '找不到這筆待辦，可能已刪除。', ''
+
+    data = snap.to_dict() or {}
+    sender = get_line_sender_display_name(event) if event else ''
+    ref.update({
+        'status': 'done',
+        'completed_at': now_taipei().isoformat(),
+        'done_at': now_taipei().isoformat(),
+        'completed_by_id': ((event or {}).get('source') or {}).get('userId', ''),
+        'completed_by_name': sender or 'LINE',
+        'done_by_id': ((event or {}).get('source') or {}).get('userId', ''),
+        'done_by_name': sender or 'LINE',
+        'updated_at': now_taipei().isoformat(),
+    })
+    return True, f'已完成：{data.get("title", "待辦")}', data.get('todo_date') or now_taipei().strftime('%Y-%m-%d')
+
+
+# 擴充 postback：處理待辦勾選完成。
+try:
+    _process_line_postback_event_before_todo_card = process_line_postback_event
+except Exception:
+    _process_line_postback_event_before_todo_card = None
+
+
+def process_line_postback_event(event):
+    try:
+        from urllib.parse import parse_qs
+        postback = event.get('postback') or {}
+        raw_data = postback.get('data', '') or ''
+        params = {k: (v[0] if isinstance(v, list) and v else '') for k, v in parse_qs(raw_data).items()}
+        action = params.get('action') or ''
+
+        if action == 'todo_done':
+            todo_id = params.get('todo_id') or ''
+            ok, msg, todo_date = _line_todo_mark_done_from_postback(todo_id, event=event)
+            target_id, _target_type = _line_todo_target_from_event(event)
+            query_date = _parse_line_todo_date(params.get('date') or todo_date or '') or now_taipei().strftime('%Y-%m-%d')
+            flex = build_line_todo_flex_card(todo_date=query_date, target_id=target_id, title_prefix='待辦事項已更新' if ok else '待辦事項')
+            return {
+                'handled': True,
+                'ok': ok,
+                'reply_text': msg,
+                'reply_flex': flex,
+                'parsed_tag': '完成待辦',
+            }
+    except Exception as e:
+        print('⚠️ LINE 待辦 postback 處理失敗：', e)
+        return {'handled': True, 'ok': False, 'reply_text': f'待辦更新失敗：{e}'}
+
+    if _process_line_postback_event_before_todo_card:
+        return _process_line_postback_event_before_todo_card(event)
+    return {'handled': False}
+
+
+def push_line_flex(to_id: str, alt_text: str, contents: dict):
+    if not LINE_CHANNEL_ACCESS_TOKEN or not to_id:
+        return False, 'LINE_CHANNEL_ACCESS_TOKEN 或 to_id 為空'
+    payload = {
+        'to': to_id,
+        'messages': [{
+            'type': 'flex',
+            'altText': (alt_text or '待辦事項')[:400],
+            'contents': contents,
+        }],
+    }
+    try:
+        import requests
+        res = requests.post(
+            'https://api.line.me/v2/bot/message/push',
+            headers=line_api_headers(),
+            json=payload,
+            timeout=8,
+        )
+        print('LINE push flex status:', res.status_code, res.text[:300])
+        return res.status_code in (200, 202), res.text[:300]
+    except Exception as e:
+        print('⚠️ LINE flex push 發生錯誤：', e)
+        return False, str(e)
+
+
+# 每日提醒也改成推送 Flex 卡片；提醒後仍會寫入 reminder_sent_dates 避免重複推播。
+def send_today_line_todo_reminders():
+    today = now_taipei().strftime('%Y-%m-%d')
+    grouped = {}
+
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        data = doc.to_dict() or {}
+        if data.get('status', 'open') != 'open':
+            continue
+        todo_date = (data.get('todo_date') or '').strip()
+        if not todo_date or todo_date > today:
+            continue
+        sent_dates = data.get('reminder_sent_dates') or []
+        if today in sent_dates:
+            continue
+        target_id = data.get('line_target_id', '')
+        if not target_id:
+            continue
+        grouped.setdefault(target_id, []).append(doc)
+
+    sent_count = 0
+    failed = []
+    for target_id, docs in grouped.items():
+        flex = build_line_todo_flex_card(todo_date=today, target_id=target_id, title_prefix='今日待辦提醒')
+        ok, msg = push_line_flex(target_id, f'{_todo_display_md(today) if "_todo_display_md" in globals() else today} 今日待辦提醒', flex)
+        if ok:
+            sent_count += 1
+            for doc in docs:
+                try:
+                    doc.reference.update({
+                        'reminder_sent_dates': firestore.ArrayUnion([today]),
+                        'last_reminded_at': now_taipei().isoformat(),
+                    })
+                except Exception as e:
+                    print('⚠️ 更新 reminder_sent_dates 失敗：', e)
+        else:
+            failed.append({'target_id': target_id, 'error': msg})
+    return {'date': today, 'target_count': len(grouped), 'sent_count': sent_count, 'failed': failed}
+
+print('✅ LINE 待辦事項已升級：同一張卡片 + 點擊勾選直接更新後台')
+# =============================================================================
+# LINE 待辦事項卡片版 Patch End
+# =============================================================================
+
+
 if __name__ == "__main__":
     print("✅ FULL_READY_20260621 已載入")
     print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
