@@ -12478,6 +12478,18 @@ def calendar_safe_date(value=None):
     return now_taipei().strftime("%Y-%m-%d")
 
 
+def format_calendar_date_label(date_text):
+    """把 2026-06-21 顯示成 6/21(日)，後台與 LINE 卡片共用。"""
+    if not date_text:
+        return ""
+    try:
+        dt = datetime.strptime(str(date_text)[:10], "%Y-%m-%d")
+        week_map = ["一", "二", "三", "四", "五", "六", "日"]
+        return f"{dt.month}/{dt.day}({week_map[dt.weekday()]})"
+    except Exception:
+        return str(date_text)
+
+
 def calendar_safe_time(value=None, default="09:00"):
     """回傳 HH:MM；無效時用 default。"""
     raw = (value or "").strip()
@@ -12574,6 +12586,7 @@ def doc_to_calendar_event(doc):
     data["start_time"] = calendar_safe_time(data.get("start_time"), "09:00")
     data["end_time"] = calendar_safe_time(data.get("end_time"), next_30_min_time(data["start_time"]))
     data["event_date"] = calendar_safe_date(data.get("event_date"))
+    data["event_date_label"] = format_calendar_date_label(data.get("event_date"))
     data["category"] = data.get("category") or "其他"
     data["category_color"] = data.get("category_color") or CALENDAR_CATEGORY_COLOR_MAP.get(data["category"], "#8B8B8B")
     return data
@@ -13028,6 +13041,7 @@ LINE_CARD_SETTINGS_TEMPLATE = r'''
 @login_required
 def calendar_page():
     selected_date = calendar_safe_date(request.args.get("date", ""))
+    selected_date_label = format_calendar_date_label(selected_date)
     events = fetch_calendar_events(selected_date)
     slots = build_30_min_slots()
     slot_cells = build_calendar_slot_cells(events, slots)
@@ -13041,6 +13055,7 @@ def calendar_page():
     return render_template(
         "calendar.html",
         selected_date=selected_date,
+        selected_date_label=selected_date_label,
         slots=slots,
         slot_cells=slot_cells,
         event_map=event_map,
@@ -13305,7 +13320,8 @@ def build_calendar_event_bubble(event, settings=None):
     category = event.get("category") or "行程"
     category_color = event.get("category_color") or CALENDAR_CATEGORY_COLOR_MAP.get(category, settings.get("primary_color", "#C9874A"))
     title = event.get("title") or f"{category}行程"
-    date_text = event.get("event_date", "") or "-"
+    raw_date_text = event.get("event_date", "") or ""
+    date_text = format_calendar_date_label(raw_date_text) or "-"
     time_text = f"{date_text} {event.get('start_time', '')} - {event.get('end_time', '')}"
 
     body_contents = [
@@ -13506,13 +13522,13 @@ def build_calendar_reply_for_range(start_date, end_date=None, mode="today"):
 
     if mode == "week":
         title = settings.get("title_week") or DEFAULT_LINE_CARD_SETTINGS["title_week"]
-        date_text = f"{start_date} ~ {end_date}"
+        date_text = f"{format_calendar_date_label(start_date)} ~ {format_calendar_date_label(end_date)}"
     elif mode == "tomorrow":
         title = settings.get("title_tomorrow") or DEFAULT_LINE_CARD_SETTINGS["title_tomorrow"]
-        date_text = start_date
+        date_text = format_calendar_date_label(start_date)
     else:
         title = settings.get("title_today") or DEFAULT_LINE_CARD_SETTINGS["title_today"]
-        date_text = start_date
+        date_text = format_calendar_date_label(start_date)
 
     flex = build_calendar_carousel(events, title=title, date_text=date_text, settings=settings)
     alt = f"{title} {len(events)} 筆"
@@ -13673,7 +13689,7 @@ def process_line_calendar_message_event(event):
         return {
             "handled": True,
             "ok": True,
-            "reply_text": f"已新增行程：{title}（{event_date} {start_time}）",
+            "reply_text": f"已新增行程：{title}（{format_calendar_date_label(event_date)} {start_time}）",
             "reply_flex": flex,
             "reply_quick_reply": build_calendar_quick_reply(settings),
             "parsed_tag": "新增行程",
@@ -13799,6 +13815,7 @@ def debug_line_preview_check():
 @login_required
 def line_card_preview():
     selected_date = calendar_safe_date(request.args.get("date", ""))
+    selected_date_label = format_calendar_date_label(selected_date)
     mode = (request.args.get("mode", "day") or "day").strip()
 
     if mode == "week":
@@ -13806,13 +13823,13 @@ def line_card_preview():
         end_date = (start_dt + timedelta(days=6)).strftime("%Y-%m-%d")
         result = build_calendar_reply_for_range(selected_date, end_date, mode="week")
         events = fetch_calendar_events(selected_date, end_date, line_only=False)
-        page_title = f"本週行程卡片預覽｜{selected_date} ~ {end_date}"
+        page_title = f"本週行程卡片預覽｜{format_calendar_date_label(selected_date)} ~ {format_calendar_date_label(end_date)}"
         back_query = f"?date={selected_date}&mode=day"
     else:
         end_date = selected_date
         result = build_calendar_reply_for_range(selected_date, selected_date, mode="today")
         events = fetch_calendar_events(selected_date, selected_date, line_only=False)
-        page_title = f"LINE 行程卡片預覽｜{selected_date}"
+        page_title = f"LINE 行程卡片預覽｜{selected_date_label}"
         back_query = f"?date={selected_date}&mode=week"
 
     settings = get_line_card_settings()
@@ -13875,7 +13892,7 @@ def line_card_preview():
           {% for e in events[:12] %}
             <div class="event-card">
               <div class="event-head">
-                <div class="time-pill" style="color:{{ e.category_color or settings.primary_color or '#C9874A' }};">📅 {{ e.event_date }}</div>
+                <div class="time-pill" style="color:{{ e.category_color or settings.primary_color or '#C9874A' }};">📅 {{ e.event_date_label or e.event_date }}</div>
                 <div class="cat-pill">{{ e.category or '行程' }}</div>
               </div>
               <div class="event-line" style="font-weight:700;color:#6b7280;"><span class="label">時間</span><span>{{ e.start_time }} - {{ e.end_time }}</span></div>
@@ -13923,6 +13940,7 @@ def line_card_preview():
 {% endblock %}
     """,
     selected_date=selected_date,
+    selected_date_label=selected_date_label,
     mode=mode,
     end_date=end_date,
     result=result,
