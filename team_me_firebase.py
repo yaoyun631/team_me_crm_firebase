@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# ✅ FULL_READY_20260621：包含 /line-card-preview、/line_card_preview、/debug/routes
 """
 完整主程式版本（對應最新需求）
 - buyer 卡片式 + 顯示最後一筆追蹤
@@ -12,7 +13,7 @@
 """
 
 from flask import (
-    Flask, render_template, request, redirect,
+    Flask, render_template, render_template_string, request, redirect,
     url_for, flash, session, Response, Blueprint, send_file
 )
 import os
@@ -8672,8 +8673,7 @@ def process_line_message_event(event):
 
 # ========= LINE Bot 代辦事項指令 Patch End =========
 
-if __name__ == "__main__":
-    app.run(debug=True)
+# ========= 原本 app.run 已移到檔案最底部，避免後續 Patch / Route 未載入 =========
 
 # ========= LINE Bot 代辦事項「多行批次新增 / 用序號完成」強化 Patch v2 =========
 # 貼在原本代辦事項 Patch 的最底部即可。
@@ -12411,3 +12411,1388 @@ def send_due_line_todo_reminders_by_settings():
     }
 
 # ========= LINE Bot 待辦事項 Patch v12 End =========
+
+# =============================================================================
+# 行事曆後台 + LINE 行程卡片 Flex Message Patch v1
+# 加入位置：請放在所有既有 route / LINE 待辦 patch 之後，app.run 之前。
+# 功能：
+# 1. CRM 後台新增 /calendar 行事曆，每 30 分鐘一格。
+# 2. CRM 後台新增 /line-card-settings，可控制 LINE 行程卡片顯示內容與顏色。
+# 3. LINE 指令支援：#今日行程、#明日行程、#本週行程、#新增行程。
+# 4. LINE 回覆改支援 Flex Message / Carousel 卡片，不再只能純文字。
+# =============================================================================
+
+from datetime import timedelta
+from urllib.parse import quote_plus
+
+CALENDAR_EVENT_COLLECTION = "calendar_events"
+LINE_CARD_SETTINGS_COLLECTION = "line_card_settings"
+
+CALENDAR_CATEGORY_OPTIONS = [
+    "帶看",
+    "回電",
+    "開發",
+    "簽約",
+    "拍照",
+    "收服務費",
+    "待辦",
+    "其他",
+]
+
+CALENDAR_CATEGORY_COLOR_MAP = {
+    "帶看": "#C9874A",
+    "回電": "#E0A800",
+    "開發": "#5E9F45",
+    "簽約": "#7B61FF",
+    "拍照": "#8A63D2",
+    "收服務費": "#B36B00",
+    "待辦": "#6C757D",
+    "其他": "#8B8B8B",
+}
+
+DEFAULT_LINE_CARD_SETTINGS = {
+    "title_today": "您今天的行程如下：",
+    "title_tomorrow": "您明天的行程如下：",
+    "title_week": "本週行程如下：",
+    "show_phone": True,
+    "show_location": True,
+    "show_note": True,
+    "show_customer": True,
+    "show_quick_actions": True,
+    "primary_color": "#C9874A",
+    "button_color": "#C9874A",
+    "calendar_start_hour": 8,
+    "calendar_end_hour": 22,
+    "line_only_enabled_events": False,
+    "quick_actions": ["新增行程", "今日行程", "本週行程", "客戶查詢", "設定提醒"],
+}
+
+
+def calendar_safe_date(value=None):
+    """回傳 YYYY-MM-DD；無效時用台北今天。"""
+    if value:
+        try:
+            return datetime.strptime(str(value).strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return now_taipei().strftime("%Y-%m-%d")
+
+
+def calendar_safe_time(value=None, default="09:00"):
+    """回傳 HH:MM；無效時用 default。"""
+    raw = (value or "").strip()
+    try:
+        return datetime.strptime(raw, "%H:%M").strftime("%H:%M")
+    except Exception:
+        return default
+
+
+def calendar_time_to_minutes(hhmm: str):
+    try:
+        h, m = [int(x) for x in str(hhmm).split(":", 1)]
+        return h * 60 + m
+    except Exception:
+        return 0
+
+
+def build_30_min_slots(start_hour=None, end_hour=None):
+    settings = get_line_card_settings()
+    if start_hour is None:
+        start_hour = int(settings.get("calendar_start_hour", 8) or 8)
+    if end_hour is None:
+        end_hour = int(settings.get("calendar_end_hour", 22) or 22)
+
+    start_hour = max(0, min(23, start_hour))
+    end_hour = max(start_hour, min(23, end_hour))
+
+    slots = []
+    for hour in range(start_hour, end_hour + 1):
+        slots.append(f"{hour:02d}:00")
+        if hour != end_hour:
+            slots.append(f"{hour:02d}:30")
+    return slots
+
+
+def next_30_min_time(hhmm: str):
+    minutes = calendar_time_to_minutes(hhmm) + 30
+    minutes = min(minutes, 23 * 60 + 59)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def get_line_card_settings():
+    settings = dict(DEFAULT_LINE_CARD_SETTINGS)
+    try:
+        doc = db.collection(LINE_CARD_SETTINGS_COLLECTION).document("default").get()
+        if doc.exists:
+            data = doc.to_dict() or {}
+            settings.update(data)
+    except Exception as e:
+        print("⚠️ 讀取 LINE 卡片設定失敗：", e)
+    return settings
+
+
+def save_line_card_settings_from_form(form):
+    quick_actions_raw = (form.get("quick_actions", "") or "").strip()
+    quick_actions = [x.strip() for x in re.split(r"[，,、\n]+", quick_actions_raw) if x.strip()]
+    if not quick_actions:
+        quick_actions = DEFAULT_LINE_CARD_SETTINGS["quick_actions"]
+
+    def _int_field(name, default):
+        try:
+            return int(form.get(name, default))
+        except Exception:
+            return default
+
+    start_hour = max(0, min(23, _int_field("calendar_start_hour", 8)))
+    end_hour = max(start_hour, min(23, _int_field("calendar_end_hour", 22)))
+
+    updates = {
+        "title_today": (form.get("title_today", "") or "").strip() or DEFAULT_LINE_CARD_SETTINGS["title_today"],
+        "title_tomorrow": (form.get("title_tomorrow", "") or "").strip() or DEFAULT_LINE_CARD_SETTINGS["title_tomorrow"],
+        "title_week": (form.get("title_week", "") or "").strip() or DEFAULT_LINE_CARD_SETTINGS["title_week"],
+        "show_phone": form.get("show_phone") == "on",
+        "show_location": form.get("show_location") == "on",
+        "show_note": form.get("show_note") == "on",
+        "show_customer": form.get("show_customer") == "on",
+        "show_quick_actions": form.get("show_quick_actions") == "on",
+        "line_only_enabled_events": form.get("line_only_enabled_events") == "on",
+        "primary_color": (form.get("primary_color", "") or "").strip() or DEFAULT_LINE_CARD_SETTINGS["primary_color"],
+        "button_color": (form.get("button_color", "") or "").strip() or DEFAULT_LINE_CARD_SETTINGS["button_color"],
+        "calendar_start_hour": start_hour,
+        "calendar_end_hour": end_hour,
+        "quick_actions": quick_actions,
+        "updated_at": now_taipei().isoformat(),
+        "updated_by_id": session.get("user_id", ""),
+        "updated_by_name": session.get("user_name", ""),
+    }
+    db.collection(LINE_CARD_SETTINGS_COLLECTION).document("default").set(updates, merge=True)
+    return updates
+
+
+def doc_to_calendar_event(doc):
+    data = doc_to_dict(doc)
+    data["start_time"] = calendar_safe_time(data.get("start_time"), "09:00")
+    data["end_time"] = calendar_safe_time(data.get("end_time"), next_30_min_time(data["start_time"]))
+    data["event_date"] = calendar_safe_date(data.get("event_date"))
+    data["category"] = data.get("category") or "其他"
+    data["category_color"] = data.get("category_color") or CALENDAR_CATEGORY_COLOR_MAP.get(data["category"], "#8B8B8B")
+    return data
+
+
+def fetch_calendar_events(start_date: str, end_date: str = None, line_only: bool = False):
+    """讀取日期區間行程。end_date 未傳時只讀單日。"""
+    start_date = calendar_safe_date(start_date)
+    end_date = calendar_safe_date(end_date or start_date)
+    events = []
+
+    try:
+        if start_date == end_date:
+            docs = db.collection(CALENDAR_EVENT_COLLECTION).where("event_date", "==", start_date).stream()
+        else:
+            # Firestore 需要索引時，後台會提示建立；若無索引，下面 except 會走備援。
+            docs = db.collection(CALENDAR_EVENT_COLLECTION).where("event_date", ">=", start_date).where("event_date", "<=", end_date).stream()
+        for d in docs:
+            item = doc_to_calendar_event(d)
+            if line_only and not item.get("line_enabled", True):
+                continue
+            events.append(item)
+    except Exception as e:
+        print("⚠️ Firestore 日期區間查詢失敗，改用備援讀取：", e)
+        try:
+            for d in db.collection(CALENDAR_EVENT_COLLECTION).stream():
+                item = doc_to_calendar_event(d)
+                if start_date <= item.get("event_date", "") <= end_date:
+                    if line_only and not item.get("line_enabled", True):
+                        continue
+                    events.append(item)
+        except Exception as e2:
+            print("❌ 讀取行事曆失敗：", e2)
+
+    events.sort(key=lambda x: (x.get("event_date", ""), x.get("start_time", ""), x.get("created_at", "")))
+    return events
+
+
+def build_calendar_event_payload(form, existing=None):
+    existing = existing or {}
+    event_date = calendar_safe_date(form.get("event_date") or existing.get("event_date"))
+    start_time = calendar_safe_time(form.get("start_time") or existing.get("start_time"), "09:00")
+    end_time = calendar_safe_time(form.get("end_time") or existing.get("end_time"), next_30_min_time(start_time))
+    if calendar_time_to_minutes(end_time) <= calendar_time_to_minutes(start_time):
+        end_time = next_30_min_time(start_time)
+
+    category = (form.get("category", "") or existing.get("category") or "其他").strip()
+    if category not in CALENDAR_CATEGORY_OPTIONS:
+        category = "其他"
+
+    payload = {
+        "title": (form.get("title", "") or "").strip(),
+        "event_date": event_date,
+        "start_time": start_time,
+        "end_time": end_time,
+        "category": category,
+        "category_color": CALENDAR_CATEGORY_COLOR_MAP.get(category, "#8B8B8B"),
+        "related_type": (form.get("related_type", "") or "").strip(),
+        "related_id": (form.get("related_id", "") or "").strip(),
+        "customer_name": (form.get("customer_name", "") or "").strip(),
+        "phone": (form.get("phone", "") or "").strip(),
+        "location": (form.get("location", "") or "").strip(),
+        "note": (form.get("note", "") or "").strip(),
+        "line_enabled": form.get("line_enabled") == "on",
+        "updated_at": now_taipei().isoformat(),
+        "updated_by_id": session.get("user_id", ""),
+        "updated_by_name": session.get("user_name", ""),
+    }
+    if not payload["title"]:
+        name = payload.get("customer_name") or payload.get("location") or category
+        payload["title"] = f"{name} {category}".strip()
+    return payload
+
+
+def calendar_prev_next_dates(selected_date):
+    dt = datetime.strptime(calendar_safe_date(selected_date), "%Y-%m-%d").date()
+    return {
+        "prev_date": (dt - timedelta(days=1)).strftime("%Y-%m-%d"),
+        "next_date": (dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+        "today": now_taipei().strftime("%Y-%m-%d"),
+    }
+
+
+CALENDAR_PAGE_TEMPLATE = r'''
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>行事曆｜Team M.E CRM</title>
+  <style>
+    body { margin:0; background:#f7f3ed; color:#3f3028; font-family:-apple-system,BlinkMacSystemFont,"Microsoft JhengHei","Noto Sans TC",Arial,sans-serif; }
+    .topbar { position:sticky; top:0; z-index:10; background:#fffaf3; border-bottom:1px solid #eadfd0; padding:14px 22px; display:flex; gap:12px; align-items:center; justify-content:space-between; }
+    .brand { font-weight:800; color:#7A4E2D; letter-spacing:.5px; }
+    .nav a, .btn { display:inline-block; text-decoration:none; border:1px solid #d8b28a; border-radius:12px; padding:8px 12px; color:#7A4E2D; background:#fff; font-size:14px; }
+    .btn.primary { background:#C9874A; color:#fff; border-color:#C9874A; }
+    .btn.danger { color:#a33; border-color:#e4b6b6; }
+    .wrap { max-width:1180px; margin:24px auto; padding:0 18px; }
+    .panel { background:#fff; border:1px solid #eadfd0; border-radius:20px; box-shadow:0 10px 30px rgba(120,80,40,.08); overflow:hidden; }
+    .panel-head { padding:18px 20px; border-bottom:1px solid #f0e6d9; display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; }
+    .date-control { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    input[type=date], select, input[type=text], input[type=time], textarea { border:1px solid #dec9b2; border-radius:10px; padding:9px 10px; font-size:15px; background:#fff; box-sizing:border-box; }
+    .schedule { display:grid; grid-template-columns:110px 1fr; }
+    .slot-time { padding:16px 18px; border-bottom:1px solid #f3eadf; background:#fffaf6; color:#8b6b4f; font-weight:700; }
+    .slot-events { padding:10px 14px; border-bottom:1px solid #f3eadf; min-height:52px; }
+    .empty { color:#c7b7a8; font-size:14px; padding:8px 0; }
+    .event-card { border:1px solid #eadfd0; border-left:7px solid var(--cat,#C9874A); border-radius:14px; padding:12px 14px; margin:4px 0 8px; background:#fffdf9; display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }
+    .event-title { font-size:17px; font-weight:800; margin-bottom:6px; color:#3d2d23; }
+    .event-meta { font-size:14px; color:#6f6258; line-height:1.75; }
+    .pill { display:inline-block; padding:3px 9px; border-radius:999px; background:#f4e3d2; color:#7A4E2D; font-size:13px; font-weight:700; margin-left:8px; }
+    .actions { display:flex; gap:7px; flex-wrap:wrap; justify-content:flex-end; min-width:150px; }
+    .msg { margin:0 0 14px; padding:12px 14px; border-radius:12px; background:#fff6e8; border:1px solid #f0d7b5; color:#7A4E2D; }
+    .preview-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-top:18px; }
+    .preview-card { background:#fff; border:1px solid #eadfd0; border-radius:20px; padding:16px; box-shadow:0 8px 20px rgba(120,80,40,.08); }
+    .preview-time { color:#C9874A; font-weight:900; }
+    @media (max-width:720px){ .schedule{grid-template-columns:80px 1fr;} .event-card{display:block;} .actions{justify-content:flex-start; margin-top:10px;} }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">Team M.E CRM｜行事曆</div>
+    <div class="nav">
+      <a href="{{ url_for('buyers') }}">客需</a>
+      <a href="{{ url_for('sellers') }}">委託</a>
+      <a href="{{ url_for('calendar_page') }}">行事曆</a>
+      <a href="{{ url_for('line_card_settings') }}">LINE卡片設定</a>
+    </div>
+  </div>
+
+  <div class="wrap">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}<div class="msg">{{ message }}</div>{% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h2 style="margin:0 0 6px;">{{ selected_date }} 行程</h2>
+          <div style="color:#8b6b4f;font-size:14px;">每 30 分鐘一格，可新增帶看、回電、開發、簽約與提醒。</div>
+        </div>
+        <div class="date-control">
+          <a class="btn" href="{{ url_for('calendar_page', date=prev_date) }}">前一天</a>
+          <form method="get" action="{{ url_for('calendar_page') }}" style="display:flex;gap:8px;align-items:center;">
+            <input type="date" name="date" value="{{ selected_date }}">
+            <button class="btn" type="submit">切換日期</button>
+          </form>
+          <a class="btn" href="{{ url_for('calendar_page', date=today) }}">今天</a>
+          <a class="btn" href="{{ url_for('calendar_page', date=next_date) }}">後一天</a>
+          <a class="btn primary" href="{{ url_for('calendar_new', date=selected_date) }}">＋新增行程</a>
+        </div>
+      </div>
+
+      <div class="schedule">
+        {% for slot in slots %}
+          <div class="slot-time">{{ slot }}</div>
+          <div class="slot-events">
+            {% set items = event_map.get(slot, []) %}
+            {% if not items %}
+              <div class="empty">空</div>
+            {% endif %}
+            {% for e in items %}
+              <div class="event-card" style="--cat: {{ e.category_color }};">
+                <div>
+                  <div class="event-title">{{ e.title }} <span class="pill">{{ e.category }}</span></div>
+                  <div class="event-meta">
+                    {{ e.start_time }} - {{ e.end_time }}<br>
+                    {% if e.customer_name %}客戶：{{ e.customer_name }}{% if e.phone %}｜{{ e.phone }}{% endif %}<br>{% endif %}
+                    {% if e.location %}地點：{{ e.location }}<br>{% endif %}
+                    {% if e.note %}備註：{{ e.note }}{% endif %}
+                  </div>
+                </div>
+                <div class="actions">
+                  <a class="btn" href="{{ url_for('calendar_edit', event_id=e.id) }}">編輯</a>
+                  <form method="post" action="{{ url_for('calendar_delete', event_id=e.id) }}" onsubmit="return confirm('確定刪除此行程？');">
+                    <button class="btn danger" type="submit">刪除</button>
+                  </form>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="preview-grid">
+      <div class="preview-card">
+        <div class="preview-time">LINE 指令</div>
+        <div style="line-height:1.9;margin-top:8px;">
+          #今日行程<br>
+          #明日行程<br>
+          #本週行程<br>
+          #新增行程<br>
+          日期: 今天<br>
+          時間: 10:00<br>
+          類型: 帶看<br>
+          標題: 童先生看農舍
+        </div>
+      </div>
+      <div class="preview-card">
+        <div class="preview-time">LINE 卡片</div>
+        <div style="line-height:1.9;margin-top:8px;">
+          會依照行程數量自動產生左右滑動卡片。<br>
+          可在「LINE卡片設定」控制電話、地點、備註是否顯示。
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+'''
+
+
+CALENDAR_FORM_TEMPLATE = r'''
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ '編輯' if event else '新增' }}行程｜Team M.E CRM</title>
+  <style>
+    body { margin:0; background:#f7f3ed; color:#3f3028; font-family:-apple-system,BlinkMacSystemFont,"Microsoft JhengHei","Noto Sans TC",Arial,sans-serif; }
+    .topbar { background:#fffaf3; border-bottom:1px solid #eadfd0; padding:14px 22px; display:flex; justify-content:space-between; align-items:center; }
+    .brand { font-weight:800; color:#7A4E2D; }
+    .nav a, .btn { display:inline-block; text-decoration:none; border:1px solid #d8b28a; border-radius:12px; padding:9px 13px; color:#7A4E2D; background:#fff; font-size:14px; }
+    .btn.primary { background:#C9874A; color:#fff; border-color:#C9874A; }
+    .wrap { max-width:760px; margin:24px auto; padding:0 18px; }
+    .panel { background:#fff; border:1px solid #eadfd0; border-radius:22px; padding:24px; box-shadow:0 10px 30px rgba(120,80,40,.08); }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+    label { display:block; font-weight:800; margin:0 0 7px; color:#5a4032; }
+    input, select, textarea { width:100%; border:1px solid #dec9b2; border-radius:12px; padding:10px 12px; font-size:15px; background:#fff; box-sizing:border-box; }
+    textarea { min-height:110px; resize:vertical; }
+    .full { grid-column:1 / -1; }
+    .hint { color:#8b6b4f; font-size:13px; margin-top:5px; }
+    .actions { margin-top:22px; display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap; }
+    .msg { margin:0 0 14px; padding:12px 14px; border-radius:12px; background:#fff6e8; border:1px solid #f0d7b5; color:#7A4E2D; }
+    @media (max-width:720px){ .grid{grid-template-columns:1fr;} }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">Team M.E CRM｜{{ '編輯' if event else '新增' }}行程</div>
+    <div class="nav"><a href="{{ url_for('calendar_page', date=(event.event_date if event else selected_date)) }}">返回行事曆</a></div>
+  </div>
+  <div class="wrap">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}{% for category, message in messages %}<div class="msg">{{ message }}</div>{% endfor %}{% endif %}
+    {% endwith %}
+    <form class="panel" method="post">
+      <h2 style="margin-top:0;">{{ '編輯' if event else '新增' }}行程</h2>
+      <div class="grid">
+        <div>
+          <label>日期</label>
+          <input type="date" name="event_date" value="{{ event.event_date if event else selected_date }}" required>
+        </div>
+        <div>
+          <label>類型</label>
+          <select name="category">
+            {% for c in category_options %}<option value="{{ c }}" {% if event and event.category == c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>開始時間</label>
+          <select name="start_time">
+            {% for s in slots %}<option value="{{ s }}" {% if (event and event.start_time == s) or ((not event) and default_start == s) %}selected{% endif %}>{{ s }}</option>{% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>結束時間</label>
+          <select name="end_time">
+            {% for s in slots %}<option value="{{ s }}" {% if (event and event.end_time == s) or ((not event) and default_end == s) %}selected{% endif %}>{{ s }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="full">
+          <label>標題</label>
+          <input type="text" name="title" value="{{ event.title if event else '' }}" placeholder="例如：童先生 看農舍 / 李太太 回電追蹤">
+        </div>
+        <div>
+          <label>客戶姓名</label>
+          <input type="text" name="customer_name" value="{{ event.customer_name if event else '' }}">
+        </div>
+        <div>
+          <label>電話</label>
+          <input type="text" name="phone" value="{{ event.phone if event else '' }}">
+        </div>
+        <div>
+          <label>關聯類型</label>
+          <select name="related_type">
+            {% set rt = event.related_type if event else '' %}
+            <option value="" {% if not rt %}selected{% endif %}>不關聯</option>
+            <option value="buyer" {% if rt == 'buyer' %}selected{% endif %}>買方 / 客需</option>
+            <option value="seller" {% if rt == 'seller' %}selected{% endif %}>賣方 / 委託</option>
+            <option value="development" {% if rt == 'development' %}selected{% endif %}>開發</option>
+            <option value="todo" {% if rt == 'todo' %}selected{% endif %}>待辦</option>
+          </select>
+        </div>
+        <div>
+          <label>關聯ID</label>
+          <input type="text" name="related_id" value="{{ event.related_id if event else '' }}" placeholder="可先空白">
+        </div>
+        <div class="full">
+          <label>地點</label>
+          <input type="text" name="location" value="{{ event.location if event else '' }}" placeholder="例如：清水、梧棲交界 / 沙鹿中山路">
+        </div>
+        <div class="full">
+          <label>備註</label>
+          <textarea name="note" placeholder="客戶需求、下一步、注意事項">{{ event.note if event else '' }}</textarea>
+        </div>
+        <div class="full">
+          <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" name="line_enabled" style="width:auto;" {% if (event and event.line_enabled) or not event %}checked{% endif %}> LINE 查詢行程時顯示這筆</label>
+          <div class="hint">若關閉，且 LINE 卡片設定選擇「只顯示已啟用」，這筆就不會出現在 LINE 卡片。</div>
+        </div>
+      </div>
+      <div class="actions">
+        <a class="btn" href="{{ url_for('calendar_page', date=(event.event_date if event else selected_date)) }}">取消</a>
+        <button class="btn primary" type="submit">儲存</button>
+      </div>
+    </form>
+  </div>
+</body>
+</html>
+'''
+
+
+LINE_CARD_SETTINGS_TEMPLATE = r'''
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LINE卡片設定｜Team M.E CRM</title>
+  <style>
+    body { margin:0; background:#f7f3ed; color:#3f3028; font-family:-apple-system,BlinkMacSystemFont,"Microsoft JhengHei","Noto Sans TC",Arial,sans-serif; }
+    .topbar { background:#fffaf3; border-bottom:1px solid #eadfd0; padding:14px 22px; display:flex; justify-content:space-between; align-items:center; }
+    .brand { font-weight:800; color:#7A4E2D; }
+    .nav a, .btn { display:inline-block; text-decoration:none; border:1px solid #d8b28a; border-radius:12px; padding:9px 13px; color:#7A4E2D; background:#fff; font-size:14px; }
+    .btn.primary { background:#C9874A; color:#fff; border-color:#C9874A; }
+    .wrap { max-width:850px; margin:24px auto; padding:0 18px; }
+    .panel { background:#fff; border:1px solid #eadfd0; border-radius:22px; padding:24px; box-shadow:0 10px 30px rgba(120,80,40,.08); }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+    .full { grid-column:1 / -1; }
+    label { display:block; font-weight:800; margin:0 0 7px; color:#5a4032; }
+    input, textarea { width:100%; border:1px solid #dec9b2; border-radius:12px; padding:10px 12px; font-size:15px; background:#fff; box-sizing:border-box; }
+    textarea { min-height:105px; resize:vertical; }
+    .check { display:flex; gap:8px; align-items:center; margin:8px 0; font-weight:700; }
+    .check input { width:auto; }
+    .hint { color:#8b6b4f; font-size:13px; margin-top:5px; line-height:1.7; }
+    .actions { margin-top:22px; display:flex; gap:10px; justify-content:flex-end; }
+    .msg { margin:0 0 14px; padding:12px 14px; border-radius:12px; background:#fff6e8; border:1px solid #f0d7b5; color:#7A4E2D; }
+    @media (max-width:720px){ .grid{grid-template-columns:1fr;} }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">Team M.E CRM｜LINE卡片設定</div>
+    <div class="nav"><a href="{{ url_for('calendar_page') }}">返回行事曆</a></div>
+  </div>
+  <div class="wrap">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}{% for category, message in messages %}<div class="msg">{{ message }}</div>{% endfor %}{% endif %}
+    {% endwith %}
+    <form class="panel" method="post">
+      <h2 style="margin-top:0;">LINE 行程卡片設定</h2>
+      <div class="grid">
+        <div class="full"><label>今日行程標題</label><input name="title_today" value="{{ settings.title_today }}"></div>
+        <div class="full"><label>明日行程標題</label><input name="title_tomorrow" value="{{ settings.title_tomorrow }}"></div>
+        <div class="full"><label>本週行程標題</label><input name="title_week" value="{{ settings.title_week }}"></div>
+        <div><label>主色</label><input name="primary_color" value="{{ settings.primary_color }}" placeholder="#C9874A"></div>
+        <div><label>按鈕色</label><input name="button_color" value="{{ settings.button_color }}" placeholder="#C9874A"></div>
+        <div><label>行事曆開始小時</label><input name="calendar_start_hour" value="{{ settings.calendar_start_hour }}" placeholder="8"></div>
+        <div><label>行事曆結束小時</label><input name="calendar_end_hour" value="{{ settings.calendar_end_hour }}" placeholder="22"></div>
+        <div class="full">
+          <label>LINE 卡片顯示內容</label>
+          <label class="check"><input type="checkbox" name="show_customer" {% if settings.show_customer %}checked{% endif %}> 顯示客戶姓名</label>
+          <label class="check"><input type="checkbox" name="show_phone" {% if settings.show_phone %}checked{% endif %}> 顯示電話</label>
+          <label class="check"><input type="checkbox" name="show_location" {% if settings.show_location %}checked{% endif %}> 顯示地點</label>
+          <label class="check"><input type="checkbox" name="show_note" {% if settings.show_note %}checked{% endif %}> 顯示備註</label>
+          <label class="check"><input type="checkbox" name="show_quick_actions" {% if settings.show_quick_actions %}checked{% endif %}> 顯示快速操作</label>
+          <label class="check"><input type="checkbox" name="line_only_enabled_events" {% if settings.line_only_enabled_events %}checked{% endif %}> LINE 只顯示有勾選「LINE查詢顯示」的行程</label>
+        </div>
+        <div class="full">
+          <label>快速操作按鈕文字</label>
+          <textarea name="quick_actions">{{ quick_actions_text }}</textarea>
+          <div class="hint">一行一個或用逗號分隔，例如：新增行程、今日行程、本週行程、客戶查詢、設定提醒。</div>
+        </div>
+      </div>
+      <div class="actions">
+        <a class="btn" href="{{ url_for('calendar_page') }}">取消</a>
+        <button class="btn primary" type="submit">儲存設定</button>
+      </div>
+    </form>
+  </div>
+</body>
+</html>
+'''
+
+
+@app.route("/calendar")
+@login_required
+def calendar_page():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    events = fetch_calendar_events(selected_date)
+
+    event_map = {}
+    floating_events = []
+    slots = build_30_min_slots()
+    slot_set = set(slots)
+    for e in events:
+        if e.get("start_time") in slot_set:
+            event_map.setdefault(e.get("start_time"), []).append(e)
+        else:
+            floating_events.append(e)
+
+    # 不在時段內的行程放在最接近起始位置，避免消失。
+    if floating_events:
+        event_map.setdefault(slots[0], []).extend(floating_events)
+
+    dates = calendar_prev_next_dates(selected_date)
+    return render_template_string(
+        CALENDAR_PAGE_TEMPLATE,
+        selected_date=selected_date,
+        slots=slots,
+        event_map=event_map,
+        events=events,
+        category_options=CALENDAR_CATEGORY_OPTIONS,
+        **dates,
+    )
+
+
+@app.route("/calendar/new", methods=["GET", "POST"])
+@login_required
+def calendar_new():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    default_start = calendar_safe_time(request.args.get("start", ""), "09:00")
+    default_end = next_30_min_time(default_start)
+
+    if request.method == "POST":
+        payload = build_calendar_event_payload(request.form)
+        payload.update({
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": session.get("user_id", ""),
+            "created_by_name": session.get("user_name", ""),
+        })
+        db.collection(CALENDAR_EVENT_COLLECTION).add(payload)
+        flash("已新增行程", "success")
+        return redirect(url_for("calendar_page", date=payload["event_date"]))
+
+    return render_template_string(
+        CALENDAR_FORM_TEMPLATE,
+        event=None,
+        selected_date=selected_date,
+        default_start=default_start,
+        default_end=default_end,
+        slots=build_30_min_slots(),
+        category_options=CALENDAR_CATEGORY_OPTIONS,
+    )
+
+
+@app.route("/calendar/<event_id>/edit", methods=["GET", "POST"])
+@login_required
+def calendar_edit(event_id):
+    doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).document(event_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        flash("找不到這筆行程", "danger")
+        return redirect(url_for("calendar_page"))
+
+    event = doc_to_calendar_event(doc)
+
+    if request.method == "POST":
+        payload = build_calendar_event_payload(request.form, existing=event)
+        doc_ref.update(payload)
+        flash("已更新行程", "success")
+        return redirect(url_for("calendar_page", date=payload["event_date"]))
+
+    return render_template_string(
+        CALENDAR_FORM_TEMPLATE,
+        event=event,
+        selected_date=event.get("event_date"),
+        default_start=event.get("start_time", "09:00"),
+        default_end=event.get("end_time", "09:30"),
+        slots=build_30_min_slots(),
+        category_options=CALENDAR_CATEGORY_OPTIONS,
+    )
+
+
+@app.route("/calendar/<event_id>/delete", methods=["POST"])
+@login_required
+def calendar_delete(event_id):
+    doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).document(event_id)
+    doc = doc_ref.get()
+    selected_date = now_taipei().strftime("%Y-%m-%d")
+    if doc.exists:
+        selected_date = (doc.to_dict() or {}).get("event_date", selected_date)
+        doc_ref.delete()
+        flash("已刪除行程", "info")
+    else:
+        flash("找不到這筆行程", "danger")
+    return redirect(url_for("calendar_page", date=selected_date))
+
+
+@app.route("/line-card-settings", methods=["GET", "POST"])
+@login_required
+def line_card_settings():
+    if request.method == "POST":
+        save_line_card_settings_from_form(request.form)
+        flash("LINE 卡片設定已更新", "success")
+        return redirect(url_for("line_card_settings"))
+
+    settings = get_line_card_settings()
+    return render_template_string(
+        LINE_CARD_SETTINGS_TEMPLATE,
+        settings=settings,
+        quick_actions_text="\n".join(settings.get("quick_actions") or []),
+    )
+
+
+# 給外部或測試用：JSON 版今日 / 指定日期行程。
+@app.route("/calendar/api/events")
+@login_required
+def calendar_api_events():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    events = fetch_calendar_events(selected_date)
+    return {"ok": True, "date": selected_date, "events": events}, 200
+
+
+# =============================================================================
+# LINE Flex Message：回覆函式與卡片產生器
+# =============================================================================
+
+def reply_line_messages(reply_token: str, messages: list):
+    if not LINE_CHANNEL_ACCESS_TOKEN or not reply_token:
+        return None
+    payload = {
+        "replyToken": reply_token,
+        "messages": messages,
+    }
+    try:
+        import requests
+        res = requests.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers=line_api_headers(),
+            json=payload,
+            timeout=8,
+        )
+        print("LINE reply status:", res.status_code, res.text[:300])
+        data = {}
+        try:
+            data = res.json() if res.text else {}
+        except Exception:
+            data = {}
+        return {
+            "status_code": res.status_code,
+            "data": data,
+            "sent_messages": (data or {}).get("sentMessages", []),
+        }
+    except Exception as e:
+        print("⚠️ LINE flex reply 發生錯誤：", e)
+        return None
+
+
+def reply_line_flex(reply_token: str, alt_text: str, contents: dict, quick_reply_items=None):
+    message = {
+        "type": "flex",
+        "altText": (alt_text or "CRM 行程卡片")[:400],
+        "contents": contents,
+    }
+    if quick_reply_items:
+        message["quickReply"] = {"items": quick_reply_items[:13]}
+    return reply_line_messages(reply_token, [message])
+
+
+def line_truncate(text, max_len=80):
+    text = str(text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 1] + "…"
+
+
+def flex_text(text, size="sm", color="#333333", weight=None, wrap=True, margin=None):
+    item = {"type": "text", "text": str(text or "-"), "size": size, "color": color, "wrap": wrap}
+    if weight:
+        item["weight"] = weight
+    if margin:
+        item["margin"] = margin
+    return item
+
+
+def flex_info_row(label, value):
+    return {
+        "type": "box",
+        "layout": "baseline",
+        "spacing": "sm",
+        "contents": [
+            {"type": "text", "text": label, "size": "xs", "color": "#999999", "flex": 2},
+            {"type": "text", "text": line_truncate(value, 90) or "-", "size": "sm", "color": "#333333", "flex": 5, "wrap": True},
+        ],
+    }
+
+
+def build_calendar_event_bubble(event, settings=None):
+    settings = settings or get_line_card_settings()
+    category = event.get("category") or "行程"
+    category_color = event.get("category_color") or CALENDAR_CATEGORY_COLOR_MAP.get(category, settings.get("primary_color", "#C9874A"))
+    title = event.get("title") or f"{category}行程"
+    date_text = event.get("event_date", "") or "-"
+    time_text = f"{date_text} {event.get('start_time', '')} - {event.get('end_time', '')}"
+
+    body_contents = [
+        {
+            "type": "box",
+            "layout": "horizontal",
+            "contents": [
+                {"type": "text", "text": f"📅 {date_text}", "size": "sm", "color": category_color, "weight": "bold", "flex": 4},
+                {"type": "text", "text": category, "size": "xs", "color": "#3F3028", "align": "center", "gravity": "center", "flex": 2, "weight": "bold"},
+            ],
+        },
+        flex_text(f"🕒 {event.get('start_time', '')} - {event.get('end_time', '')}", size="sm", color="#666666", weight="bold", margin="sm"),
+        flex_text(line_truncate(title, 48), size="lg", color="#222222", weight="bold", margin="md"),
+        {"type": "separator", "margin": "md"},
+        {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "md", "contents": []},
+    ]
+
+    info_box = body_contents[-1]
+    if settings.get("show_customer", True):
+        info_box["contents"].append(flex_info_row("客戶", event.get("customer_name") or "-"))
+    if settings.get("show_phone", True):
+        info_box["contents"].append(flex_info_row("電話", event.get("phone") or "-"))
+    if settings.get("show_location", True):
+        info_box["contents"].append(flex_info_row("地點", event.get("location") or "-"))
+    if settings.get("show_note", True):
+        info_box["contents"].append(flex_info_row("備註", event.get("note") or "-"))
+
+    if not info_box["contents"]:
+        info_box["contents"].append(flex_text(time_text, size="sm", color="#666666"))
+
+    footer_contents = []
+    base_url = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+    if base_url and event.get("id"):
+        footer_contents.append({
+            "type": "button",
+            "style": "primary",
+            "color": settings.get("button_color", "#C9874A"),
+            "height": "sm",
+            "action": {
+                "type": "uri",
+                "label": "查看詳情",
+                "uri": f"{base_url}/calendar/{event.get('id')}/edit",
+            },
+        })
+
+    if event.get("location"):
+        footer_contents.append({
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "action": {
+                "type": "uri",
+                "label": "查看地圖",
+                "uri": "https://www.google.com/maps/search/?api=1&query=" + quote_plus(event.get("location", "")),
+            },
+        })
+
+    if event.get("phone"):
+        footer_contents.append({
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "action": {
+                "type": "uri",
+                "label": "撥打電話",
+                "uri": "tel:" + re.sub(r"[^0-9+]", "", event.get("phone", "")),
+            },
+        })
+
+    if not footer_contents:
+        footer_contents.append({
+            "type": "button",
+            "style": "secondary",
+            "height": "sm",
+            "action": {
+                "type": "message",
+                "label": "本週行程",
+                "text": "#本週行程",
+            },
+        })
+
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": body_contents,
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": footer_contents[:3],
+        },
+        "styles": {
+            "footer": {"separator": True},
+        },
+    }
+
+
+def build_calendar_empty_bubble(title, date_text, settings=None):
+    settings = settings or get_line_card_settings()
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                flex_text("📅 " + title, size="lg", color="#222222", weight="bold"),
+                flex_text(date_text, size="sm", color="#8b6b4f"),
+                {"type": "separator", "margin": "md"},
+                flex_text("目前沒有行程，可以到後台新增，或直接用 #新增行程 建立。", size="sm", color="#666666", margin="md"),
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": settings.get("button_color", "#C9874A"),
+                    "action": {"type": "message", "label": "新增行程格式", "text": "#新增行程"},
+                }
+            ],
+        },
+    }
+
+
+def build_calendar_carousel(events, title="行程", date_text="", settings=None):
+    settings = settings or get_line_card_settings()
+    bubbles = []
+    if not events:
+        bubbles.append(build_calendar_empty_bubble(title, date_text, settings))
+    else:
+        for event in events[:12]:
+            bubbles.append(build_calendar_event_bubble(event, settings))
+
+    if len(bubbles) == 1:
+        return bubbles[0]
+    return {"type": "carousel", "contents": bubbles}
+
+
+def build_calendar_quick_reply(settings=None):
+    settings = settings or get_line_card_settings()
+    if not settings.get("show_quick_actions", True):
+        return []
+
+    label_to_text = {
+        "新增行程": "#新增行程",
+        "今日行程": "#今日行程",
+        "今天行程": "#今日行程",
+        "明日行程": "#明日行程",
+        "明天行程": "#明日行程",
+        "本週行程": "#本週行程",
+        "客戶查詢": "#查詢紀錄",
+        "設定提醒": "#設定待辦提醒",
+    }
+
+    items = []
+    for label in settings.get("quick_actions") or []:
+        text = label_to_text.get(label, f"#{label}")
+        items.append({
+            "type": "action",
+            "action": {
+                "type": "message",
+                "label": str(label)[:20],
+                "text": text,
+            },
+        })
+    return items[:13]
+
+
+def build_calendar_reply_for_range(start_date, end_date=None, mode="today"):
+    settings = get_line_card_settings()
+    line_only = bool(settings.get("line_only_enabled_events", False))
+    events = fetch_calendar_events(start_date, end_date or start_date, line_only=line_only)
+
+    if mode == "week":
+        title = settings.get("title_week") or DEFAULT_LINE_CARD_SETTINGS["title_week"]
+        date_text = f"{start_date} ~ {end_date}"
+    elif mode == "tomorrow":
+        title = settings.get("title_tomorrow") or DEFAULT_LINE_CARD_SETTINGS["title_tomorrow"]
+        date_text = start_date
+    else:
+        title = settings.get("title_today") or DEFAULT_LINE_CARD_SETTINGS["title_today"]
+        date_text = start_date
+
+    flex = build_calendar_carousel(events, title=title, date_text=date_text, settings=settings)
+    alt = f"{title} {len(events)} 筆"
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": alt,
+        "reply_flex": flex,
+        "reply_quick_reply": build_calendar_quick_reply(settings),
+        "parsed_tag": "行事曆",
+    }
+
+
+def parse_line_calendar_create_fields(text):
+    fields = {}
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for line in lines[1:]:
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.+)$", line)
+        if not m:
+            # 沒寫 key 的行，先當備註追加。
+            fields["note"] = (fields.get("note", "") + "\n" + line).strip()
+            continue
+        key = normalize_line_key(m.group(1))
+        raw_key = (m.group(1) or "").strip().replace(" ", "")
+        value = m.group(2).strip()
+        if raw_key in ("日期", "行程日期"):
+            fields["event_date_raw"] = value
+        elif raw_key in ("時間", "開始時間", "時段"):
+            fields["time_raw"] = value
+        elif raw_key in ("結束時間",):
+            fields["end_time"] = value
+        elif raw_key in ("類型", "分類"):
+            fields["category"] = value
+        elif raw_key in ("標題", "行程", "事項"):
+            fields["title"] = value
+        elif raw_key in ("客戶", "姓名", "客戶姓名"):
+            fields["customer_name"] = value
+        elif raw_key in ("電話", "手機"):
+            fields["phone"] = value
+        elif raw_key in ("地點", "地址", "位置"):
+            fields["location"] = value
+        elif raw_key in ("備註", "內容", "說明"):
+            fields["note"] = value
+        elif key in ("record_id", "related_id"):
+            fields["related_id"] = value
+        else:
+            fields[raw_key] = value
+    return fields
+
+
+def parse_calendar_date_word(raw):
+    raw = (raw or "").strip()
+    today = now_taipei().date()
+    if raw in ("", "今天", "今日"):
+        return today.strftime("%Y-%m-%d")
+    if raw in ("明天", "明日"):
+        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    if raw in ("後天",):
+        return (today + timedelta(days=2)).strftime("%Y-%m-%d")
+    return calendar_safe_date(raw)
+
+
+def parse_calendar_time_range(raw_time, raw_end=None):
+    text = (raw_time or "").strip()
+    # 支援 10:00-10:30 / 1000-1030 / 10點 / 10點30
+    found = re.findall(r"(\d{1,2})(?:[:：點](\d{1,2}))?", text)
+    if found:
+        h1, m1 = found[0]
+        start = f"{int(h1):02d}:{int(m1 or 0):02d}"
+        if len(found) >= 2:
+            h2, m2 = found[1]
+            end = f"{int(h2):02d}:{int(m2 or 0):02d}"
+        else:
+            end = calendar_safe_time(raw_end, next_30_min_time(start))
+        return calendar_safe_time(start, "09:00"), calendar_safe_time(end, next_30_min_time(start))
+    start = calendar_safe_time(text, "09:00")
+    end = calendar_safe_time(raw_end, next_30_min_time(start))
+    return start, end
+
+
+def process_line_calendar_message_event(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+
+    raw_text = (message.get("text") or "").strip()
+    normalized = raw_text.replace("＃", "#").strip()
+    today = now_taipei().date()
+
+    if normalized in ("#今日行程", "#今天行程", "今日行程", "今天行程"):
+        d = today.strftime("%Y-%m-%d")
+        return build_calendar_reply_for_range(d, mode="today")
+
+    if normalized in ("#明日行程", "#明天行程", "明日行程", "明天行程"):
+        d = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+        return build_calendar_reply_for_range(d, mode="tomorrow")
+
+    if normalized in ("#本週行程", "本週行程"):
+        # 以今天起算未來 7 天，符合房仲使用情境。
+        start = today.strftime("%Y-%m-%d")
+        end = (today + timedelta(days=6)).strftime("%Y-%m-%d")
+        return build_calendar_reply_for_range(start, end, mode="week")
+
+    if normalized.startswith("#新增行程"):
+        fields = parse_line_calendar_create_fields(normalized)
+        if len(normalized.splitlines()) == 1:
+            example = (
+                "新增行程格式：\n"
+                "#新增行程\n"
+                "日期: 今天\n"
+                "時間: 10:00-10:30\n"
+                "類型: 帶看\n"
+                "標題: 童先生看農舍\n"
+                "客戶: 童先生\n"
+                "電話: 0921-123-456\n"
+                "地點: 清水、梧棲交界\n"
+                "備註: 退休夫妻，想看農舍、有空地"
+            )
+            return {"handled": True, "ok": True, "reply_text": example, "parsed_tag": "新增行程格式"}
+
+        event_date = parse_calendar_date_word(fields.get("event_date_raw", "今天"))
+        start_time, end_time = parse_calendar_time_range(fields.get("time_raw", "09:00"), fields.get("end_time", ""))
+        category = fields.get("category", "其他")
+        if category not in CALENDAR_CATEGORY_OPTIONS:
+            category = "其他"
+
+        title = fields.get("title", "").strip()
+        if not title:
+            title = f"{fields.get('customer_name', '')} {category}".strip() or category
+
+        payload = {
+            "title": title,
+            "event_date": event_date,
+            "start_time": start_time,
+            "end_time": end_time,
+            "category": category,
+            "category_color": CALENDAR_CATEGORY_COLOR_MAP.get(category, "#8B8B8B"),
+            "related_type": fields.get("related_type", ""),
+            "related_id": fields.get("related_id", ""),
+            "customer_name": fields.get("customer_name", ""),
+            "phone": fields.get("phone", ""),
+            "location": fields.get("location", ""),
+            "note": fields.get("note", ""),
+            "line_enabled": True,
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": "line_bot",
+            "created_by_name": "LINE Bot",
+            "updated_at": now_taipei().isoformat(),
+            "updated_by_id": "line_bot",
+            "updated_by_name": "LINE Bot",
+        }
+        doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).document()
+        doc_ref.set(payload)
+        payload["id"] = doc_ref.id
+        event_item = dict(payload)
+        settings = get_line_card_settings()
+        flex = build_calendar_event_bubble(event_item, settings)
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": f"已新增行程：{title}（{event_date} {start_time}）",
+            "reply_flex": flex,
+            "reply_quick_reply": build_calendar_quick_reply(settings),
+            "parsed_tag": "新增行程",
+        }
+
+    return {"handled": False}
+
+
+# 將行事曆 LINE 指令掛到現有 process_line_message_event 前面；其他客需/委託/待辦照原本流程。
+try:
+    _process_line_message_event_before_calendar_patch = process_line_message_event
+
+    def process_line_message_event(event):
+        calendar_result = process_line_calendar_message_event(event)
+        if calendar_result.get("handled"):
+            return calendar_result
+        return _process_line_message_event_before_calendar_patch(event)
+
+    print("✅ 已啟用 LINE 行事曆指令 Patch")
+except Exception as e:
+    print("⚠️ 啟用 LINE 行事曆指令 Patch 失敗：", e)
+
+
+# 覆寫既有 line_webhook view：支援 result['reply_flex'] / result['reply_messages']，仍保留原文字回覆。
+def line_webhook_with_flex_calendar():
+    raw_body = request.get_data(cache=False, as_text=False)
+    signature = request.headers.get("x-line-signature", "")
+
+    if not verify_line_signature(raw_body, signature):
+        return "Invalid signature", 400
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception as e:
+        print("⚠️ LINE webhook JSON 解析失敗：", e)
+        return "Bad Request", 400
+
+    events = payload.get("events", [])
+    for event in events:
+        try:
+            result = process_line_message_event(event)
+            if not result or not result.get("handled"):
+                continue
+
+            reply_result = None
+            reply_token = event.get("replyToken")
+            if not reply_token:
+                continue
+
+            if result.get("reply_messages"):
+                reply_result = reply_line_messages(reply_token, result.get("reply_messages") or [])
+            elif result.get("reply_flex"):
+                reply_result = reply_line_flex(
+                    reply_token,
+                    result.get("reply_text", "CRM 行程卡片"),
+                    result.get("reply_flex"),
+                    quick_reply_items=result.get("reply_quick_reply"),
+                )
+            elif result.get("reply_text"):
+                reply_result = reply_line_text(
+                    reply_token,
+                    result["reply_text"] if result.get("ok") else result["reply_text"],
+                )
+
+            if result.get("ok") and result.get("target_type") and result.get("target_id") and reply_result:
+                for sent in reply_result.get("sent_messages", []):
+                    sent_id = str(sent.get("id", "")).strip()
+                    if sent_id:
+                        save_line_message_link(
+                            sent_id,
+                            result["target_type"],
+                            result["target_id"],
+                            tag=result.get("parsed_tag", ""),
+                            action="bot_reply",
+                            customer_name=result.get("customer_name", ""),
+                            phone=result.get("phone", ""),
+                            source_event=event,
+                        )
+        except Exception as e:
+            print("⚠️ 處理 LINE event 發生錯誤：", e)
+
+    return "OK", 200
+
+
+try:
+    app.view_functions["line_webhook"] = line_webhook_with_flex_calendar
+    print("✅ line_webhook 已升級：支援 Flex Message / 行事曆卡片")
+except Exception as e:
+    print("⚠️ 覆寫 line_webhook 失敗：", e)
+
+# =============================================================================
+# 行事曆後台 + LINE 行程卡片 Flex Message Patch v1 End
+# =============================================================================
+
+
+
+
+
+# ========= DEBUG：檢查目前 Flask 有註冊哪些網址 =========
+@app.route("/debug/routes", strict_slashes=False)
+def debug_routes():
+    rules = []
+    for rule in app.url_map.iter_rules():
+        methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
+        rules.append(f"{methods:10s} {rule.rule}  ->  {rule.endpoint}")
+    return "<pre>" + "\n".join(sorted(rules)) + "</pre>"
+
+@app.route("/debug/line-preview-check", strict_slashes=False)
+def debug_line_preview_check():
+    ok = any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules())
+    rules = [rule.rule for rule in app.url_map.iter_rules() if "line" in rule.rule or "calendar" in rule.rule]
+    return {
+        "line_card_preview_registered": ok,
+        "calendar_line_routes": sorted(rules),
+        "message": "如果這裡顯示 true，就可以開 /line-card-preview?date=2026-06-22"
+    }
+
+# =============================================================================
+# LINE 卡片預覽頁：不用真的連 LINE，也可以先看 Flex Message 長相
+# =============================================================================
+@app.route("/line-card-preview", strict_slashes=False)
+@app.route("/line_card_preview", strict_slashes=False)
+@login_required
+def line_card_preview():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    mode = (request.args.get("mode", "day") or "day").strip()
+
+    if mode == "week":
+        start_dt = datetime.strptime(selected_date, "%Y-%m-%d").date()
+        end_date = (start_dt + timedelta(days=6)).strftime("%Y-%m-%d")
+        result = build_calendar_reply_for_range(selected_date, end_date, mode="week")
+        events = fetch_calendar_events(selected_date, end_date, line_only=False)
+        page_title = f"本週行程卡片預覽｜{selected_date} ~ {end_date}"
+        back_query = f"?date={selected_date}&mode=day"
+    else:
+        end_date = selected_date
+        result = build_calendar_reply_for_range(selected_date, selected_date, mode="today")
+        events = fetch_calendar_events(selected_date, selected_date, line_only=False)
+        page_title = f"LINE 行程卡片預覽｜{selected_date}"
+        back_query = f"?date={selected_date}&mode=week"
+
+    settings = get_line_card_settings()
+    flex_json_text = json.dumps(result.get("reply_flex", {}), ensure_ascii=False, indent=2)
+    quick_reply_text = json.dumps(result.get("reply_quick_reply", []), ensure_ascii=False, indent=2)
+
+    return render_template_string("""
+{% extends "base.html" %}
+{% block content %}
+<style>
+  .preview-wrap {display:grid;grid-template-columns:minmax(320px, 430px) 1fr;gap:20px;align-items:start;}
+  .phone-frame {background:#dbeafe;border-radius:32px;padding:18px;box-shadow:0 14px 40px rgba(0,0,0,.12);border:1px solid rgba(255,255,255,.8);}
+  .phone-top {text-align:center;color:#6b7280;font-size:12px;margin-bottom:12px;}
+  .line-area {background:linear-gradient(180deg,#cfe3ff,#eef6ff);border-radius:24px;padding:16px;min-height:640px;overflow:hidden;}
+  .msg-row {display:flex;gap:10px;align-items:flex-start;margin-bottom:12px;}
+  .bot-icon {width:38px;height:38px;border-radius:50%;background:#7A4E2D;color:white;display:flex;align-items:center;justify-content:center;font-size:11px;flex:0 0 auto;}
+  .bot-bubble {background:white;border-radius:18px;padding:10px 14px;font-weight:700;box-shadow:0 4px 16px rgba(0,0,0,.08);}
+  .carousel-preview {display:flex;gap:12px;overflow-x:auto;padding:8px 2px 16px;scroll-snap-type:x mandatory;}
+  .event-card {background:white;border-radius:18px;width:310px;min-width:310px;padding:16px;box-shadow:0 8px 22px rgba(0,0,0,.13);scroll-snap-align:start;}
+  .event-head {display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:10px;}
+  .time-pill {font-weight:800;font-size:15px;}
+  .cat-pill {border-radius:999px;padding:5px 12px;font-size:13px;font-weight:700;background:#fff4df;border:1px solid #f1c27d;}
+  .event-title {font-size:20px;font-weight:900;margin:8px 0 12px;line-height:1.25;}
+  .event-line {font-size:14px;margin:8px 0;color:#374151;display:flex;gap:8px;}
+  .event-line .label {color:#9ca3af;width:44px;flex:0 0 auto;}
+  .event-buttons {display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px;}
+  .mock-btn {border:1px solid #d1d5db;border-radius:10px;text-align:center;padding:8px;font-size:14px;font-weight:700;background:#fff;}
+  .mock-btn.primary {background:{{ settings.button_color or '#C9874A' }};color:white;border-color:{{ settings.button_color or '#C9874A' }};}
+  .json-box {font-family:Consolas,Menlo,monospace;font-size:12px;white-space:pre;max-height:520px;overflow:auto;background:#111827;color:#e5e7eb;border-radius:12px;padding:14px;}
+  @media (max-width: 992px){.preview-wrap{grid-template-columns:1fr}.phone-frame{max-width:460px;margin:auto}.line-area{min-height:560px}}
+</style>
+
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-1">{{ page_title }}</h3>
+    <div class="text-muted small">這裡是本機預覽，不需要部署，也不會真的發送到 LINE。</div>
+  </div>
+  <div class="d-flex gap-2 flex-wrap">
+    <form method="get" action="{{ url_for('line_card_preview') }}" class="d-flex gap-2">
+      <input type="date" name="date" value="{{ selected_date }}" class="form-control">
+      <input type="hidden" name="mode" value="{{ mode }}">
+      <button class="btn btn-outline-secondary" type="submit">切換日期</button>
+    </form>
+    <a class="btn btn-outline-primary" href="{{ url_for('line_card_preview') }}{{ back_query }}">{{ '看單日' if mode == 'week' else '看本週' }}</a>
+    <a class="btn btn-primary" href="{{ url_for('calendar_page', date=selected_date) }}">回行事曆</a>
+  </div>
+</div>
+
+<div class="preview-wrap">
+  <div class="phone-frame">
+    <div class="phone-top">LINE Bot 預覽</div>
+    <div class="line-area">
+      <div class="msg-row">
+        <div class="bot-icon">Team<br>ME</div>
+        <div class="bot-bubble">📅 {{ result.reply_text }}</div>
+      </div>
+
+      <div class="carousel-preview">
+        {% if events %}
+          {% for e in events[:12] %}
+            <div class="event-card">
+              <div class="event-head">
+                <div class="time-pill" style="color:{{ e.category_color or settings.primary_color or '#C9874A' }};">📅 {{ e.event_date }}</div>
+                <div class="cat-pill">{{ e.category or '行程' }}</div>
+              </div>
+              <div class="event-line" style="font-weight:700;color:#6b7280;"><span class="label">時間</span><span>{{ e.start_time }} - {{ e.end_time }}</span></div>
+              <div class="event-title">{{ e.title or '未命名行程' }}</div>
+              {% if settings.show_customer %}<div class="event-line"><span class="label">客戶</span><span>{{ e.customer_name or '-' }}</span></div>{% endif %}
+              {% if settings.show_phone %}<div class="event-line"><span class="label">電話</span><span>{{ e.phone or '-' }}</span></div>{% endif %}
+              {% if settings.show_location %}<div class="event-line"><span class="label">地點</span><span>{{ e.location or '-' }}</span></div>{% endif %}
+              {% if settings.show_note %}<div class="event-line"><span class="label">備註</span><span>{{ e.note or '-' }}</span></div>{% endif %}
+              <div class="event-buttons">
+                <div class="mock-btn primary">查看詳情</div>
+                <div class="mock-btn">查看地圖</div>
+              </div>
+            </div>
+          {% endfor %}
+        {% else %}
+          <div class="event-card">
+            <div class="event-title">目前沒有行程</div>
+            <div class="event-line"><span>可以先到行事曆新增一筆行程，再回來預覽。</span></div>
+            <div class="event-buttons"><div class="mock-btn primary">新增行程格式</div></div>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card mb-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <strong>Flex Message JSON</strong>
+        <span class="badge bg-secondary">可貼到 LINE Flex Simulator</span>
+      </div>
+      <div class="card-body">
+        <div class="json-box">{{ flex_json_text }}</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><strong>Quick Reply JSON</strong></div>
+      <div class="card-body"><div class="json-box" style="max-height:220px;">{{ quick_reply_text }}</div></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+    """,
+    selected_date=selected_date,
+    mode=mode,
+    end_date=end_date,
+    result=result,
+    events=events,
+    settings=settings,
+    flex_json_text=flex_json_text,
+    quick_reply_text=quick_reply_text,
+    page_title=page_title,
+    back_query=back_query,
+    )
+
+if __name__ == "__main__":
+    print("✅ FULL_READY_20260621 已載入")
+    print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
+    print("✅ 可用 /debug/routes 檢查目前所有 route")
+    app.run(debug=True)
