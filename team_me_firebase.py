@@ -14114,7 +14114,21 @@ def _build_record_flex_bubble(record_type: str, record_id: str, data: dict, titl
     else:
         msg_text = f"#開發追蹤\nID: {record_id}\n內容: "
         msg_label = "回覆開發"
-    btns.append({"type": "button", "style": "secondary", "height": "sm", "action": {"type": "message", "label": msg_label, "text": msg_text}})
+    # LINE 的 message action 會「直接送出」，無法讓同仁繼續打字；
+    # 改用 postback + inputOption=openKeyboard + fillInText，點「回覆追蹤」後會開啟鍵盤，
+    # 文字先帶入輸入框，同仁補上內容再送出，送出後會被原本 #買方追蹤/#賣方追蹤/#開發追蹤 parser 寫回後台。
+    btns.append({
+        "type": "button",
+        "style": "secondary",
+        "height": "sm",
+        "action": {
+            "type": "postback",
+            "label": msg_label,
+            "data": f"action=followup_input&record_type={record_type}&record_id={record_id}",
+            "inputOption": "openKeyboard",
+            "fillInText": msg_text,
+        },
+    })
 
     return {
         "type": "bubble",
@@ -14392,6 +14406,49 @@ def todos_delete(todo_id):
 
 # =============================================================================
 # 後台 BUG 修正 + 新增功能 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# 追蹤回覆輸入修正 + 開發傳群組穩定修正 Patch v20260621C
+# =============================================================================
+
+# 讓 LINE postback「回覆追蹤」按鈕只負責打開鍵盤/預填文字，不需要另外回覆。
+def process_line_postback_event(event):
+    try:
+        postback = event.get("postback") or {}
+        data = postback.get("data", "")
+        if "followup_input" in data:
+            return {"handled": True, "ok": True, "reply_text": ""}
+    except Exception:
+        pass
+    return {"handled": False}
+
+
+# 如果原本 webhook 有處理 event 但沒處理 postback，這裡只補一個安全 helper；
+# 主要輸入寫回仍然是使用者補完 #買方追蹤/#賣方追蹤/#開發追蹤 後送出的文字。
+
+
+# 重新覆蓋開發傳群組，避免開發頁按鈕因 referrer 或資料欄位缺漏出錯。
+def development_send_to_line_fixed(development_id):
+    try:
+        res = _push_record_to_group("development", development_id, title_prefix="後台傳送")
+        if res.get("ok"):
+            flash("已傳送到 LINE 群組", "success")
+        else:
+            flash(f"傳送失敗：{res.get('error') or res.get('text') or res}", "danger")
+    except Exception as e:
+        print("⚠️ 開發傳到群組失敗：", e)
+        flash(f"傳送失敗：{e}", "danger")
+    return redirect(request.referrer or url_for("development_detail", development_id=development_id))
+
+try:
+    app.view_functions["development_send_to_line"] = login_required(development_send_to_line_fixed)
+except Exception as e:
+    print("⚠️ 套用 development_send_to_line_fixed 失敗：", e)
+
+# =============================================================================
+# 追蹤回覆輸入修正 + 開發傳群組穩定修正 Patch End
 # =============================================================================
 
 

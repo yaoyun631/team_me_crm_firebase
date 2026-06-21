@@ -224,12 +224,9 @@
 
                 <button class="btn btn-sm btn-outline-primary quick-flow-btn" type="submit">存</button>
                 <a href="{{ url_for('development_detail', development_id=d.id) }}" class="btn btn-sm btn-outline-primary quick-flow-btn">詳細 / 追蹤</a>
-                <a href="{{ url_for('calendar_new', related_type='development', related_id=d.id, title=((d.name or d.address or '開發') ~ ' 開發追蹤'), customer_name=d.name, phone=d.phone, location=(d.address or d.registered_address), note=d.note) }}" class="btn btn-sm btn-outline-success quick-flow-btn">加行事曆</a>
-                <button form="send-development-line-{{ d.id }}" type="submit" class="btn btn-sm btn-outline-info quick-flow-btn">傳群組</button>
                 <button form="delete-development-{{ d.id }}" type="submit" class="btn btn-sm btn-outline-danger quick-flow-btn">刪除</button>
               </div>
             </form>
-            <form id="send-development-line-{{ d.id }}" method="post" action="{{ url_for('development_send_to_line', development_id=d.id) }}"></form>
             <form id="delete-development-{{ d.id }}" method="post" action="{{ url_for('development_delete', development_id=d.id) }}" onsubmit="return confirm('確定要刪除這筆開發與相關追蹤紀錄嗎？');"></form>
           </div>
         </div>

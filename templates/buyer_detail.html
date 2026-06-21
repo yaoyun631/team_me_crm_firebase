@@ -111,7 +111,7 @@
 <div class="row">
   <div class="col-md-6 mb-4">
     <h4 class="mb-3">新增追蹤紀錄</h4>
-    <form method="post" action="{{ url_for('add_buyer_followup', buyer_id=buyer.id) }}">
+    <form id="followupForm" method="post" action="{{ url_for('add_buyer_followup', buyer_id=buyer.id) }}">
       <div class="mb-3">
         <label class="form-label">聯絡時間（不填則用現在）</label>
         <input type="datetime-local" name="contact_time" class="form-control">
@@ -119,13 +119,13 @@
 
       <div class="mb-3">
         <label class="form-label">聯絡方式</label>
-        <input type="text" name="channel" class="form-control"
+        <input id="followupChannel" type="text" name="channel" class="form-control"
                placeholder="電話 / LINE / 簡訊 / 現場…">
       </div>
 
       <div class="mb-3">
         <label class="form-label">聯絡內容紀錄</label>
-        <textarea name="content" class="form-control" rows="3"
+        <textarea id="followupContent" name="content" class="form-control" rows="3"
                   placeholder="聊了什麼？客戶反應如何？"></textarea>
       </div>
 
@@ -165,6 +165,10 @@
                   class="btn btn-sm btn-outline-secondary me-1">
                   編輯
                 </a>
+                <button type="button"
+                        class="btn btn-sm btn-outline-primary me-1 js-reply-followup"
+                        data-channel="{{ f.channel or 'LINE' }}"
+                        data-reply="回覆 {{ f.contact_time or '' }} 追蹤：">回覆追蹤</button>
                 <form method="post"
                       action="{{ url_for('buyer_followup_delete', buyer_id=buyer.id, followup_id=f.id) }}"
                       style="display:inline;"
@@ -235,6 +239,38 @@
 </div>
 {% endif %}
 
+
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  const buttons = document.querySelectorAll('.js-reply-followup');
+  const content = document.getElementById('followupContent');
+  const channel = document.getElementById('followupChannel');
+  const form = document.getElementById('followupForm');
+
+  buttons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (!content || !form) return;
+      const prefix = btn.dataset.reply || '回覆追蹤：';
+      const channelValue = btn.dataset.channel || 'LINE';
+      if (channel && !channel.value) {
+        channel.value = channelValue;
+      }
+      if (!content.value.trim()) {
+        content.value = prefix + '\n';
+      } else {
+        content.value = content.value.trim() + '\n\n' + prefix + '\n';
+      }
+      form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setTimeout(function () {
+        content.focus();
+        content.selectionStart = content.selectionEnd = content.value.length;
+      }, 350);
+    });
+  });
+});
+</script>
+
 {% endblock %}
 {% block scripts %}
 <script>
@@ -286,4 +322,36 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 });
 </script>
+
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  const buttons = document.querySelectorAll('.js-reply-followup');
+  const content = document.getElementById('followupContent');
+  const channel = document.getElementById('followupChannel');
+  const form = document.getElementById('followupForm');
+
+  buttons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (!content || !form) return;
+      const prefix = btn.dataset.reply || '回覆追蹤：';
+      const channelValue = btn.dataset.channel || 'LINE';
+      if (channel && !channel.value) {
+        channel.value = channelValue;
+      }
+      if (!content.value.trim()) {
+        content.value = prefix + '\n';
+      } else {
+        content.value = content.value.trim() + '\n\n' + prefix + '\n';
+      }
+      form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setTimeout(function () {
+        content.focus();
+        content.selectionStart = content.selectionEnd = content.value.length;
+      }, 350);
+    });
+  });
+});
+</script>
+
 {% endblock %}

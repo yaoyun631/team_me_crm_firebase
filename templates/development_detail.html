@@ -1,12 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3">
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <h3 class="mb-0">開發詳細資料</h3>
-  <div>
-    
-    <a href="{{ url_for('calendar_new', related_type='development', related_id=development.id, title=((development.name or development.address or '開發') ~ ' 開發追蹤'), customer_name=development.name, phone=development.phone, location=(development.address or development.registered_address), note=development.note) }}" class="btn btn-outline-success me-2">加入行事曆</a>
-    <form method="post" action="{{ url_for('development_send_to_line', development_id=development.id) }}" style="display:inline;"><button type="submit" class="btn btn-outline-info me-2">傳到群組</button></form>
-    <a href="{{ url_for('development_edit', development_id=development.id) }}" class="btn btn-warning me-2">編輯資料</a>
+  <div class="d-flex justify-content-end align-items-center flex-wrap gap-2">
+    <a href="{{ url_for('calendar_new', related_type='development', related_id=development.id, title=((development.name or development.address or '開發') ~ ' 開發追蹤'), customer_name=development.name, phone=development.phone, location=(development.address or development.registered_address), note=development.note) }}" class="btn btn-outline-success">加入行事曆</a>
+    <form method="post" action="{{ url_for('development_send_to_line', development_id=development.id) }}" class="m-0" onsubmit="return confirm('確定要把這筆開發資料傳到 LINE 群組嗎？');">
+      <button type="submit" class="btn btn-outline-info">傳到群組</button>
+    </form>
+    <a href="{{ url_for('development_edit', development_id=development.id) }}" class="btn btn-warning">編輯資料</a>
     <a href="{{ session.get('developments_return_url') or url_for('developments') }}" class="btn btn-secondary">返回列表</a>
   </div>
 </div>
@@ -41,9 +42,9 @@
 <div class="row">
   <div class="col-md-6 mb-4">
     <h4 class="mb-3">新增追蹤紀錄</h4>
-    <form method="post" action="{{ url_for('add_development_followup', development_id=development.id) }}">
+    <form id="followupForm" method="post" action="{{ url_for('add_development_followup', development_id=development.id) }}">
       <div class="mb-3"><label class="form-label">聯絡時間（不填則用現在）</label><input type="datetime-local" name="contact_time" class="form-control"></div>
-      <div class="mb-3"><label class="form-label">聯絡方式</label><input type="text" name="channel" class="form-control" placeholder="電話 / LINE / 寄信 / 現場"></div>
+      <div class="mb-3"><label class="form-label">聯絡方式</label><input id="followupChannel" type="text" name="channel" class="form-control" placeholder="電話 / LINE / 寄信 / 現場"></div>
       <div class="mb-3"><label class="form-label">目前狀態</label>
         <select name="current_stage" class="form-select">
           <option value="">不變更</option>
@@ -62,7 +63,7 @@
       </div>
       <div class="mb-3"><label class="form-label">下次日期</label><input type="date" name="next_action_date" class="form-control"></div>
       <div class="mb-3"><label class="form-label">戶籍地址（可選）</label><input type="text" name="registered_address" class="form-control"></div>
-      <div class="mb-3"><label class="form-label">聯絡內容紀錄</label><textarea name="content" class="form-control" rows="3"></textarea></div>
+      <div class="mb-3"><label class="form-label">聯絡內容紀錄</label><textarea id="followupContent" name="content" class="form-control" rows="3"></textarea></div>
       <button type="submit" class="btn btn-primary">新增紀錄</button>
     </form>
   </div>
@@ -83,6 +84,10 @@
                 <small class="text-muted d-block mb-1">KEYIN：{{ f.created_by_name or "-" }}</small>
                 {% if f.sender_display_name %}<small class="text-muted d-block mb-1">留言者：{{ f.sender_display_name }}</small>{% endif %}
                 <a href="{{ url_for('development_followup_edit', development_id=development.id, followup_id=f.id) }}" class="btn btn-sm btn-outline-secondary me-1">編輯</a>
+                <button type="button"
+                        class="btn btn-sm btn-outline-primary me-1 js-reply-followup"
+                        data-channel="{{ f.channel or 'LINE' }}"
+                        data-reply="回覆 {{ f.contact_time or '' }} 追蹤：">回覆追蹤</button>
                 <form method="post" action="{{ url_for('development_followup_delete', development_id=development.id, followup_id=f.id) }}" style="display:inline;" onsubmit="return confirm('確定要刪除這筆追蹤紀錄嗎？');">
                   <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
                 </form>
@@ -102,4 +107,36 @@
     {% endif %}
   </div>
 </div>
+
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  const buttons = document.querySelectorAll('.js-reply-followup');
+  const content = document.getElementById('followupContent');
+  const channel = document.getElementById('followupChannel');
+  const form = document.getElementById('followupForm');
+
+  buttons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (!content || !form) return;
+      const prefix = btn.dataset.reply || '回覆追蹤：';
+      const channelValue = btn.dataset.channel || 'LINE';
+      if (channel && !channel.value) {
+        channel.value = channelValue;
+      }
+      if (!content.value.trim()) {
+        content.value = prefix + '\n';
+      } else {
+        content.value = content.value.trim() + '\n\n' + prefix + '\n';
+      }
+      form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setTimeout(function () {
+        content.focus();
+        content.selectionStart = content.selectionEnd = content.value.length;
+      }, 350);
+    });
+  });
+});
+</script>
+
 {% endblock %}
