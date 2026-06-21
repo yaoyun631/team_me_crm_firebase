@@ -160,6 +160,11 @@
                         {% if e.line_enabled %}
                           <span class="badge bg-success ms-1">LINE</span>
                         {% endif %}
+                        {% if e.visibility == 'public' %}
+                          <span class="badge bg-info text-dark ms-1">公開</span>
+                        {% else %}
+                          <span class="badge bg-secondary ms-1">個人</span>
+                        {% endif %}
                       </div>
                     </div>
 
@@ -200,6 +205,9 @@
                     {% if e.location %}
                       <a class="btn btn-sm btn-outline-success" target="_blank" href="https://www.google.com/maps/search/?api=1&query={{ e.location|urlencode }}">地圖</a>
                     {% endif %}
+                    <form method="post" action="{{ url_for('calendar_send_to_line', event_id=e.id) }}">
+                      <button type="submit" class="btn btn-sm btn-outline-info">傳到群組</button>
+                    </form>
                   </div>
                 </div>
               </td>

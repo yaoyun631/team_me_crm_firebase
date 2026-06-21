@@ -12,7 +12,7 @@
       <div class="mb-3"><label class="form-label">網址</label><input type="text" name="url" class="form-control" value="{{ development.url or '' }}"></div>
       <div class="mb-3"><label class="form-label">目前狀態</label>
         <select name="current_stage" class="form-select">
-          {% for opt in status_options %}
+          {% for opt in (status_options or development_current_stage_options or []) %}
             <option value="{{ opt }}" {% if (development.current_stage or development.stage) == opt %}selected{% endif %}>{{ opt }}</option>
           {% endfor %}
         </select>
@@ -20,7 +20,7 @@
       <div class="mb-3"><label class="form-label">下一動作</label>
         <select name="next_action" class="form-select">
           <option value="">請選擇</option>
-          {% for opt in next_action_options %}
+          {% for opt in (next_action_options or development_next_action_options or []) %}
             <option value="{{ opt }}" {% if development.next_action == opt %}selected{% endif %}>{{ opt }}</option>
           {% endfor %}
         </select>

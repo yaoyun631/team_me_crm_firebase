@@ -1734,7 +1734,7 @@ def buyer_edit(buyer_id):
             "other_background": form.get("other_background", "").strip(),
             "note": form.get("note", "").strip(),
             "labels": labels,
-            "stage": form.get("stage", "").strip(),  # 接觸/帶看/斡旋/成交
+            "stage": form.get("stage", "").strip() or buyer.get("stage", ""),  # 保留最後狀態
             "updated_at": now_taipei().isoformat(),
             "updated_by_id": session.get("user_id"),
             "updated_by_name": session.get("user_name"),
@@ -2120,7 +2120,7 @@ def seller_edit(seller_id):
             "address": form.get("address", "").strip(),
             "property_type": form.get("property_type", "").strip(),
             "level": form.get("level", "").strip(),
-            "stage": form.get("stage", "").strip(),  # 開發中 / 委託中 / 成交
+            "stage": form.get("stage", "").strip() or seller.get("stage", ""),  # 保留最後狀態
             "reason": form.get("reason", "").strip(),
             "expected_price": form.get("expected_price", "").strip(),
             "min_price": form.get("min_price", "").strip(),
@@ -12465,6 +12465,7 @@ DEFAULT_LINE_CARD_SETTINGS = {
     "calendar_end_hour": 22,
     "line_only_enabled_events": False,
     "quick_actions": ["新增行程", "今日行程", "本週行程", "客戶查詢", "設定提醒"],
+    "notify_target_id": "",
 }
 
 
@@ -12573,6 +12574,7 @@ def save_line_card_settings_from_form(form):
         "calendar_start_hour": start_hour,
         "calendar_end_hour": end_hour,
         "quick_actions": quick_actions,
+        "notify_target_id": (form.get("notify_target_id", "") or "").strip(),
         "updated_at": now_taipei().isoformat(),
         "updated_by_id": session.get("user_id", ""),
         "updated_by_name": session.get("user_name", ""),
@@ -12588,6 +12590,9 @@ def doc_to_calendar_event(doc):
     data["event_date"] = calendar_safe_date(data.get("event_date"))
     data["event_date_label"] = format_calendar_date_label(data.get("event_date"))
     data["category"] = data.get("category") or "其他"
+    data["custom_category"] = data.get("custom_category") or ""
+    data["display_category"] = data.get("display_category") or (data["custom_category"] if data["category"] == "其他" and data["custom_category"] else data["category"])
+    data["visibility"] = data.get("visibility") or "public"
     data["category_color"] = data.get("category_color") or CALENDAR_CATEGORY_COLOR_MAP.get(data["category"], "#8B8B8B")
     return data
 
@@ -12608,6 +12613,13 @@ def fetch_calendar_events(start_date: str, end_date: str = None, line_only: bool
             item = doc_to_calendar_event(d)
             if line_only and not item.get("line_enabled", True):
                 continue
+            # 後台登入時：個人行程只給本人看，公開行程所有人可看；舊資料無 owner/visibility 時保留顯示。
+            if not line_only:
+                vis = item.get("visibility") or "public"
+                owner = item.get("owner_user_id") or ""
+                uid = session.get("user_id", "") if request else ""
+                if vis == "personal" and owner and uid and owner != uid:
+                    continue
             events.append(item)
     except Exception as e:
         print("⚠️ Firestore 日期區間查詢失敗，改用備援讀取：", e)
@@ -12617,6 +12629,12 @@ def fetch_calendar_events(start_date: str, end_date: str = None, line_only: bool
                 if start_date <= item.get("event_date", "") <= end_date:
                     if line_only and not item.get("line_enabled", True):
                         continue
+                    if not line_only:
+                        vis = item.get("visibility") or "public"
+                        owner = item.get("owner_user_id") or ""
+                        uid = session.get("user_id", "") if request else ""
+                        if vis == "personal" and owner and uid and owner != uid:
+                            continue
                     events.append(item)
         except Exception as e2:
             print("❌ 讀取行事曆失敗：", e2)
@@ -12689,12 +12707,23 @@ def build_calendar_event_payload(form, existing=None):
     if category not in CALENDAR_CATEGORY_OPTIONS:
         category = "其他"
 
+    custom_category = (form.get("custom_category", "") or existing.get("custom_category", "") or "").strip()
+    display_category = custom_category if category == "其他" and custom_category else category
+    visibility = (form.get("visibility", "") or existing.get("visibility") or "personal").strip()
+    if visibility not in ("personal", "public"):
+        visibility = "personal"
+
     payload = {
         "title": (form.get("title", "") or "").strip(),
         "event_date": event_date,
         "start_time": start_time,
         "end_time": end_time,
         "category": category,
+        "custom_category": custom_category,
+        "display_category": display_category,
+        "visibility": visibility,
+        "owner_user_id": existing.get("owner_user_id") or session.get("user_id", ""),
+        "owner_user_name": existing.get("owner_user_name") or session.get("user_name", ""),
         "category_color": CALENDAR_CATEGORY_COLOR_MAP.get(category, "#8B8B8B"),
         "related_type": (form.get("related_type", "") or "").strip(),
         "related_id": (form.get("related_id", "") or "").strip(),
@@ -13317,7 +13346,7 @@ def calendar_event_edit_url(event):
 
 def build_calendar_event_bubble(event, settings=None):
     settings = settings or get_line_card_settings()
-    category = event.get("category") or "行程"
+    category = event.get("display_category") or event.get("category") or "行程"
     category_color = event.get("category_color") or CALENDAR_CATEGORY_COLOR_MAP.get(category, settings.get("primary_color", "#C9874A"))
     title = event.get("title") or f"{category}行程"
     raw_date_text = event.get("event_date", "") or ""
@@ -13952,6 +13981,419 @@ def line_card_preview():
     back_query=back_query,
     calendar_related_button_label=calendar_related_button_label,
     )
+
+
+# =============================================================================
+# 後台 BUG 修正 + 群組推播 + 待辦事項後台 + 卡片加入行事曆 Patch v20260621B
+# =============================================================================
+from urllib.parse import urlencode as _urlencode
+
+
+def _crm_keep_status(form_value, existing_value, fallback=""):
+    value = (form_value or "").strip()
+    if value:
+        return value
+    return (existing_value or fallback or "").strip()
+
+
+def _crm_line_notify_target_id():
+    target = (os.environ.get("LINE_NOTIFY_TARGET_ID") or "").strip()
+    if target:
+        return target
+    try:
+        settings = get_line_card_settings()
+        return (settings.get("notify_target_id") or settings.get("line_notify_target_id") or "").strip()
+    except Exception:
+        return ""
+
+
+def line_push_messages(target_id: str, messages: list):
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return {"ok": False, "error": "LINE_CHANNEL_ACCESS_TOKEN 未設定"}
+    if not target_id:
+        return {"ok": False, "error": "LINE_NOTIFY_TARGET_ID 未設定"}
+    try:
+        import requests
+        res = requests.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers=line_api_headers(),
+            json={"to": target_id, "messages": messages[:5]},
+            timeout=8,
+        )
+        print("LINE push status:", res.status_code, res.text[:300])
+        return {"ok": 200 <= res.status_code < 300, "status_code": res.status_code, "text": res.text[:500]}
+    except Exception as e:
+        print("⚠️ LINE push 發生錯誤：", e)
+        return {"ok": False, "error": str(e)}
+
+
+def _crm_public_url_for(path, **params):
+    if params:
+        qs = _urlencode({k: v for k, v in params.items() if v is not None and str(v) != ""})
+        path = path + (("&" if "?" in path else "?") + qs if qs else "")
+    return build_app_url(path)
+
+
+def _record_calendar_params(record_type: str, record_id: str, data: dict):
+    record_type = record_type or ""
+    name = data.get("name") or data.get("customer_name") or ""
+    phone = data.get("phone") or ""
+    location = data.get("address") or data.get("preferred_areas") or data.get("registered_address") or ""
+    if record_type == "buyer":
+        title = f"{name} 客需追蹤".strip()
+        note = data.get("note") or data.get("requirement_must") or data.get("preferred_areas") or ""
+        category = "回電"
+    elif record_type == "seller":
+        title = f"{name} 委託追蹤".strip()
+        note = data.get("note") or data.get("reason") or ""
+        category = "回電"
+    else:
+        title = f"{name or data.get('address') or '開發'} 開發追蹤".strip()
+        note = data.get("note") or data.get("next_action") or ""
+        category = "開發"
+    return {
+        "related_type": record_type,
+        "related_id": record_id,
+        "title": title,
+        "category": category,
+        "customer_name": name,
+        "phone": phone,
+        "location": location,
+        "note": note,
+    }
+
+
+def _record_calendar_url(record_type: str, record_id: str, data: dict):
+    params = _record_calendar_params(record_type, record_id, data)
+    return _crm_public_url_for("/calendar/new", **params)
+
+
+def _record_edit_url(record_type: str, record_id: str):
+    if record_type == "buyer":
+        return _crm_public_url_for(f"/buyers/{record_id}/edit")
+    if record_type == "seller":
+        return _crm_public_url_for(f"/sellers/{record_id}/edit")
+    if record_type == "development":
+        return _crm_public_url_for(f"/developments/{record_id}/edit")
+    return build_app_url("/")
+
+
+def _record_detail_url(record_type: str, record_id: str):
+    if record_type == "buyer":
+        return _crm_public_url_for(f"/buyers/{record_id}")
+    if record_type == "seller":
+        return _crm_public_url_for(f"/sellers/{record_id}")
+    if record_type == "development":
+        return _crm_public_url_for(f"/developments/{record_id}")
+    return build_app_url("/")
+
+
+def _build_record_flex_bubble(record_type: str, record_id: str, data: dict, title_prefix="CRM 資料"):
+    label_map = {"buyer": "客需", "seller": "委託", "development": "開發"}
+    label = label_map.get(record_type, "CRM")
+    name = data.get("name") or "未填姓名"
+    phone = data.get("phone") or "-"
+    source = data.get("source") or "-"
+    status = data.get("current_stage") or data.get("stage") or "-"
+    next_action = data.get("next_action") or "-"
+    area = data.get("preferred_areas") or data.get("address") or data.get("registered_address") or "-"
+    note = data.get("note") or data.get("requirement_must") or "-"
+
+    btns = [
+        {"type": "button", "style": "primary", "height": "sm", "color": "#C9874A", "action": {"type": "uri", "label": f"編輯{label}", "uri": _record_edit_url(record_type, record_id)}},
+        {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "uri", "label": "加入行事曆", "uri": _record_calendar_url(record_type, record_id, data)}},
+        {"type": "button", "style": "secondary", "height": "sm", "action": {"type": "uri", "label": "查看後台", "uri": _record_detail_url(record_type, record_id)}},
+    ]
+    # 在群組點這個按鈕會丟出可被機器人解析的格式，方便群組快速回覆/追蹤。
+    if record_type == "buyer":
+        msg_text = f"#買方追蹤\n客戶ID: {record_id}\n內容: "
+        msg_label = "回覆追蹤"
+    elif record_type == "seller":
+        msg_text = f"#賣方追蹤\n客戶ID: {record_id}\n內容: "
+        msg_label = "回覆追蹤"
+    else:
+        msg_text = f"#開發追蹤\nID: {record_id}\n內容: "
+        msg_label = "回覆開發"
+    btns.append({"type": "button", "style": "secondary", "height": "sm", "action": {"type": "message", "label": msg_label, "text": msg_text}})
+
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": f"{title_prefix}｜{label}", "size": "xs", "color": "#C9874A", "weight": "bold"},
+            {"type": "text", "text": line_truncate(name, 45), "size": "lg", "weight": "bold", "wrap": True, "color": "#222222"},
+            {"type": "separator", "margin": "md"},
+            {"type": "box", "layout": "vertical", "spacing": "sm", "margin": "md", "contents": [
+                flex_info_row("電話", phone),
+                flex_info_row("來源", source),
+                flex_info_row("狀態", status),
+                flex_info_row("下一步", next_action),
+                flex_info_row("區域/地址", area),
+                flex_info_row("備註", note),
+            ]},
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": btns[:4]},
+        "styles": {"footer": {"separator": True}},
+    }
+
+
+def _push_record_to_group(record_type: str, record_id: str, title_prefix="CRM 資料"):
+    coll = {"buyer": "buyers", "seller": "sellers", "development": "developments"}.get(record_type)
+    if not coll:
+        return {"ok": False, "error": "record_type 不正確"}
+    snap = db.collection(coll).document(record_id).get()
+    if not snap.exists:
+        return {"ok": False, "error": "找不到資料"}
+    data = snap.to_dict() or {}
+    bubble = _build_record_flex_bubble(record_type, record_id, data, title_prefix=title_prefix)
+    return line_push_messages(_crm_line_notify_target_id(), [{"type": "flex", "altText": f"{title_prefix}：{data.get('name','')}", "contents": bubble}])
+
+
+def _push_calendar_event_to_group(event_id: str, title_prefix="行程資料"):
+    snap = db.collection(CALENDAR_EVENT_COLLECTION).document(event_id).get()
+    if not snap.exists:
+        return {"ok": False, "error": "找不到行程"}
+    event = doc_to_calendar_event(snap)
+    bubble = build_calendar_event_bubble(event)
+    return line_push_messages(_crm_line_notify_target_id(), [{"type": "flex", "altText": f"{title_prefix}：{event.get('title','')}", "contents": bubble}])
+
+
+@app.route("/buyers/<buyer_id>/send-to-line", methods=["POST"])
+@login_required
+def buyer_send_to_line(buyer_id):
+    res = _push_record_to_group("buyer", buyer_id, title_prefix="後台傳送")
+    flash("已傳送到 LINE 群組" if res.get("ok") else f"傳送失敗：{res.get('error') or res.get('text')}", "success" if res.get("ok") else "danger")
+    return redirect(request.referrer or url_for("buyer_detail", buyer_id=buyer_id))
+
+
+@app.route("/sellers/<seller_id>/send-to-line", methods=["POST"])
+@login_required
+def seller_send_to_line(seller_id):
+    res = _push_record_to_group("seller", seller_id, title_prefix="後台傳送")
+    flash("已傳送到 LINE 群組" if res.get("ok") else f"傳送失敗：{res.get('error') or res.get('text')}", "success" if res.get("ok") else "danger")
+    return redirect(request.referrer or url_for("seller_detail", seller_id=seller_id))
+
+
+@app.route("/developments/<development_id>/send-to-line", methods=["POST"])
+@login_required
+def development_send_to_line(development_id):
+    res = _push_record_to_group("development", development_id, title_prefix="後台傳送")
+    flash("已傳送到 LINE 群組" if res.get("ok") else f"傳送失敗：{res.get('error') or res.get('text')}", "success" if res.get("ok") else "danger")
+    return redirect(request.referrer or url_for("development_detail", development_id=development_id))
+
+
+@app.route("/calendar/<event_id>/send-to-line", methods=["POST"])
+@login_required
+def calendar_send_to_line(event_id):
+    res = _push_calendar_event_to_group(event_id, title_prefix="後台傳送行程")
+    flash("已傳送行程到 LINE 群組" if res.get("ok") else f"傳送失敗：{res.get('error') or res.get('text')}", "success" if res.get("ok") else "danger")
+    return redirect(request.referrer or url_for("calendar_page"))
+
+
+@app.after_request
+def _backend_update_notify_group(response):
+    # 後台編輯 / 新增追蹤後，自動推送到群組。沒有設定 target id 時會安靜略過。
+    try:
+        if request.method != "POST" or response.status_code not in (200, 302, 303):
+            return response
+        if not _crm_line_notify_target_id():
+            return response
+        endpoint = request.endpoint or ""
+        path = request.path or ""
+        m = None
+        if endpoint in ("buyer_edit", "add_buyer_followup"):
+            m = re.search(r"/buyers/([^/]+)", path)
+            if m:
+                _push_record_to_group("buyer", m.group(1), title_prefix="後台更新")
+        elif endpoint in ("seller_edit", "add_seller_followup"):
+            m = re.search(r"/sellers/([^/]+)", path)
+            if m:
+                _push_record_to_group("seller", m.group(1), title_prefix="後台更新")
+        elif endpoint in ("development_edit", "add_development_followup"):
+            m = re.search(r"/developments/([^/]+)", path)
+            if m:
+                _push_record_to_group("development", m.group(1), title_prefix="後台更新")
+        elif endpoint == "calendar_edit":
+            m = re.search(r"/calendar/([^/]+)/edit", path)
+            if m:
+                _push_calendar_event_to_group(m.group(1), title_prefix="行程更新")
+    except Exception as e:
+        print("⚠️ 後台更新推播失敗：", e)
+    return response
+
+
+# 讓 /calendar/new 可以吃客需/委託/開發卡片帶入的 query string。
+def calendar_new_prefill():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    default_start = calendar_safe_time(request.args.get("start", ""), "09:00")
+    default_end = calendar_safe_time(request.args.get("end", ""), next_30_min_time(default_start))
+
+    if request.method == "POST":
+        payload = build_calendar_event_payload(request.form)
+        payload.update({
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": session.get("user_id", ""),
+            "created_by_name": session.get("user_name", ""),
+        })
+        doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).add(payload)[1]
+        flash("已新增行程", "success")
+        if _crm_line_notify_target_id():
+            try:
+                _push_calendar_event_to_group(doc_ref.id, title_prefix="新增行程")
+            except Exception as e:
+                print("⚠️ 新增行程推播失敗：", e)
+        return redirect(url_for("calendar_page", date=payload["event_date"]))
+
+    prefill = {}
+    for key in ("title", "category", "custom_category", "related_type", "related_id", "customer_name", "phone", "location", "note", "visibility"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            prefill[key] = value
+    if prefill:
+        prefill["event_date"] = selected_date
+        prefill["start_time"] = default_start
+        prefill["end_time"] = default_end
+        prefill["line_enabled"] = True
+    return render_template(
+        "calendar_form.html",
+        event=prefill if prefill else None,
+        selected_date=selected_date,
+        default_start=default_start,
+        default_end=default_end,
+        slots=build_30_min_slots(),
+        category_options=CALENDAR_CATEGORY_OPTIONS,
+    )
+
+# 覆蓋原本 calendar_new endpoint，但保留原本 URL rule。
+app.view_functions["calendar_new"] = login_required(calendar_new_prefill)
+
+
+# 修正 development edit：表單沒有送 current_stage 時保留原本最後狀態，並補齊 template 變數名稱。
+def development_edit_fixed(development_id):
+    doc_ref = db.collection("developments").document(development_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        flash("找不到這筆開發", "danger")
+        return redirect(url_for("developments"))
+    development = doc_to_dict(doc)
+    if request.method == "POST":
+        form = request.form
+        current_stage = normalize_development_status(_crm_keep_status(form.get("current_stage") or form.get("stage"), development.get("current_stage") or development.get("stage"), "待聯繫"))
+        next_action = normalize_development_next_action(_crm_keep_status(form.get("next_action"), development.get("next_action"), ""))
+        next_action_date = (form.get("next_action_date", "") or development.get("next_action_date", "") or "").strip()
+        updated = {
+            "name": form.get("name", "").strip() or development.get("name") or "未填姓名",
+            "phone": form.get("phone", "").strip(),
+            "source": form.get("source", "").strip(),
+            "address": form.get("address", "").strip(),
+            "registered_address": form.get("registered_address", "").strip(),
+            "url": form.get("url", "").strip(),
+            "current_stage": current_stage,
+            "stage": current_stage,
+            "next_action": next_action,
+            "next_action_date": next_action_date,
+            "note": form.get("note", "").strip(),
+            "updated_at": now_taipei().isoformat(),
+            "updated_by_id": session.get("user_id"),
+            "updated_by_name": session.get("user_name"),
+        }
+        doc_ref.update(updated)
+        flash("已更新開發資料", "success")
+        return redirect(url_for("development_detail", development_id=development_id))
+    return render_template(
+        "development_edit.html",
+        development=development,
+        status_options=DEVELOPMENT_STATUS_OPTIONS,
+        next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+    )
+
+app.view_functions["development_edit"] = login_required(development_edit_fixed)
+
+
+# 記住開發列表的篩選狀態，從詳細頁返回時不會跳回預設。
+@app.before_request
+def _remember_developments_list_url():
+    try:
+        if request.endpoint == "developments" and request.method == "GET":
+            session["developments_return_url"] = request.full_path
+    except Exception:
+        pass
+
+
+# 待辦事項後台。
+def _todo_doc_to_dict(doc):
+    data = doc.to_dict() or {}
+    data["id"] = doc.id
+    return data
+
+
+@app.route("/todos")
+@login_required
+def todos_page():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    show_done = request.args.get("show_done", "") == "1"
+    docs = db.collection(LINE_TODO_COLLECTION).where("todo_date", "==", selected_date).stream()
+    items = [_todo_doc_to_dict(d) for d in docs]
+    if not show_done:
+        items = [x for x in items if x.get("status", "open") != "done"]
+    items.sort(key=lambda x: (x.get("status", "open") == "done", x.get("created_at", "")))
+    return render_template("todos.html", items=items, selected_date=selected_date, selected_date_label=format_calendar_date_label(selected_date), show_done=show_done)
+
+
+@app.route("/todos/new", methods=["POST"])
+@login_required
+def todos_new():
+    title = (request.form.get("title") or "").strip()
+    todo_date = calendar_safe_date(request.form.get("todo_date") or "")
+    note = (request.form.get("note") or "").strip()
+    if not title:
+        flash("請輸入待辦事項", "warning")
+        return redirect(url_for("todos_page", date=todo_date))
+    db.collection(LINE_TODO_COLLECTION).add({
+        "title": title,
+        "content": note,
+        "todo_date": todo_date,
+        "status": "open",
+        "source": "後台",
+        "created_at": now_taipei().isoformat(),
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+    })
+    flash("已新增待辦事項", "success")
+    return redirect(url_for("todos_page", date=todo_date))
+
+
+@app.route("/todos/<todo_id>/done", methods=["POST"])
+@login_required
+def todos_done(todo_id):
+    ref = db.collection(LINE_TODO_COLLECTION).document(todo_id)
+    snap = ref.get()
+    date = now_taipei().strftime("%Y-%m-%d")
+    if snap.exists:
+        date = (snap.to_dict() or {}).get("todo_date") or date
+        ref.update({"status": "done", "completed_at": now_taipei().isoformat(), "completed_by_name": session.get("user_name", "")})
+        flash("已完成待辦", "success")
+    return redirect(url_for("todos_page", date=date))
+
+
+@app.route("/todos/<todo_id>/delete", methods=["POST"])
+@login_required
+def todos_delete(todo_id):
+    ref = db.collection(LINE_TODO_COLLECTION).document(todo_id)
+    snap = ref.get()
+    date = now_taipei().strftime("%Y-%m-%d")
+    if snap.exists:
+        date = (snap.to_dict() or {}).get("todo_date") or date
+        ref.delete()
+        flash("已刪除待辦", "info")
+    return redirect(url_for("todos_page", date=date))
+
+# =============================================================================
+# 後台 BUG 修正 + 新增功能 Patch End
+# =============================================================================
+
 
 if __name__ == "__main__":
     print("✅ FULL_READY_20260621 已載入")

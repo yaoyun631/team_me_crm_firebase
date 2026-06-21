@@ -3,8 +3,11 @@
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h3 class="mb-0">開發詳細資料</h3>
   <div>
+    
+    <a href="{{ url_for('calendar_new', related_type='development', related_id=development.id, title=((development.name or development.address or '開發') ~ ' 開發追蹤'), customer_name=development.name, phone=development.phone, location=(development.address or development.registered_address), note=development.note) }}" class="btn btn-outline-success me-2">加入行事曆</a>
+    <form method="post" action="{{ url_for('development_send_to_line', development_id=development.id) }}" style="display:inline;"><button type="submit" class="btn btn-outline-info me-2">傳到群組</button></form>
     <a href="{{ url_for('development_edit', development_id=development.id) }}" class="btn btn-warning me-2">編輯資料</a>
-    <a href="{{ url_for('developments') }}" class="btn btn-secondary">返回列表</a>
+    <a href="{{ session.get('developments_return_url') or url_for('developments') }}" class="btn btn-secondary">返回列表</a>
   </div>
 </div>
 
@@ -44,7 +47,7 @@
       <div class="mb-3"><label class="form-label">目前狀態</label>
         <select name="current_stage" class="form-select">
           <option value="">不變更</option>
-          {% for opt in status_options %}
+          {% for opt in (status_options or development_current_stage_options or []) %}
             <option value="{{ opt }}">{{ opt }}</option>
           {% endfor %}
         </select>
@@ -52,7 +55,7 @@
       <div class="mb-3"><label class="form-label">下一動作</label>
         <select name="next_action" class="form-select">
           <option value="">不變更</option>
-          {% for opt in next_action_options %}
+          {% for opt in (next_action_options or development_next_action_options or []) %}
             <option value="{{ opt }}">{{ opt }}</option>
           {% endfor %}
         </select>

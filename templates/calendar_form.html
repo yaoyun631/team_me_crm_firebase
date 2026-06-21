@@ -1,12 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
 
-{% set is_edit = event is defined and event %}
-{% set current_date = event.event_date if is_edit else selected_date %}
-{% set current_start = event.start_time if is_edit else default_start %}
-{% set current_end = event.end_time if is_edit else default_end %}
-{% set current_category = event.category if is_edit else '' %}
-{% set current_related_type = event.related_type if is_edit else '' %}
+{% set is_edit = event is defined and event and event.id is defined and event.id %}
+{% set has_prefill = event is defined and event %}
+{% set current_date = event.event_date if has_prefill else selected_date %}
+{% set current_start = event.start_time if has_prefill else default_start %}
+{% set current_end = event.end_time if has_prefill else default_end %}
+{% set current_category = event.category if has_prefill else '' %}
+{% set current_related_type = event.related_type if has_prefill else '' %}
+{% set current_visibility = event.visibility if has_prefill and event.visibility is defined else 'personal' %}
 
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <div>
@@ -26,7 +28,7 @@
           <label class="form-label">行程標題 <span class="text-danger">*</span></label>
           <input type="text" name="title" class="form-control" required
                  placeholder="例：童先生 看農舍 / 李太太回電追蹤"
-                 value="{{ event.title if is_edit else '' }}">
+                 value="{{ event.title if has_prefill else '' }}">
         </div>
         <div class="col-md-4 mb-3">
           <label class="form-label">行程分類</label>
@@ -34,6 +36,22 @@
             {% for opt in category_options %}
               <option value="{{ opt }}" {% if current_category == opt or (not current_category and opt == '帶看') %}selected{% endif %}>{{ opt }}</option>
             {% endfor %}
+          </select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="col-md-6 mb-3" id="customCategoryWrap" style="display:none;">
+          <label class="form-label">自訂分類</label>
+          <input type="text" name="custom_category" id="custom_category" class="form-control"
+                 placeholder="例：會議 / 跑銀行 / 交屋"
+                 value="{{ event.custom_category if has_prefill and event.custom_category is defined else '' }}">
+        </div>
+        <div class="col-md-6 mb-3">
+          <label class="form-label">行程可見性</label>
+          <select name="visibility" class="form-select">
+            <option value="personal" {% if current_visibility == 'personal' %}selected{% endif %}>個人行程（只有自己看得到）</option>
+            <option value="public" {% if current_visibility == 'public' %}selected{% endif %}>公開行程（所有人都看得到）</option>
           </select>
         </div>
       </div>
@@ -84,7 +102,7 @@
           <label class="form-label">關聯資料 ID</label>
           <input type="text" name="related_id" class="form-control"
                  placeholder="可填 buyer_id / seller_id / development_id，也可以先空白"
-                 value="{{ event.related_id if is_edit else '' }}">
+                 value="{{ event.related_id if has_prefill else '' }}">
         </div>
       </div>
 
@@ -93,13 +111,13 @@
           <label class="form-label">客戶 / 對象名稱</label>
           <input type="text" name="customer_name" class="form-control"
                  placeholder="例：童先生、李太太、屋主王先生"
-                 value="{{ event.customer_name if is_edit else '' }}">
+                 value="{{ event.customer_name if has_prefill else '' }}">
         </div>
         <div class="col-md-6 mb-3">
           <label class="form-label">電話</label>
           <input type="text" name="phone" class="form-control"
                  placeholder="例：0921-123-456"
-                 value="{{ event.phone if is_edit else '' }}">
+                 value="{{ event.phone if has_prefill else '' }}">
         </div>
       </div>
 
@@ -107,13 +125,13 @@
         <label class="form-label">地點</label>
         <input type="text" name="location" class="form-control"
                placeholder="例：清水、梧棲交界 / 沙鹿區中山路 / 公司"
-               value="{{ event.location if is_edit else '' }}">
+               value="{{ event.location if has_prefill else '' }}">
       </div>
 
       <div class="mb-3">
         <label class="form-label">備註</label>
         <textarea name="note" class="form-control" rows="4"
-                  placeholder="例：退休夫妻，想看農舍、有空地；記得帶物件資料。">{{ event.note if is_edit else '' }}</textarea>
+                  placeholder="例：退休夫妻，想看農舍、有空地；記得帶物件資料。">{{ event.note if has_prefill else '' }}</textarea>
       </div>
 
       <div class="form-check mb-3">
@@ -136,3 +154,16 @@
 </div>
 
 {% endblock %}
+
+<script>
+function toggleCustomCategory(){
+  const sel = document.querySelector('select[name="category"]');
+  const wrap = document.getElementById('customCategoryWrap');
+  if(!sel || !wrap) return;
+  wrap.style.display = sel.value === '其他' ? 'block' : 'none';
+}
+document.addEventListener('DOMContentLoaded', function(){
+  const sel = document.querySelector('select[name="category"]');
+  if(sel){ sel.addEventListener('change', toggleCustomCategory); toggleCustomCategory(); }
+});
+</script>

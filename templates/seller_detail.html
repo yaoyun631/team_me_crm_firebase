@@ -4,6 +4,9 @@
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h3 class="mb-0">賣方詳細資料</h3>
   <div>
+    
+    <a href="{{ url_for('calendar_new', related_type='seller', related_id=seller.id, title=(seller.name ~ ' 委託追蹤'), customer_name=seller.name, phone=seller.phone, location=seller.address, note=seller.note) }}" class="btn btn-outline-success me-2">加入行事曆</a>
+    <form method="post" action="{{ url_for('seller_send_to_line', seller_id=seller.id) }}" style="display:inline;"><button type="submit" class="btn btn-outline-info me-2">傳到群組</button></form>
     <a href="{{ url_for('seller_edit', seller_id=seller.id) }}" class="btn btn-warning me-2">編輯資料</a>
     <a href="{{ url_for('sellers') }}" class="btn btn-secondary">返回列表</a>
   </div>

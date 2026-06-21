@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-0">待辦事項</h3>
+    <div class="small text-muted mt-1">{{ selected_date_label or selected_date }}｜可管理 LINE Bot 待辦提醒。</div>
+  </div>
+  <form method="get" class="d-flex gap-2 align-items-center">
+    <input type="date" name="date" class="form-control form-control-sm" value="{{ selected_date }}">
+    <label class="form-check-label small text-nowrap">
+      <input type="checkbox" name="show_done" value="1" {% if show_done %}checked{% endif %}> 顯示完成
+    </label>
+    <button class="btn btn-outline-secondary btn-sm">切換</button>
+  </form>
+</div>
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header fw-bold">新增待辦事項</div>
+  <div class="card-body">
+    <form method="post" action="{{ url_for('todos_new') }}" class="row g-2">
+      <div class="col-md-3"><input type="date" name="todo_date" class="form-control" value="{{ selected_date }}"></div>
+      <div class="col-md-5"><input type="text" name="title" class="form-control" placeholder="待辦事項，例如：提醒客戶補資料" required></div>
+      <div class="col-md-3"><input type="text" name="note" class="form-control" placeholder="備註（可空白）"></div>
+      <div class="col-md-1 d-grid"><button class="btn btn-primary">新增</button></div>
+    </form>
+  </div>
+</div>
+
+<div class="card shadow-sm">
+  <div class="card-header fw-bold">待辦清單</div>
+  <div class="card-body p-0">
+    <table class="table table-hover align-middle mb-0">
+      <thead class="table-light"><tr><th style="width:120px;">日期</th><th>事項</th><th>備註</th><th style="width:120px;">狀態</th><th style="width:180px;">操作</th></tr></thead>
+      <tbody>
+        {% for item in items %}
+          <tr>
+            <td>{{ item.todo_date or '-' }}</td>
+            <td class="fw-bold">{{ item.title or item.content or '-' }}</td>
+            <td class="text-muted small">{{ item.content if item.title else '' }}</td>
+            <td>{% if item.status == 'done' %}<span class="badge bg-success">已完成</span>{% else %}<span class="badge bg-warning text-dark">待處理</span>{% endif %}</td>
+            <td>
+              <div class="d-flex gap-2">
+                {% if item.status != 'done' %}
+                  <form method="post" action="{{ url_for('todos_done', todo_id=item.id) }}"><button class="btn btn-sm btn-outline-success">完成</button></form>
+                {% endif %}
+                <form method="post" action="{{ url_for('todos_delete', todo_id=item.id) }}" onsubmit="return confirm('確定刪除？');"><button class="btn btn-sm btn-outline-danger">刪除</button></form>
+              </div>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" class="text-center text-muted py-4">目前沒有待辦事項</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
