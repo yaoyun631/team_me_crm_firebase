@@ -15316,7 +15316,13 @@ def build_line_todo_flex_card(todo_date='', target_id='', title_prefix='待辦�
         'type': 'button',
         'style': 'secondary',
         'height': 'sm',
-        'action': {'type': 'message', 'label': '新增待辦', 'text': '#新增待辦\n日期: 今天\n事項: '},
+        'action': {
+            'type': 'postback',
+            'label': '新增待辦',
+            'data': 'action=todo_new_input',
+            'inputOption': 'openKeyboard',
+            'fillInText': '#新增待辦\n日期: 今天\n事項: ',
+        },
     })
 
     return {
@@ -15393,6 +15399,17 @@ def process_line_postback_event(event):
         raw_data = postback.get('data', '') or ''
         params = {k: (v[0] if isinstance(v, list) and v else '') for k, v in parse_qs(raw_data).items()}
         action = params.get('action') or ''
+
+        if action == 'todo_new_input':
+            # 按「新增待辦」只負責打開鍵盤並預填文字；
+            # 使用者補上事項後按送出，才會由 #新增待辦 文字流程寫入後台。
+            return {
+                'handled': True,
+                'ok': True,
+                'reply_text': '',
+                'parsed_tag': '新增待辦輸入',
+                'silent': True,
+            }
 
         if action == 'todo_done':
             todo_id = params.get('todo_id') or ''
@@ -15684,7 +15701,13 @@ def build_line_todo_flex_card(todo_date='', target_id='', title_prefix='待辦�
         'type': 'button',
         'style': 'secondary',
         'height': 'sm',
-        'action': {'type': 'message', 'label': '新增待辦', 'text': '#新增待辦\n日期: 今天\n事項: '},
+        'action': {
+            'type': 'postback',
+            'label': '新增待辦',
+            'data': 'action=todo_new_input',
+            'inputOption': 'openKeyboard',
+            'fillInText': '#新增待辦\n日期: 今天\n事項: ',
+        },
     })
 
     return {
