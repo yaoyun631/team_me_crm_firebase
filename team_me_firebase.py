@@ -15807,6 +15807,418 @@ except Exception as e:
 # =============================================================================
 
 
+
+# =============================================================================
+# 行事曆分類客製化 Patch v1
+# 功能：
+# 1. 在 /line-card-settings 裡設定「行事曆行程分類」。
+# 2. /calendar/new 與 /calendar/<id>/edit 的類型下拉選單改吃後台設定。
+# 3. LINE #新增行程 的「類型」也改吃後台設定。
+# 4. 自訂分類沒有指定顏色時，預設使用 LINE 卡片設定的主色。
+# =============================================================================
+
+DEFAULT_CALENDAR_CATEGORIES = [
+    "帶看",
+    "回電",
+    "開發",
+    "簽約",
+    "拍照",
+    "收服務費",
+    "待辦",
+    "其他",
+]
+
+try:
+    DEFAULT_LINE_CARD_SETTINGS.setdefault("calendar_categories", list(DEFAULT_CALENDAR_CATEGORIES))
+except Exception:
+    pass
+
+
+def _parse_calendar_category_list(value):
+    """把後台輸入的分類文字轉成乾淨清單。支援一行一個、逗號、頓號。"""
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = re.split(r"[，,、\n]+", str(value or ""))
+
+    result = []
+    seen = set()
+    for item in raw_items:
+        label = str(item or "").strip()
+        if not label:
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        result.append(label)
+
+    if not result:
+        result = list(DEFAULT_CALENDAR_CATEGORIES)
+
+    if "其他" not in result:
+        result.append("其他")
+
+    return result
+
+
+def _sync_calendar_category_global(category_list):
+    """同步舊程式會使用的 CALENDAR_CATEGORY_OPTIONS，避免舊函式讀到舊清單。"""
+    try:
+        categories = _parse_calendar_category_list(category_list)
+        globals()["CALENDAR_CATEGORY_OPTIONS"][:] = categories
+        return categories
+    except Exception:
+        globals()["CALENDAR_CATEGORY_OPTIONS"] = _parse_calendar_category_list(category_list)
+        return globals()["CALENDAR_CATEGORY_OPTIONS"]
+
+
+_original_get_line_card_settings_for_categories = get_line_card_settings
+
+
+def get_line_card_settings():
+    settings = _original_get_line_card_settings_for_categories()
+    categories = _parse_calendar_category_list(settings.get("calendar_categories") or DEFAULT_CALENDAR_CATEGORIES)
+    settings["calendar_categories"] = categories
+    _sync_calendar_category_global(categories)
+    return settings
+
+
+_original_save_line_card_settings_from_form_for_categories = save_line_card_settings_from_form
+
+
+def save_line_card_settings_from_form(form):
+    updates = _original_save_line_card_settings_from_form_for_categories(form)
+    categories = _parse_calendar_category_list(form.get("calendar_categories") or updates.get("calendar_categories") or DEFAULT_CALENDAR_CATEGORIES)
+    updates["calendar_categories"] = categories
+    updates["updated_at"] = now_taipei().isoformat()
+    updates["updated_by_id"] = session.get("user_id", "")
+    updates["updated_by_name"] = session.get("user_name", "")
+    db.collection(LINE_CARD_SETTINGS_COLLECTION).document("default").set({
+        "calendar_categories": categories,
+        "updated_at": updates["updated_at"],
+        "updated_by_id": updates["updated_by_id"],
+        "updated_by_name": updates["updated_by_name"],
+    }, merge=True)
+    _sync_calendar_category_global(categories)
+    return updates
+
+
+def get_calendar_category_options():
+    settings = get_line_card_settings()
+    return _parse_calendar_category_list(settings.get("calendar_categories") or DEFAULT_CALENDAR_CATEGORIES)
+
+
+def get_calendar_category_color(category, settings=None):
+    settings = settings or get_line_card_settings()
+    category = (category or "其他").strip()
+    return CALENDAR_CATEGORY_COLOR_MAP.get(category) or settings.get("primary_color") or "#C9874A"
+
+
+# 讓 LINE 卡片設定頁增加「行事曆行程分類」輸入欄位。
+_CATEGORY_SETTINGS_BLOCK = """
+        <div class="full">
+          <label>行事曆行程分類</label>
+          <textarea name="calendar_categories">{{ calendar_categories_text }}</textarea>
+          <div class="hint">
+            一行一個分類，會同步用在：後台新增行程、編輯行程、LINE #新增行程。<br>
+            例如：帶看、回電、開發、簽約、拍照、收服務費、跑銀行、會議、私人行程、其他。<br>
+            建議保留「其他」，若沒填系統會自動補上。
+          </div>
+        </div>
+"""
+
+try:
+    LINE_CARD_SETTINGS_TEMPLATE_CUSTOM_CATEGORIES = LINE_CARD_SETTINGS_TEMPLATE.replace(
+        '        <div class="full">\n          <label>快速操作按鈕文字</label>',
+        _CATEGORY_SETTINGS_BLOCK + '        <div class="full">\n          <label>快速操作按鈕文字</label>'
+    )
+except Exception:
+    LINE_CARD_SETTINGS_TEMPLATE_CUSTOM_CATEGORIES = LINE_CARD_SETTINGS_TEMPLATE
+
+
+def line_card_settings_custom_categories():
+    if request.method == "POST":
+        save_line_card_settings_from_form(request.form)
+        flash("LINE 卡片設定已更新", "success")
+        return redirect(url_for("line_card_settings"))
+
+    settings = get_line_card_settings()
+    return render_template_string(
+        LINE_CARD_SETTINGS_TEMPLATE_CUSTOM_CATEGORIES,
+        settings=settings,
+        quick_actions_text="\n".join(settings.get("quick_actions") or []),
+        calendar_categories_text="\n".join(get_calendar_category_options()),
+    )
+
+
+try:
+    app.view_functions["line_card_settings"] = login_required(line_card_settings_custom_categories)
+except Exception as e:
+    print("⚠️ 套用行事曆分類設定頁失敗：", e)
+
+
+def doc_to_calendar_event(doc):
+    data = doc_to_dict(doc)
+    data["start_time"] = calendar_safe_time(data.get("start_time"), "09:00")
+    data["end_time"] = calendar_safe_time(data.get("end_time"), next_30_min_time(data["start_time"]))
+    data["event_date"] = calendar_safe_date(data.get("event_date"))
+    data["event_date_label"] = format_calendar_date_label(data.get("event_date"))
+    data["category"] = (data.get("category") or "其他").strip()
+    data["custom_category"] = data.get("custom_category") or ""
+    data["display_category"] = data.get("display_category") or (
+        data["custom_category"] if data["category"] == "其他" and data["custom_category"] else data["category"]
+    )
+    data["visibility"] = data.get("visibility") or "public"
+    data["category_color"] = data.get("category_color") or get_calendar_category_color(data["category"])
+    return data
+
+
+def build_calendar_event_payload(form, existing=None):
+    existing = existing or {}
+    event_date = calendar_safe_date(form.get("event_date") or existing.get("event_date"))
+    start_time = calendar_safe_time(form.get("start_time") or existing.get("start_time"), "09:00")
+    end_time = calendar_safe_time(form.get("end_time") or existing.get("end_time"), next_30_min_time(start_time))
+    if calendar_time_to_minutes(end_time) <= calendar_time_to_minutes(start_time):
+        end_time = next_30_min_time(start_time)
+
+    category_options = get_calendar_category_options()
+    category = (form.get("category", "") or existing.get("category") or "其他").strip()
+    if category not in category_options:
+        category = "其他"
+
+    custom_category = (form.get("custom_category", "") or existing.get("custom_category", "") or "").strip()
+    display_category = custom_category if category == "其他" and custom_category else category
+
+    visibility = (form.get("visibility", "") or existing.get("visibility") or "personal").strip()
+    if visibility not in ("personal", "public"):
+        visibility = "personal"
+
+    payload = {
+        "title": (form.get("title", "") or "").strip(),
+        "event_date": event_date,
+        "start_time": start_time,
+        "end_time": end_time,
+        "category": category,
+        "custom_category": custom_category,
+        "display_category": display_category,
+        "visibility": visibility,
+        "owner_user_id": existing.get("owner_user_id") or session.get("user_id", ""),
+        "owner_user_name": existing.get("owner_user_name") or session.get("user_name", ""),
+        "category_color": get_calendar_category_color(category),
+        "related_type": (form.get("related_type", "") or "").strip(),
+        "related_id": (form.get("related_id", "") or "").strip(),
+        "customer_name": (form.get("customer_name", "") or "").strip(),
+        "phone": (form.get("phone", "") or "").strip(),
+        "location": (form.get("location", "") or "").strip(),
+        "note": (form.get("note", "") or "").strip(),
+        "line_enabled": form.get("line_enabled") == "on",
+        "updated_at": now_taipei().isoformat(),
+        "updated_by_id": session.get("user_id", ""),
+        "updated_by_name": session.get("user_name", ""),
+    }
+    if not payload["title"]:
+        name = payload.get("customer_name") or payload.get("location") or category
+        payload["title"] = f"{name} {category}".strip()
+    return payload
+
+
+def calendar_page_custom_categories():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    selected_date_label = format_calendar_date_label(selected_date)
+    events = fetch_calendar_events(selected_date)
+    slots = build_30_min_slots()
+    slot_cells = build_calendar_slot_cells(events, slots)
+
+    event_map = {}
+    for e in events:
+        event_map.setdefault(e.get("start_time"), []).append(e)
+
+    dates = calendar_prev_next_dates(selected_date)
+    return render_template(
+        "calendar.html",
+        selected_date=selected_date,
+        selected_date_label=selected_date_label,
+        slots=slots,
+        slot_cells=slot_cells,
+        event_map=event_map,
+        events=events,
+        category_options=get_calendar_category_options(),
+        **dates,
+    )
+
+
+def calendar_edit_custom_categories(event_id):
+    doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).document(event_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        flash("找不到這筆行程", "danger")
+        return redirect(url_for("calendar_page"))
+
+    event = doc_to_calendar_event(doc)
+    if request.method == "POST":
+        payload = build_calendar_event_payload(request.form, existing=event)
+        doc_ref.update(payload)
+        flash("已更新行程", "success")
+        return redirect(url_for("calendar_page", date=payload["event_date"]))
+
+    return render_template(
+        "calendar_form.html",
+        event=event,
+        selected_date=event.get("event_date"),
+        default_start=event.get("start_time", "09:00"),
+        default_end=event.get("end_time", "09:30"),
+        slots=build_30_min_slots(),
+        category_options=get_calendar_category_options(),
+    )
+
+
+def calendar_new_prefill_custom_categories():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    default_start = calendar_safe_time(request.args.get("start", ""), "09:00")
+    default_end = calendar_safe_time(request.args.get("end", ""), next_30_min_time(default_start))
+
+    if request.method == "POST":
+        payload = build_calendar_event_payload(request.form)
+        payload.update({
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": session.get("user_id", ""),
+            "created_by_name": session.get("user_name", ""),
+        })
+        doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).add(payload)[1]
+        flash("已新增行程", "success")
+        if _crm_line_notify_target_id():
+            try:
+                _push_calendar_event_to_group(doc_ref.id, title_prefix="新增行程")
+            except Exception as e:
+                print("⚠️ 新增行程推播失敗：", e)
+        return redirect(url_for("calendar_page", date=payload["event_date"]))
+
+    prefill = {}
+    for key in ("title", "category", "custom_category", "related_type", "related_id", "customer_name", "phone", "location", "note", "visibility"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            prefill[key] = value
+
+    if prefill:
+        prefill["event_date"] = selected_date
+        prefill["start_time"] = default_start
+        prefill["end_time"] = default_end
+        prefill["line_enabled"] = True
+
+    return render_template(
+        "calendar_form.html",
+        event=prefill if prefill else None,
+        selected_date=selected_date,
+        default_start=default_start,
+        default_end=default_end,
+        slots=build_30_min_slots(),
+        category_options=get_calendar_category_options(),
+    )
+
+
+# LINE #新增行程 也吃後台自訂行程分類。
+def process_line_calendar_message_event(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+
+    raw_text = (message.get("text") or "").strip()
+    normalized = raw_text.replace("＃", "#").strip()
+    today = now_taipei().date()
+
+    if normalized in ("#今日行程", "#今天行程", "今日行程", "今天行程"):
+        return build_calendar_reply_for_range(today.strftime("%Y-%m-%d"), mode="today")
+
+    if normalized in ("#明日行程", "#明天行程", "明日行程", "明天行程"):
+        return build_calendar_reply_for_range((today + timedelta(days=1)).strftime("%Y-%m-%d"), mode="tomorrow")
+
+    if normalized in ("#本週行程", "本週行程"):
+        start = today.strftime("%Y-%m-%d")
+        end = (today + timedelta(days=6)).strftime("%Y-%m-%d")
+        return build_calendar_reply_for_range(start, end, mode="week")
+
+    if normalized.startswith("#新增行程"):
+        fields = parse_line_calendar_create_fields(normalized)
+        category_options = get_calendar_category_options()
+        if len(normalized.splitlines()) == 1:
+            sample_category = category_options[0] if category_options else "帶看"
+            example = (
+                "新增行程格式：\n"
+                "#新增行程\n"
+                "日期: 今天\n"
+                "時間: 10:00-10:30\n"
+                f"類型: {sample_category}\n"
+                "標題: 童先生看農舍\n"
+                "客戶: 童先生\n"
+                "電話: 0921-123-456\n"
+                "地點: 清水、梧棲交界\n"
+                "備註: 退休夫妻，想看農舍、有空地\n\n"
+                "目前可用類型：" + "、".join(category_options)
+            )
+            return {"handled": True, "ok": True, "reply_text": example, "parsed_tag": "新增行程格式"}
+
+        event_date = parse_calendar_date_word(fields.get("event_date_raw", "今天"))
+        start_time, end_time = parse_calendar_time_range(fields.get("time_raw", "09:00"), fields.get("end_time", ""))
+        category = (fields.get("category") or "其他").strip()
+        if category not in category_options:
+            category = "其他"
+
+        title = fields.get("title", "").strip()
+        if not title:
+            title = f"{fields.get('customer_name', '')} {category}".strip() or category
+
+        payload = {
+            "title": title,
+            "event_date": event_date,
+            "start_time": start_time,
+            "end_time": end_time,
+            "category": category,
+            "display_category": category,
+            "category_color": get_calendar_category_color(category),
+            "related_type": fields.get("related_type", ""),
+            "related_id": fields.get("related_id", ""),
+            "customer_name": fields.get("customer_name", ""),
+            "phone": fields.get("phone", ""),
+            "location": fields.get("location", ""),
+            "note": fields.get("note", ""),
+            "visibility": "public",
+            "line_enabled": True,
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": "line_bot",
+            "created_by_name": "LINE Bot",
+            "updated_at": now_taipei().isoformat(),
+            "updated_by_id": "line_bot",
+            "updated_by_name": "LINE Bot",
+        }
+        doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).document()
+        doc_ref.set(payload)
+        payload["id"] = doc_ref.id
+        settings = get_line_card_settings()
+        flex = build_calendar_event_bubble(dict(payload), settings)
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": f"已新增行程：{title}（{format_calendar_date_label(event_date)} {start_time}）",
+            "reply_flex": flex,
+            "reply_quick_reply": build_calendar_quick_reply(settings),
+            "parsed_tag": "新增行程",
+        }
+
+    return {"handled": False}
+
+
+try:
+    _sync_calendar_category_global(get_calendar_category_options())
+    app.view_functions["calendar_page"] = login_required(calendar_page_custom_categories)
+    app.view_functions["calendar_new"] = login_required(calendar_new_prefill_custom_categories)
+    app.view_functions["calendar_edit"] = login_required(calendar_edit_custom_categories)
+    print("✅ 行事曆分類客製化已啟用：可在 /line-card-settings 設定行程分類")
+except Exception as e:
+    print("⚠️ 行事曆分類客製化套用失敗：", e)
+# =============================================================================
+# 行事曆分類客製化 Patch End
+# =============================================================================
+
 if __name__ == "__main__":
     print("✅ FULL_READY_20260621 已載入")
     print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
