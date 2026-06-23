@@ -19453,6 +19453,463 @@ except Exception as e:
 # LINE 個人 / 群組精準權限 + 可選傳送對象 + 待辦公開/個人 Patch End
 # =============================================================================
 
+
+# =============================================================================
+# 後台個人資料隔離 Patch v20260623B
+# - 後台登入者只能看到：公開資料 + 自己的個人資料
+# - 其他人的個人客需 / 委託 / 開發 / 行事曆 / 待辦不會出現在列表、詳細頁、同屋主頁
+# - 個人資料如果綁定 LINE userId，會以目前登入者的個人後台 LINE 綁定為準
+# =============================================================================
+
+
+def _backend_current_line_user_ids():
+    """取得目前登入者已綁定的 LINE 個人 userId，供後台個人資料過濾使用。"""
+    ids = set()
+    try:
+        binding = get_current_user_line_binding()
+        if (binding.get("user_id") or "").strip():
+            ids.add((binding.get("user_id") or "").strip())
+    except Exception:
+        pass
+
+    try:
+        _, user_doc = _current_crm_user_doc()
+        for key in ("line_user_id", "line_personal_user_id"):
+            val = (user_doc.get(key) or "").strip()
+            if val:
+                ids.add(val)
+    except Exception:
+        pass
+    return ids
+
+
+def _backend_normalize_record_visibility(data: dict):
+    data = dict(data or {})
+    visibility = (data.get("visibility") or "").strip()
+    if visibility not in ("public", "personal"):
+        # 舊資料預設公開，避免既有資料突然消失；有 U 開頭 target 的舊待辦視為個人。
+        if str(data.get("line_target_id") or "").startswith("U") or (data.get("line_target_type") == "user"):
+            visibility = "personal"
+        else:
+            visibility = "public"
+    data["visibility"] = visibility
+    return data
+
+
+def backend_can_view_personal_record(data: dict) -> bool:
+    """
+    後台頁面用：
+    - 公開資料：所有登入者可看
+    - 個人資料：只能該登入者看
+      1) 若有 owner_line_user_id，以登入者個人後台綁定 LINE ID 比對
+      2) 若沒有 owner_line_user_id，才以 owner_user_id / created_by_id 比對
+    """
+    data = _backend_normalize_record_visibility(data)
+    if data.get("visibility") != "personal":
+        return True
+
+    uid = (session.get("user_id") or "").strip()
+    if not uid:
+        return False
+
+    owner_line_id = (
+        data.get("owner_line_user_id")
+        or data.get("line_user_id")
+        or (data.get("line_target_id") if str(data.get("line_target_id") or "").startswith("U") else "")
+        or ""
+    ).strip()
+
+    if owner_line_id:
+        return owner_line_id in _backend_current_line_user_ids()
+
+    owner_user_id = (data.get("owner_user_id") or "").strip()
+    created_by_id = (data.get("created_by_id") or "").strip()
+    return bool((owner_user_id and owner_user_id == uid) or (created_by_id and created_by_id == uid))
+
+
+def _backend_visible_items(items):
+    return [x for x in (items or []) if backend_can_view_personal_record(x)]
+
+
+def _backend_can_view_doc(collection_name: str, doc_id: str) -> bool:
+    if not doc_id:
+        return False
+    try:
+        snap = db.collection(collection_name).document(doc_id).get()
+        if not snap.exists:
+            return False
+        return backend_can_view_personal_record(snap.to_dict() or {})
+    except Exception as e:
+        print("⚠️ 後台權限檢查失敗：", collection_name, doc_id, e)
+        return False
+
+
+def _backend_forbidden_redirect(label="資料", fallback_endpoint="buyers"):
+    flash(f"這筆{label}是其他使用者的個人資料，無法查看或操作。", "warning")
+    try:
+        return redirect(request.referrer or url_for(fallback_endpoint))
+    except Exception:
+        return redirect(url_for("buyers"))
+
+
+# ---------- 客需列表：只顯示公開 + 自己個人 ----------
+def buyers_backend_visible():
+    q = request.args.get("q", "").strip()
+    level = request.args.get("level", "").strip()
+    intent_type = request.args.get("intent_type", "").strip()
+    stage = request.args.get("stage", "").strip()
+    source = request.args.get("source", "").strip()
+    label = request.args.get("label", "").strip()
+    sort_by = request.args.get("sort_by", "created_at_desc")
+
+    docs = db.collection("buyers").stream()
+    visible_buyers = _backend_visible_items([doc_to_dict(d) for d in docs])
+
+    source_options = sorted({(b.get("source") or "").strip() for b in visible_buyers if (b.get("source") or "").strip()})
+    label_options = build_label_options(visible_buyers)
+    buyers_list = list(visible_buyers)
+
+    if q:
+        buyers_list = [b for b in buyers_list if q in (b.get("name") or "") or q in (b.get("phone") or "")]
+    if level:
+        buyers_list = [b for b in buyers_list if b.get("level") == level]
+    if intent_type:
+        buyers_list = [b for b in buyers_list if b.get("intent_type") == intent_type]
+    if stage:
+        buyers_list = [b for b in buyers_list if (b.get("stage") or "") == stage]
+    if source:
+        buyers_list = [b for b in buyers_list if (b.get("source") or "") == source]
+    if label:
+        buyers_list = [b for b in buyers_list if label in ensure_list(b.get("labels"))]
+
+    if sort_by == "created_at_asc":
+        buyers_list.sort(key=lambda b: b.get("created_at") or "")
+    elif sort_by == "created_at_desc":
+        buyers_list.sort(key=lambda b: b.get("created_at") or "", reverse=True)
+    elif sort_by == "name_asc":
+        buyers_list.sort(key=lambda b: (b.get("name") or ""))
+    elif sort_by == "name_desc":
+        buyers_list.sort(key=lambda b: (b.get("name") or ""), reverse=True)
+
+    buyers_list = attach_latest_followup(buyers_list, "buyer_followups", "buyer_id")
+    return render_template(
+        "buyers.html",
+        buyers=buyers_list,
+        q=q,
+        level=level,
+        intent_type=intent_type,
+        stage=stage,
+        source=source,
+        source_options=source_options,
+        label=label,
+        label_options=label_options,
+        sort_by=sort_by,
+        buyer_stage_options=BUYER_STAGE_OPTIONS,
+        total_count=len(visible_buyers),
+        filtered_count=len(buyers_list),
+    )
+
+
+# ---------- 委託列表：只顯示公開 + 自己個人 ----------
+def sellers_backend_visible():
+    q = request.args.get("q", "").strip()
+    level = request.args.get("level", "").strip()
+    stage = request.args.get("stage", "").strip()
+    source = request.args.get("source", "").strip()
+    label = request.args.get("label", "").strip()
+    sort_by = request.args.get("sort_by", "created_at_desc")
+
+    docs = db.collection("sellers").stream()
+    visible_sellers = _backend_visible_items([doc_to_dict(d) for d in docs])
+
+    source_options = sorted({(s.get("source") or "").strip() for s in visible_sellers if (s.get("source") or "").strip()})
+    label_options = build_label_options(visible_sellers)
+    sellers_list = list(visible_sellers)
+
+    if q:
+        sellers_list = [s for s in sellers_list if q in (s.get("name") or "") or q in (s.get("phone") or "")]
+    if level:
+        sellers_list = [s for s in sellers_list if s.get("level") == level]
+    if stage:
+        sellers_list = [s for s in sellers_list if (s.get("stage") or "") == stage]
+    if source:
+        sellers_list = [s for s in sellers_list if (s.get("source") or "") == source]
+    if label:
+        sellers_list = [s for s in sellers_list if label in ensure_list(s.get("labels"))]
+
+    if sort_by == "created_at_asc":
+        sellers_list.sort(key=lambda s: s.get("created_at") or "")
+    elif sort_by == "created_at_desc":
+        sellers_list.sort(key=lambda s: s.get("created_at") or "", reverse=True)
+    elif sort_by == "name_asc":
+        sellers_list.sort(key=lambda s: (s.get("name") or ""))
+    elif sort_by == "name_desc":
+        sellers_list.sort(key=lambda s: (s.get("name") or ""), reverse=True)
+
+    sellers_list = attach_latest_followup(sellers_list, "seller_followups", "seller_id")
+    return render_template(
+        "sellers.html",
+        sellers=sellers_list,
+        q=q,
+        level=level,
+        stage=stage,
+        source=source,
+        source_options=source_options,
+        label=label,
+        label_options=label_options,
+        sort_by=sort_by,
+        seller_stage_options=SELLER_STAGE_OPTIONS,
+        total_count=len(visible_sellers),
+        filtered_count=len(sellers_list),
+    )
+
+
+# ---------- 開發列表：同屋主分組也只用可見資料計算 ----------
+def developments_backend_visible_grouped():
+    q = request.args.get("q", "").strip()
+    current_stage = request.args.get("current_stage", "").strip()
+    next_action = request.args.get("next_action", "").strip()
+    source = request.args.get("source", "").strip()
+    sort_by = request.args.get("sort_by", "created_at_desc")
+    show_done = request.args.get("show_done", "").strip()
+
+    docs = db.collection("developments").stream()
+    visible_items = _backend_visible_items([doc_to_dict(d) for d in docs])
+    total_count = len(visible_items)
+    source_options = sorted({(x.get("source") or "").strip() for x in visible_items if (x.get("source") or "").strip()})
+
+    attach_development_owner_groups(visible_items)
+    items = list(visible_items)
+
+    if q:
+        q_key = development_owner_key_from_phone(q)
+        items = [
+            x for x in items
+            if q in (x.get("name") or "")
+            or q in (x.get("phone") or "")
+            or q in (x.get("address") or "")
+            or q in (x.get("registered_address") or "")
+            or (q_key and q_key == (x.get("owner_key") or development_owner_key_from_phone(x.get("phone", ""))))
+        ]
+    if current_stage:
+        items = [x for x in items if (x.get("current_stage") or x.get("stage") or "") == current_stage]
+    if next_action:
+        items = [x for x in items if (x.get("next_action") or "") == next_action]
+    if source:
+        items = [x for x in items if (x.get("source") or "") == source]
+    if show_done != "1":
+        items = [x for x in items if (x.get("current_stage") or x.get("stage") or "") not in DEVELOPMENT_HIDDEN_BY_DEFAULT]
+
+    if sort_by == "created_at_asc":
+        items.sort(key=lambda x: x.get("created_at") or "")
+    elif sort_by == "created_at_desc":
+        items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    elif sort_by == "name_asc":
+        items.sort(key=lambda x: (x.get("name") or ""))
+    elif sort_by == "name_desc":
+        items.sort(key=lambda x: (x.get("name") or ""), reverse=True)
+    else:
+        items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+
+    return render_template(
+        "developments.html",
+        developments=items,
+        q=q,
+        current_stage=current_stage,
+        next_action=next_action,
+        source=source,
+        source_options=source_options,
+        show_done=show_done,
+        sort_by=sort_by,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+        total_count=total_count,
+        filtered_count=len(items),
+        label_docx_enabled=(next_action == "寄開發信"),
+        label_docx_count=len([x for x in items if (x.get("registered_address") or "").strip()]),
+    )
+
+
+# 同屋主物件清單：只列出目前登入者可看的物件。
+try:
+    _get_development_same_owner_items_before_backend_isolation = get_development_same_owner_items
+except Exception:
+    _get_development_same_owner_items_before_backend_isolation = None
+
+
+def get_development_same_owner_items(phone: str, exclude_id: str = ""):
+    key = development_owner_key_from_phone(phone)
+    if not key:
+        return []
+    result = []
+    for doc in db.collection("developments").stream():
+        item = doc_to_dict(doc)
+        if not backend_can_view_personal_record(item):
+            continue
+        item_key = item.get("owner_key") or development_owner_key_from_phone(item.get("phone", ""))
+        if item_key == key and (not exclude_id or item.get("id") != exclude_id):
+            result.append(item)
+    result.sort(key=lambda x: (x.get("created_at") or "", x.get("address") or ""))
+    attach_development_owner_groups(result)
+    return result
+
+
+# 開發同屋主獨立頁：只列出目前登入者可看的物件。
+def development_owner_group_backend_visible(owner_key):
+    owner_key = development_owner_key_from_phone(owner_key)
+    items = []
+    owner_name = "同屋主"
+    owner_phone = owner_key
+    for doc in db.collection("developments").stream():
+        item = doc_to_dict(doc)
+        if not backend_can_view_personal_record(item):
+            continue
+        item_key = item.get("owner_key") or development_owner_key_from_phone(item.get("phone", ""))
+        if item_key == owner_key:
+            items.append(item)
+            owner_name = item.get("name") or owner_name
+            owner_phone = item.get("phone") or owner_phone
+    items.sort(key=lambda x: (x.get("created_at") or "", x.get("address") or ""))
+    attach_development_owner_groups(items)
+    return render_template(
+        "development_owner_group.html",
+        owner_key=owner_key,
+        owner_name=owner_name,
+        owner_phone=owner_phone,
+        items=items,
+        development_current_stage_options=DEVELOPMENT_STATUS_OPTIONS,
+        development_next_action_options=DEVELOPMENT_NEXT_ACTION_OPTIONS,
+    )
+
+
+# 行事曆：後台個人行程依「登入者 LINE 綁定 / owner_user_id」過濾。
+try:
+    _fetch_calendar_events_before_backend_isolation = fetch_calendar_events
+except Exception:
+    _fetch_calendar_events_before_backend_isolation = None
+
+
+def fetch_calendar_events(start_date: str, end_date: str = None, line_only: bool = False, calendar_view: str = "all", line_source_kind: str = "", line_source_id: str = ""):
+    events = _fetch_calendar_events_before_backend_isolation(start_date, end_date, line_only=line_only, calendar_view=calendar_view, line_source_kind=line_source_kind, line_source_id=line_source_id)
+    # LINE 查詢仍走原本權限矩陣；只加強後台查詢。
+    if line_only or line_source_kind or line_source_id:
+        return events
+    filtered = []
+    for item in events:
+        if not backend_can_view_personal_record(item):
+            continue
+        if calendar_view == "public" and (item.get("visibility") or "public") != "public":
+            continue
+        if calendar_view == "personal" and (item.get("visibility") or "public") != "personal":
+            continue
+        filtered.append(item)
+    return filtered
+
+
+# 待辦後台：只顯示公開待辦 + 自己個人待辦。
+def todos_page_backend_visible():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    show_done = request.args.get("show_done", "") == "1"
+
+    docs = db.collection(LINE_TODO_COLLECTION).where("todo_date", "==", selected_date).stream()
+    all_items = [_todo_doc_to_dict(d) for d in docs]
+    all_items = _backend_visible_items(all_items)
+    all_items.sort(key=_todo_item_sort_key)
+
+    open_count = len([x for x in all_items if x.get("status", "open") != "done"])
+    done_count = len([x for x in all_items if x.get("status", "open") == "done"])
+    items = all_items if show_done else [x for x in all_items if x.get("status", "open") != "done"]
+
+    return render_template(
+        "todos.html",
+        items=items,
+        selected_date=selected_date,
+        selected_date_label=format_calendar_date_label(selected_date),
+        show_done=show_done,
+        open_count=open_count,
+        done_count=done_count,
+        total_count=len(all_items),
+    )
+
+
+def _guard_backend_record(collection_name, record_id, label, fallback_endpoint):
+    if not _backend_can_view_doc(collection_name, record_id):
+        return _backend_forbidden_redirect(label=label, fallback_endpoint=fallback_endpoint)
+    return None
+
+
+def _wrap_backend_access(endpoint, collection_name, id_param, label, fallback_endpoint):
+    old_func = app.view_functions.get(endpoint)
+    if not old_func:
+        return
+    def wrapped(*args, **kwargs):
+        rid = kwargs.get(id_param)
+        if session.get("user_id"):
+            blocked = _guard_backend_record(collection_name, rid, label, fallback_endpoint)
+            if blocked:
+                return blocked
+        return old_func(*args, **kwargs)
+    wrapped.__name__ = getattr(old_func, "__name__", endpoint) + "_backend_isolated"
+    app.view_functions[endpoint] = wrapped
+
+
+# 套用列表頁。
+try:
+    app.view_functions["buyers"] = login_required(buyers_backend_visible)
+    app.view_functions["sellers"] = login_required(sellers_backend_visible)
+    app.view_functions["developments"] = login_required(developments_backend_visible_grouped)
+    app.view_functions["development_owner_group"] = login_required(development_owner_group_backend_visible)
+    app.view_functions["todos_page"] = login_required(todos_page_backend_visible)
+except Exception as e:
+    print("⚠️ 後台列表個人資料隔離套用失敗：", e)
+
+
+# 套用詳細 / 編輯 / 刪除 / 追蹤 / 傳送等操作保護。
+for _endpoint, _collection, _id_param, _label, _fallback in [
+    ("buyer_detail", "buyers", "buyer_id", "客需", "buyers"),
+    ("buyer_edit", "buyers", "buyer_id", "客需", "buyers"),
+    ("buyer_delete", "buyers", "buyer_id", "客需", "buyers"),
+    ("buyer_quick_stage", "buyers", "buyer_id", "客需", "buyers"),
+    ("add_buyer_followup", "buyers", "buyer_id", "客需", "buyers"),
+    ("buyer_followup_edit", "buyers", "buyer_id", "客需", "buyers"),
+    ("buyer_followup_delete", "buyers", "buyer_id", "客需", "buyers"),
+    ("buyer_send_to_line", "buyers", "buyer_id", "客需", "buyers"),
+
+    ("seller_detail", "sellers", "seller_id", "委託", "sellers"),
+    ("seller_edit", "sellers", "seller_id", "委託", "sellers"),
+    ("seller_delete", "sellers", "seller_id", "委託", "sellers"),
+    ("seller_quick_stage", "sellers", "seller_id", "委託", "sellers"),
+    ("add_seller_followup", "sellers", "seller_id", "委託", "sellers"),
+    ("seller_followup_edit", "sellers", "seller_id", "委託", "sellers"),
+    ("seller_followup_delete", "sellers", "seller_id", "委託", "sellers"),
+    ("seller_send_to_line", "sellers", "seller_id", "委託", "sellers"),
+
+    ("development_detail", "developments", "development_id", "開發", "developments"),
+    ("development_edit", "developments", "development_id", "開發", "developments"),
+    ("development_delete", "developments", "development_id", "開發", "developments"),
+    ("development_quick_flow", "developments", "development_id", "開發", "developments"),
+    ("add_development_followup", "developments", "development_id", "開發", "developments"),
+    ("development_followup_edit", "developments", "development_id", "開發", "developments"),
+    ("development_followup_delete", "developments", "development_id", "開發", "developments"),
+    ("development_send_to_line", "developments", "development_id", "開發", "developments"),
+
+    ("calendar_edit", CALENDAR_EVENT_COLLECTION if 'CALENDAR_EVENT_COLLECTION' in globals() else 'calendar_events', "event_id", "行程", "calendar_page"),
+    ("calendar_delete", CALENDAR_EVENT_COLLECTION if 'CALENDAR_EVENT_COLLECTION' in globals() else 'calendar_events', "event_id", "行程", "calendar_page"),
+    ("calendar_send_to_line", CALENDAR_EVENT_COLLECTION if 'CALENDAR_EVENT_COLLECTION' in globals() else 'calendar_events', "event_id", "行程", "calendar_page"),
+    ("todos_toggle", LINE_TODO_COLLECTION if 'LINE_TODO_COLLECTION' in globals() else 'line_todos', "todo_id", "待辦", "todos_page"),
+    ("todos_delete", LINE_TODO_COLLECTION if 'LINE_TODO_COLLECTION' in globals() else 'line_todos', "todo_id", "待辦", "todos_page"),
+]:
+    try:
+        _wrap_backend_access(_endpoint, _collection, _id_param, _label, _fallback)
+    except Exception as e:
+        print("⚠️ 後台操作個人資料隔離套用失敗：", _endpoint, e)
+
+print("✅ 後台個人資料隔離已啟用：登入者只能看到公開資料 + 自己的個人資料")
+
+# =============================================================================
+# 後台個人資料隔離 Patch End
+# =============================================================================
+
 if __name__ == "__main__":
     print("✅ FULL_READY_20260621 已載入")
     print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
