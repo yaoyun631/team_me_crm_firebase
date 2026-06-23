@@ -28,6 +28,15 @@
         <span class="badge bg-primary ms-2">等級 {{ seller.level }}</span>
       {% endif %}
     </h5>
+    <div class="mb-3">
+      <span class="badge {% if seller.visibility == 'personal' %}bg-warning text-dark{% else %}bg-success{% endif %}">
+        LINE顯示：{{ '個人資料' if seller.visibility == 'personal' else '公開資料' }}
+      </span>
+      {% if seller.visibility == 'personal' %}
+        <span class="badge bg-light text-dark ms-1">{{ seller.owner_line_name or seller.owner_user_name or '未綁定個人LINE' }}</span>
+      {% endif %}
+    </div>
+
 
     {# 有圖片就顯示一行文字，點擊後展開大圖輪播 #}
     {% if photos %}

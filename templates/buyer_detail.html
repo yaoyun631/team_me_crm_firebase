@@ -28,6 +28,15 @@
         <span class="badge bg-primary ms-2">等級 {{ buyer.level }}</span>
       {% endif %}
     </h5>
+    <div class="mb-3">
+      <span class="badge {% if buyer.visibility == 'personal' %}bg-warning text-dark{% else %}bg-success{% endif %}">
+        LINE顯示：{{ '個人資料' if buyer.visibility == 'personal' else '公開資料' }}
+      </span>
+      {% if buyer.visibility == 'personal' %}
+        <span class="badge bg-light text-dark ms-1">{{ buyer.owner_line_name or buyer.owner_user_name or '未綁定個人LINE' }}</span>
+      {% endif %}
+    </div>
+
 
     {# 🔹 不直接顯示圖片，改成文字連結 #}
     {% if photos %}

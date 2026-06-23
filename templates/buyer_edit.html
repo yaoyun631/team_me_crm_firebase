@@ -6,6 +6,9 @@
 <div class="card">
   <div class="card-body">
     <form method="post" enctype="multipart/form-data">
+{% set item_visibility = buyer.visibility or 'public' %}
+{% set owner_line_user_id = buyer.owner_line_user_id or '' %}
+
       <div class="mb-3">
         <label class="form-label">姓名（必填）</label>
         <input type="text" name="name" class="form-control" value="{{ buyer.name }}" required>
@@ -202,6 +205,33 @@
         <textarea name="note" class="form-control" rows="3">{{ buyer.note }}</textarea>
       </div>
 
+
+
+      <div class="card border-warning mb-3">
+        <div class="card-header bg-warning bg-opacity-25 fw-bold">LINE 顯示設定</div>
+        <div class="card-body">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">資料可見性</label>
+              <select name="visibility" class="form-select crm-visibility-select">
+                <option value="public" {% if item_visibility != 'personal' %}selected{% endif %}>公開資料（可傳到設定允許的群組）</option>
+                <option value="personal" {% if item_visibility == 'personal' %}selected{% endif %}>個人資料（只傳給綁定的個人 LINE）</option>
+              </select>
+            </div>
+            <div class="col-md-6 crm-owner-line-wrap">
+              <label class="form-label">綁定個人 LINE</label>
+              <select name="owner_line_user_id" class="form-select">
+                <option value="">請選擇個人 LINE 帳號</option>
+                {% for u in line_user_options or [] %}
+                  <option value="{{ u.user_id }}" {% if owner_line_user_id == u.user_id %}selected{% endif %}>{{ u.name }}{% if not u.enabled %}（停用）{% endif %}</option>
+                {% endfor %}
+              </select>
+              <div class="form-text">個人資料會單獨推送給這個 LINE 帳號。</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="mb-3 text-muted">
         <small>
           建立時間：{{ buyer.created_at or "-" }}
@@ -223,6 +253,23 @@
 
 {% endblock %}
 {% block scripts %}
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  function refreshCrmVisibility() {
+    document.querySelectorAll('.crm-visibility-select').forEach(function(sel){
+      const form = sel.closest('form');
+      const wrap = form ? form.querySelector('.crm-owner-line-wrap') : null;
+      if (wrap) wrap.style.display = sel.value === 'personal' ? '' : 'none';
+    });
+  }
+  document.querySelectorAll('.crm-visibility-select').forEach(function(sel){
+    sel.addEventListener('change', refreshCrmVisibility);
+  });
+  refreshCrmVisibility();
+});
+</script>
+
 <script>
 document.addEventListener("DOMContentLoaded", () => {
   const MAX_FILES = 5;

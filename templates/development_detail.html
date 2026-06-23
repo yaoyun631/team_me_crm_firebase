@@ -15,6 +15,15 @@
 <div class="card mb-4">
   <div class="card-body">
     <h5 class="card-title mb-3">{{ development.name or "未填姓名" }}</h5>
+    <div class="mb-3">
+      <span class="badge {% if development.visibility == 'personal' %}bg-warning text-dark{% else %}bg-success{% endif %}">
+        LINE顯示：{{ '個人資料' if development.visibility == 'personal' else '公開資料' }}
+      </span>
+      {% if development.visibility == 'personal' %}
+        <span class="badge bg-light text-dark ms-1">{{ development.owner_line_name or development.owner_user_name or '未綁定個人LINE' }}</span>
+      {% endif %}
+    </div>
+
     <div class="row mb-2">
       <div class="col-md-6">
         <p class="mb-1"><strong>電話：</strong>{{ development.phone or "-" }}</p>

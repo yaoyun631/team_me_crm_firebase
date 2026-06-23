@@ -1547,7 +1547,10 @@ def buyers_new():
     if file and file.filename:
         photo_url = upload_image_to_storage(file, folder="buyers", object_id=buyer_id)
 
+    crm_vis = crm_record_visibility_payload_from_form(form)
+
     data = {
+        **crm_vis,
         "name": name,
         "phone": phone,
         "email": email,
@@ -1710,8 +1713,10 @@ def buyer_edit(buyer_id):
 
         # ✅ 先處理一般文字欄位
         labels = get_request_labels(form)
+        crm_vis = crm_record_visibility_payload_from_form(form, buyer)
 
         updated = {
+            **crm_vis,
             "name": name,
             "phone": form.get("phone", "").strip(),
             "email": form.get("email", "").strip(),
@@ -1981,7 +1986,10 @@ def sellers_new():
 
 
     # ========== Firestore 要存的資料 ==========
+    crm_vis = crm_record_visibility_payload_from_form(form)
+
     data = {
+        **crm_vis,
         "name": name,
         "phone": phone,
         "email": email,
@@ -14060,6 +14068,8 @@ def _record_calendar_params(record_type: str, record_id: str, data: dict):
         "phone": phone,
         "location": location,
         "note": note,
+        "visibility": data.get("visibility") or "public",
+        "owner_line_user_id": data.get("owner_line_user_id") or "",
     }
 
 
@@ -14295,7 +14305,9 @@ def development_edit_fixed(development_id):
         current_stage = normalize_development_status(_crm_keep_status(form.get("current_stage") or form.get("stage"), development.get("current_stage") or development.get("stage"), "待聯繫"))
         next_action = normalize_development_next_action(_crm_keep_status(form.get("next_action"), development.get("next_action"), ""))
         next_action_date = (form.get("next_action_date", "") or development.get("next_action_date", "") or "").strip()
+        crm_vis = crm_record_visibility_payload_from_form(form, development)
         updated = {
+            **crm_vis,
             "name": form.get("name", "").strip() or development.get("name") or "未填姓名",
             "phone": form.get("phone", "").strip(),
             "source": form.get("source", "").strip(),
@@ -14629,8 +14641,10 @@ def developments_new_owner_grouped():
     next_action_date = form.get("next_action_date", "").strip()
     _manual_url = form.get("url", "").strip()
     nav_url = _make_google_nav_url(registered_address or address)
+    crm_vis = crm_record_visibility_payload_from_form(form)
 
     data = {
+        **crm_vis,
         "name": form.get("name", "").strip() or "未填姓名",
         "phone": phone,
         "source": infer_development_source(form.get("source", "").strip(), _manual_url),
@@ -16217,6 +16231,2695 @@ except Exception as e:
     print("⚠️ 行事曆分類客製化套用失敗：", e)
 # =============================================================================
 # 行事曆分類客製化 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# LINE 設定中心 + 多群組權限 + 指令控管 Patch v20260622A
+# - /line-card-settings 改成「設定中心」，需管理員密碼
+# - 可設定多個 LINE 群組 / 房間，每個群組可接收不同類型訊息
+# - 每個群組可使用的指令不同
+# - 未設定的群組 / 私訊使用者不能使用指令
+# =============================================================================
+
+LINE_RECEIVE_TYPE_OPTIONS = [
+    ("buyer", "客需卡片 / 客需更新"),
+    ("seller", "委託卡片 / 委託更新"),
+    ("development", "開發卡片 / 開發更新"),
+    ("calendar", "行事曆 / 行程卡片"),
+    ("todo", "待辦事項"),
+]
+
+LINE_COMMAND_TYPE_OPTIONS = [
+    ("calendar", "行事曆指令：#今日行程、#明日行程、#本週行程、#新增行程"),
+    ("todo", "待辦指令：#今日待辦、#待辦、#新增待辦"),
+    ("buyer", "客需指令：#新增客需、#買方追蹤、#帶看、#成交"),
+    ("seller", "委託指令：#新增委託、#賣方追蹤、#查詢委託到期"),
+    ("development", "開發指令：#新增開發、#開發追蹤、開發自由格式"),
+    ("query", "查詢指令：#查詢紀錄"),
+    ("followup", "卡片回覆追蹤 / 勾選待辦 / postback 操作"),
+]
+
+LINE_SETTINGS_ADMIN_SESSION_KEY = "line_settings_admin_ok"
+
+
+def _settings_admin_password_ok(password: str) -> bool:
+    password = str(password or "")
+    if not password:
+        return False
+
+    # 1. Firestore 內儲存的雜湊密碼優先。
+    try:
+        settings = get_line_card_settings()
+        password_hash = settings.get("settings_admin_password_hash", "") or ""
+        if password_hash and check_password_hash(password_hash, password):
+            return True
+    except Exception:
+        pass
+
+    # 2. 環境變數可作為備援 / 忘記密碼時覆蓋。
+    env_password = (os.environ.get("LINE_SETTINGS_ADMIN_PASSWORD") or "").strip()
+    if env_password and hmac.compare_digest(env_password, password):
+        return True
+
+    # 3. 第一次安裝預設密碼：123456。登入後請立即到設定中心修改。
+    if not env_password:
+        return hmac.compare_digest("123456", password)
+
+    return False
+
+
+def _normalize_permission_list(values):
+    if not values:
+        return []
+    if isinstance(values, str):
+        values = re.split(r"[，,、\s]+", values)
+    out = []
+    seen = set()
+    for item in values:
+        item = str(item or "").strip()
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _normalize_line_group_config(group):
+    group = dict(group or {})
+    return {
+        "enabled": bool(group.get("enabled", True)),
+        "name": (group.get("name") or "未命名群組").strip(),
+        "target_id": (group.get("target_id") or group.get("group_id") or group.get("room_id") or "").strip(),
+        "receive_types": _normalize_permission_list(group.get("receive_types") or group.get("receives") or []),
+        "command_types": _normalize_permission_list(group.get("command_types") or group.get("commands") or []),
+        "note": (group.get("note") or "").strip(),
+    }
+
+
+def get_line_group_settings():
+    """讀取設定中心的群組清單。舊版 notify_target_id 會自動轉成一個預設群組。"""
+    settings = get_line_card_settings()
+    groups = []
+
+    for g in settings.get("line_groups") or []:
+        ng = _normalize_line_group_config(g)
+        if ng.get("target_id"):
+            groups.append(ng)
+
+    # 舊版單一群組相容：有 notify_target_id 但還沒設定 line_groups 時，視為預設群組。
+    old_target = (settings.get("notify_target_id") or settings.get("line_notify_target_id") or os.environ.get("LINE_NOTIFY_TARGET_ID") or "").strip()
+    if old_target and not any(g.get("target_id") == old_target for g in groups):
+        groups.append({
+            "enabled": True,
+            "name": "預設群組",
+            "target_id": old_target,
+            "receive_types": [x[0] for x in LINE_RECEIVE_TYPE_OPTIONS],
+            "command_types": [x[0] for x in LINE_COMMAND_TYPE_OPTIONS],
+            "note": "由舊版 LINE_NOTIFY_TARGET_ID / notify_target_id 自動帶入",
+        })
+
+    return groups
+
+
+def get_enabled_line_groups():
+    return [g for g in get_line_group_settings() if g.get("enabled") and g.get("target_id")]
+
+
+def line_event_source_kind_and_id(event):
+    source = (event or {}).get("source") or {}
+    if source.get("groupId"):
+        return "group", source.get("groupId")
+    if source.get("roomId"):
+        return "room", source.get("roomId")
+    if source.get("userId"):
+        return "user", source.get("userId")
+    return "unknown", ""
+
+
+def find_line_group_by_target_id(target_id: str):
+    target_id = (target_id or "").strip()
+    if not target_id:
+        return None
+    for g in get_enabled_line_groups():
+        if (g.get("target_id") or "").strip() == target_id:
+            return g
+    return None
+
+
+def line_group_allows_receive(group, receive_type: str) -> bool:
+    if not group or not group.get("enabled"):
+        return False
+    allowed = set(group.get("receive_types") or [])
+    return "all" in allowed or receive_type in allowed
+
+
+def line_group_allows_command(group, command_type: str) -> bool:
+    if not group or not group.get("enabled"):
+        return False
+    allowed = set(group.get("command_types") or [])
+    return "all" in allowed or command_type in allowed
+
+
+def detect_line_command_type(text: str, event=None) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    first = text.splitlines()[0].strip().replace(" ", "")
+    first_no_hash = first[1:] if first.startswith("#") else first
+
+    if first_no_hash in ("綁定", "群組ID", "查詢群組ID", "取得群組ID", "GroupID", "groupid"):
+        return "system_group_id"
+
+    if first_no_hash in ("今日行程", "今天行程", "明日行程", "明天行程", "本週行程", "新增行程"):
+        return "calendar"
+    if first_no_hash in ("今日待辦", "待辦", "新增待辦"):
+        return "todo"
+    if first_no_hash in ("新增客需", "買方追蹤", "帶看", "成交", "客戶分類"):
+        return "buyer"
+    if first_no_hash in ("新增委託", "賣方追蹤", "查詢委託到期", "委託"):
+        return "seller"
+    if first_no_hash in ("新增開發", "開發追蹤"):
+        return "development"
+    if first_no_hash in ("查詢紀錄",):
+        return "query"
+
+    # 開發自由格式通常沒有 #，給開發群組使用。
+    if not first.startswith("#") and ("地址" in text or "屋主" in text or "自售" in text):
+        return "development"
+
+    return "unknown"
+
+
+def detect_line_postback_command_type(event) -> str:
+    try:
+        data = ((event or {}).get("postback") or {}).get("data", "") or ""
+        if "todo" in data:
+            return "todo"
+        if "followup" in data:
+            return "followup"
+        if "calendar" in data:
+            return "calendar"
+    except Exception:
+        pass
+    return "followup"
+
+
+def line_access_gate(event):
+    """檢查群組是否被授權，以及該群組是否能使用此指令。"""
+    kind, target_id = line_event_source_kind_and_id(event)
+
+    # 允許任何地方詢問群組 ID，方便設定。
+    if (event.get("message") or {}).get("type") == "text":
+        text = (event.get("message") or {}).get("text", "")
+        if detect_line_command_type(text) == "system_group_id":
+            return True, "system_group_id", None
+
+    group = find_line_group_by_target_id(target_id)
+    if not group:
+        if kind == "user":
+            return False, "未授權：此官方帳號不開放私人指令。請在已設定的 LINE 群組中使用。", None
+        if target_id:
+            return False, f"未授權：此群組尚未在後台設定。\n群組ID：{target_id}\n請到「設定 → LINE群組權限」新增此群組。", None
+        return False, "未授權：無法辨識 LINE 來源。", None
+
+    if event.get("type") == "postback":
+        cmd_type = detect_line_postback_command_type(event)
+    else:
+        text = (event.get("message") or {}).get("text", "")
+        cmd_type = detect_line_command_type(text)
+
+    # unknown 文字不主動放行，避免陌生人加了官方帳號後亂試。
+    if cmd_type == "unknown":
+        return False, "這個群組沒有可辨識的指令。請使用已開放的 #指令。", group
+
+    if cmd_type == "system_group_id":
+        return True, cmd_type, group
+
+    if not line_group_allows_command(group, cmd_type):
+        return False, f"此群組未開放「{cmd_type}」類指令，請到後台設定中心調整群組權限。", group
+
+    return True, cmd_type, group
+
+
+def line_get_push_targets(receive_type: str):
+    targets = []
+    for g in get_enabled_line_groups():
+        if line_group_allows_receive(g, receive_type):
+            targets.append(g)
+    return targets
+
+
+def line_push_messages_to_allowed_groups(receive_type: str, messages: list):
+    targets = line_get_push_targets(receive_type)
+    if not targets:
+        return {"ok": False, "error": f"沒有設定可接收「{receive_type}」的 LINE 群組"}
+
+    results = []
+    ok_count = 0
+    for g in targets:
+        res = line_push_messages(g.get("target_id"), messages)
+        res["group_name"] = g.get("name")
+        res["target_id"] = g.get("target_id")
+        results.append(res)
+        if res.get("ok"):
+            ok_count += 1
+    return {"ok": ok_count > 0, "sent_count": ok_count, "total_count": len(targets), "results": results}
+
+
+# 覆寫舊版單一群組：依群組設定發送到所有允許接收該類型的群組。
+def _push_record_to_group(record_type: str, record_id: str, title_prefix="CRM 資料"):
+    coll = {"buyer": "buyers", "seller": "sellers", "development": "developments"}.get(record_type)
+    if not coll:
+        return {"ok": False, "error": "record_type 不正確"}
+    snap = db.collection(coll).document(record_id).get()
+    if not snap.exists:
+        return {"ok": False, "error": "找不到資料"}
+    data = snap.to_dict() or {}
+    bubble = _build_record_flex_bubble(record_type, record_id, data, title_prefix=title_prefix)
+    return line_push_messages_to_allowed_groups(record_type, [{"type": "flex", "altText": f"{title_prefix}：{data.get('name','')}", "contents": bubble}])
+
+
+def _push_calendar_event_to_group(event_id: str, title_prefix="行程資料"):
+    snap = db.collection(CALENDAR_EVENT_COLLECTION).document(event_id).get()
+    if not snap.exists:
+        return {"ok": False, "error": "找不到行程"}
+    event = doc_to_calendar_event(snap)
+    bubble = build_calendar_event_bubble(event)
+    return line_push_messages_to_allowed_groups("calendar", [{"type": "flex", "altText": f"{title_prefix}：{event.get('title','')}", "contents": bubble}])
+
+
+def _line_push_result_flash_message(res):
+    if not res.get("ok"):
+        return f"傳送失敗：{res.get('error') or res.get('text') or res}", "danger"
+    if res.get("total_count"):
+        return f"已傳送到 {res.get('sent_count', 0)}/{res.get('total_count', 0)} 個 LINE 群組", "success"
+    return "已傳送到 LINE 群組", "success"
+
+
+# 讓舊有 send-to-line route 的 flash 顯示多群組結果。
+def buyer_send_to_line_multi_group(buyer_id):
+    res = _push_record_to_group("buyer", buyer_id, title_prefix="後台傳送")
+    msg, cat = _line_push_result_flash_message(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("buyer_detail", buyer_id=buyer_id))
+
+
+def seller_send_to_line_multi_group(seller_id):
+    res = _push_record_to_group("seller", seller_id, title_prefix="後台傳送")
+    msg, cat = _line_push_result_flash_message(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("seller_detail", seller_id=seller_id))
+
+
+def development_send_to_line_multi_group(development_id):
+    res = _push_record_to_group("development", development_id, title_prefix="後台傳送")
+    msg, cat = _line_push_result_flash_message(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("development_detail", development_id=development_id))
+
+
+def calendar_send_to_line_multi_group(event_id):
+    res = _push_calendar_event_to_group(event_id, title_prefix="後台傳送行程")
+    msg, cat = _line_push_result_flash_message(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("calendar_page"))
+
+
+try:
+    app.view_functions["buyer_send_to_line"] = login_required(buyer_send_to_line_multi_group)
+    app.view_functions["seller_send_to_line"] = login_required(seller_send_to_line_multi_group)
+    app.view_functions["development_send_to_line"] = login_required(development_send_to_line_multi_group)
+    app.view_functions["calendar_send_to_line"] = login_required(calendar_send_to_line_multi_group)
+except Exception as e:
+    print("⚠️ 套用多群組發送 view 失敗：", e)
+
+
+LINE_SETTINGS_CENTER_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <title>設定中心｜厝米 Team M.E</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body{background:#f6f3ef;}
+    .setting-card{background:#fff;border:1px solid #eadbca;border-radius:18px;box-shadow:0 6px 22px rgba(120,80,40,.08);}
+    .section-title{font-weight:800;color:#7a4e2d;}
+    .hint{font-size:.86rem;color:#777;}
+    .sticky-side{position:sticky;top:20px;}
+    textarea{min-height:140px;}
+    .group-box{border:1px solid #eadbca;border-radius:14px;padding:14px;background:#fffaf5;}
+    .code{font-family:Consolas,monospace;font-size:.85rem;}
+  </style>
+</head>
+<body>
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="{{ url_for('buyers') }}">厝米 Team M.E</a>
+    <div class="d-flex ms-auto flex-wrap gap-2">
+      <a href="{{ url_for('buyers') }}" class="btn btn-sm btn-outline-light">客需</a>
+      <a href="{{ url_for('sellers') }}" class="btn btn-sm btn-outline-light">委託</a>
+      <a href="{{ url_for('developments') }}" class="btn btn-sm btn-outline-light">開發</a>
+      <a href="{{ url_for('calendar_page') }}" class="btn btn-sm btn-outline-light">行事曆</a>
+      <a href="{{ url_for('todos_page') }}" class="btn btn-sm btn-outline-light">待辦事項</a>
+      <a href="{{ url_for('logout') }}" class="btn btn-sm btn-warning">登出</a>
+    </div>
+  </div>
+</nav>
+
+<div class="container mb-5">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, msg in messages %}
+        <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+          {{ msg }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <div>
+      <h2 class="mb-1">設定中心</h2>
+      <div class="text-muted small">LINE 群組、權限、卡片樣式、行事曆分類都在這裡管理。</div>
+    </div>
+    <form method="post" action="{{ url_for('line_settings_admin_logout') }}">
+      <button class="btn btn-outline-danger btn-sm">離開管理模式</button>
+    </form>
+  </div>
+
+  <form method="post">
+    <div class="row g-4">
+      <div class="col-lg-3">
+        <div class="setting-card p-3 sticky-side">
+          <div class="section-title mb-2">設定區塊</div>
+          <div class="list-group small">
+            <a class="list-group-item list-group-item-action" href="#security">管理員密碼</a>
+            <a class="list-group-item list-group-item-action" href="#groups">LINE 群組權限</a>
+            <a class="list-group-item list-group-item-action" href="#card">LINE 卡片樣式</a>
+            <a class="list-group-item list-group-item-action" href="#calendar">行事曆設定</a>
+            <a class="list-group-item list-group-item-action" href="#help">指令說明</a>
+          </div>
+          <button class="btn btn-primary w-100 mt-3" type="submit">儲存設定</button>
+        </div>
+      </div>
+
+      <div class="col-lg-9">
+        <div id="security" class="setting-card p-4 mb-4">
+          <h4 class="section-title">管理員密碼</h4>
+          <div class="hint mb-3">進入此設定頁需要輸入管理員密碼。第一次預設密碼是 <span class="code">123456</span>，建議立即修改；也可以用環境變數 <span class="code">LINE_SETTINGS_ADMIN_PASSWORD</span> 強制覆蓋。</div>
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">新管理員密碼</label>
+              <input type="password" name="new_settings_admin_password" class="form-control" placeholder="留空則不修改">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">再次輸入新密碼</label>
+              <input type="password" name="new_settings_admin_password_confirm" class="form-control" placeholder="留空則不修改">
+            </div>
+          </div>
+        </div>
+
+        <div id="groups" class="setting-card p-4 mb-4">
+          <h4 class="section-title">LINE 群組權限</h4>
+          <div class="hint mb-3">
+            只有列在這裡且啟用的群組 / 房間可以使用指令。私人聊天預設不能使用。<br>
+            群組 ID 可以在群組輸入 <span class="code">#綁定</span> 取得。
+          </div>
+
+          <input type="hidden" name="group_count" value="{{ group_rows|length }}">
+          {% for g in group_rows %}
+            {% set idx = loop.index0 %}
+            <div class="group-box mb-3">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <strong>群組 {{ loop.index }}</strong>
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="group_{{ idx }}_enabled" {% if g.enabled %}checked{% endif %}>
+                  <label class="form-check-label">啟用</label>
+                </div>
+              </div>
+              <div class="row g-2 mb-3">
+                <div class="col-md-4">
+                  <label class="form-label">群組名稱</label>
+                  <input class="form-control" name="group_{{ idx }}_name" value="{{ g.name }}" placeholder="例如：小秘書群">
+                </div>
+                <div class="col-md-8">
+                  <label class="form-label">群組 / 房間 ID</label>
+                  <input class="form-control code" name="group_{{ idx }}_target_id" value="{{ g.target_id }}" placeholder="Cxxxxxxxx 或 Rxxxxxxxx">
+                </div>
+              </div>
+
+              <div class="mb-2 fw-bold small">這個群組可以接收哪些後台推播？</div>
+              <div class="row g-2 mb-3">
+                {% for key, label in receive_options %}
+                  <div class="col-md-6">
+                    <label class="form-check">
+                      <input class="form-check-input" type="checkbox" name="group_{{ idx }}_receive_types" value="{{ key }}" {% if key in g.receive_types %}checked{% endif %}>
+                      <span class="form-check-label">{{ label }}</span>
+                    </label>
+                  </div>
+                {% endfor %}
+              </div>
+
+              <div class="mb-2 fw-bold small">這個群組可以下哪些 LINE 指令？</div>
+              <div class="row g-2 mb-3">
+                {% for key, label in command_options %}
+                  <div class="col-md-6">
+                    <label class="form-check">
+                      <input class="form-check-input" type="checkbox" name="group_{{ idx }}_command_types" value="{{ key }}" {% if key in g.command_types %}checked{% endif %}>
+                      <span class="form-check-label">{{ label }}</span>
+                    </label>
+                  </div>
+                {% endfor %}
+              </div>
+
+              <label class="form-label">備註</label>
+              <input class="form-control" name="group_{{ idx }}_note" value="{{ g.note }}" placeholder="例如：店內公告用、業務群、測試群">
+            </div>
+          {% endfor %}
+        </div>
+
+        <div id="card" class="setting-card p-4 mb-4">
+          <h4 class="section-title">LINE 卡片樣式</h4>
+          <div class="row g-3">
+            <div class="col-md-4"><label class="form-label">今天行程標題</label><input name="title_today" class="form-control" value="{{ settings.title_today }}"></div>
+            <div class="col-md-4"><label class="form-label">明日行程標題</label><input name="title_tomorrow" class="form-control" value="{{ settings.title_tomorrow }}"></div>
+            <div class="col-md-4"><label class="form-label">本週行程標題</label><input name="title_week" class="form-control" value="{{ settings.title_week }}"></div>
+            <div class="col-md-3"><label class="form-label">主色</label><input type="color" name="primary_color" class="form-control form-control-color" value="{{ settings.primary_color or '#C9874A' }}"></div>
+            <div class="col-md-3"><label class="form-label">按鈕色</label><input type="color" name="button_color" class="form-control form-control-color" value="{{ settings.button_color or '#C9874A' }}"></div>
+            <div class="col-md-6">
+              <label class="form-label">快速操作按鈕文字</label>
+              <textarea name="quick_actions" class="form-control">{{ quick_actions_text }}</textarea>
+            </div>
+            <div class="col-12">
+              <div class="row g-2">
+                {% for key, label in [('show_phone','顯示電話'),('show_location','顯示地點'),('show_note','顯示備註'),('show_customer','顯示客戶'),('show_quick_actions','顯示快速操作'),('line_only_enabled_events','只顯示勾選 LINE 的行程')] %}
+                  <div class="col-md-4"><label class="form-check"><input class="form-check-input" type="checkbox" name="{{ key }}" {% if settings.get(key) %}checked{% endif %}> {{ label }}</label></div>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="calendar" class="setting-card p-4 mb-4">
+          <h4 class="section-title">行事曆設定</h4>
+          <div class="row g-3">
+            <div class="col-md-3"><label class="form-label">開始小時</label><input type="number" name="calendar_start_hour" class="form-control" value="{{ settings.calendar_start_hour or 8 }}" min="0" max="23"></div>
+            <div class="col-md-3"><label class="form-label">結束小時</label><input type="number" name="calendar_end_hour" class="form-control" value="{{ settings.calendar_end_hour or 22 }}" min="0" max="23"></div>
+            <div class="col-md-6"></div>
+            <div class="col-12">
+              <label class="form-label">行事曆行程分類</label>
+              <textarea name="calendar_categories" class="form-control">{{ calendar_categories_text }}</textarea>
+              <div class="hint mt-1">一行一個分類，會同步用在後台新增 / 編輯行程與 LINE #新增行程。</div>
+            </div>
+          </div>
+        </div>
+
+        <div id="help" class="setting-card p-4 mb-4">
+          <h4 class="section-title">指令說明</h4>
+          <div class="row g-3 small">
+            <div class="col-md-6"><strong>查群組 ID</strong><br><span class="code">#綁定</span></div>
+            <div class="col-md-6"><strong>行事曆</strong><br><span class="code">#今日行程 / #明日行程 / #本週行程 / #新增行程</span></div>
+            <div class="col-md-6"><strong>待辦</strong><br><span class="code">#今日待辦 / #待辦 / #新增待辦</span></div>
+            <div class="col-md-6"><strong>客需 / 委託 / 開發</strong><br><span class="code">#新增客需 / #新增委託 / #新增開發</span></div>
+          </div>
+        </div>
+
+        <button class="btn btn-primary btn-lg w-100" type="submit">儲存全部設定</button>
+      </div>
+    </div>
+  </form>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
+
+
+LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <title>設定中心管理員驗證</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>body{background:#f6f3ef}.box{max-width:420px;margin:80px auto;background:#fff;border-radius:18px;padding:28px;box-shadow:0 8px 28px rgba(120,80,40,.12)}</style>
+</head>
+<body>
+  <div class="box">
+    <h3 class="mb-2">設定中心</h3>
+    <p class="text-muted small">此頁可管理 LINE 群組權限與指令，請輸入管理員密碼。</p>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, msg in messages %}
+          <div class="alert alert-{{ category }} py-2">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+    <form method="post">
+      <input type="hidden" name="admin_login" value="1">
+      <div class="mb-3">
+        <label class="form-label">管理員密碼</label>
+        <input type="password" name="admin_password" class="form-control" autofocus required>
+      </div>
+      <button class="btn btn-primary w-100">進入設定中心</button>
+      <a href="{{ url_for('buyers') }}" class="btn btn-link w-100 mt-2">回後台</a>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+
+def parse_line_groups_from_form(form):
+    try:
+        count = int(form.get("group_count", 0))
+    except Exception:
+        count = 0
+    count = max(0, min(20, count))
+    groups = []
+    for i in range(count):
+        target_id = (form.get(f"group_{i}_target_id") or "").strip()
+        name = (form.get(f"group_{i}_name") or "").strip()
+        # 空白列不儲存。
+        if not target_id and not name:
+            continue
+        groups.append({
+            "enabled": form.get(f"group_{i}_enabled") == "on",
+            "name": name or f"群組 {i+1}",
+            "target_id": target_id,
+            "receive_types": form.getlist(f"group_{i}_receive_types"),
+            "command_types": form.getlist(f"group_{i}_command_types"),
+            "note": (form.get(f"group_{i}_note") or "").strip(),
+        })
+    return groups
+
+
+def save_line_settings_center_from_form(form):
+    # 保留既有設定儲存邏輯：卡片樣式、行事曆分類。
+    updates = save_line_card_settings_from_form(form)
+
+    groups = parse_line_groups_from_form(form)
+
+    # 若使用者沒有填任何群組，但有舊版 notify_target_id，就保留相容。
+    if not groups:
+        old_target = (form.get("notify_target_id") or updates.get("notify_target_id") or os.environ.get("LINE_NOTIFY_TARGET_ID") or "").strip()
+        if old_target:
+            groups = [{
+                "enabled": True,
+                "name": "預設群組",
+                "target_id": old_target,
+                "receive_types": [x[0] for x in LINE_RECEIVE_TYPE_OPTIONS],
+                "command_types": [x[0] for x in LINE_COMMAND_TYPE_OPTIONS],
+                "note": "舊版單一群組相容",
+            }]
+
+    extra = {
+        "line_groups": groups,
+        "updated_at": now_taipei().isoformat(),
+        "updated_by_id": session.get("user_id", ""),
+        "updated_by_name": session.get("user_name", ""),
+    }
+
+    new_pw = (form.get("new_settings_admin_password") or "").strip()
+    new_pw2 = (form.get("new_settings_admin_password_confirm") or "").strip()
+    if new_pw or new_pw2:
+        if new_pw != new_pw2:
+            raise ValueError("兩次輸入的新管理員密碼不一致")
+        if len(new_pw) < 4:
+            raise ValueError("管理員密碼至少 4 碼")
+        extra["settings_admin_password_hash"] = generate_password_hash(new_pw)
+
+    db.collection(LINE_CARD_SETTINGS_COLLECTION).document("default").set(extra, merge=True)
+    return {**updates, **extra}
+
+
+def line_card_settings_center():
+    if request.method == "POST" and request.form.get("admin_login") == "1":
+        if _settings_admin_password_ok(request.form.get("admin_password", "")):
+            session[LINE_SETTINGS_ADMIN_SESSION_KEY] = True
+            flash("已進入設定中心", "success")
+            return redirect(url_for("line_card_settings"))
+        flash("管理員密碼錯誤", "danger")
+        return render_template_string(LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE)
+
+    if not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
+        return render_template_string(LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE)
+
+    if request.method == "POST":
+        try:
+            save_line_settings_center_from_form(request.form)
+            flash("設定已更新", "success")
+        except Exception as e:
+            flash(f"設定儲存失敗：{e}", "danger")
+        return redirect(url_for("line_card_settings"))
+
+    settings = get_line_card_settings()
+    groups = get_line_group_settings()
+
+    # 顯示固定 6 列；不足補空白列，方便新增群組。
+    group_rows = list(groups)
+    while len(group_rows) < 6:
+        group_rows.append({
+            "enabled": False,
+            "name": "",
+            "target_id": "",
+            "receive_types": [],
+            "command_types": [],
+            "note": "",
+        })
+
+    return render_template_string(
+        LINE_SETTINGS_CENTER_TEMPLATE,
+        settings=settings,
+        group_rows=group_rows,
+        receive_options=LINE_RECEIVE_TYPE_OPTIONS,
+        command_options=LINE_COMMAND_TYPE_OPTIONS,
+        quick_actions_text="\n".join(settings.get("quick_actions") or []),
+        calendar_categories_text="\n".join(get_calendar_category_options()),
+    )
+
+
+@app.route("/line-card-settings/logout-admin", methods=["POST"], endpoint="line_settings_admin_logout")
+@login_required
+def line_settings_admin_logout():
+    session.pop(LINE_SETTINGS_ADMIN_SESSION_KEY, None)
+    flash("已離開設定中心管理模式", "info")
+    return redirect(url_for("buyers"))
+
+
+try:
+    app.view_functions["line_card_settings"] = login_required(line_card_settings_center)
+    print("✅ 設定中心已啟用：/line-card-settings 需管理員密碼，支援多群組權限")
+except Exception as e:
+    print("⚠️ 設定中心套用失敗：", e)
+
+
+# 覆寫 LINE webhook：加入群組/指令權限控管。
+def line_webhook_with_group_acl():
+    raw_body = request.get_data(cache=False, as_text=False)
+    signature = request.headers.get("x-line-signature", "")
+
+    if not verify_line_signature(raw_body, signature):
+        return "Invalid signature", 400
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception as e:
+        print("⚠️ LINE webhook JSON 解析失敗：", e)
+        return "Bad Request", 400
+
+    events = payload.get("events", [])
+    for event in events:
+        try:
+            reply_token = event.get("replyToken")
+
+            # 綁定/ID查詢：任何來源都可以用，方便建立設定。
+            if (event.get("message") or {}).get("type") == "text":
+                text = (event.get("message") or {}).get("text", "")
+                if detect_line_command_type(text) == "system_group_id":
+                    kind, target_id = line_event_source_kind_and_id(event)
+                    msg = f"來源類型：{kind}\nID：{target_id or '-'}\n請複製這個 ID 到後台「設定 → LINE 群組權限」。"
+                    if reply_token:
+                        reply_line_text(reply_token, msg)
+                    continue
+
+            allowed, reason_or_cmd, group = line_access_gate(event)
+            if not allowed:
+                if reply_token:
+                    reply_line_text(reply_token, reason_or_cmd)
+                continue
+
+            if event.get("type") == "postback":
+                result = process_line_postback_event(event)
+            else:
+                result = process_line_message_event(event)
+
+            if not result or not result.get("handled"):
+                continue
+
+            reply_result = None
+            if not reply_token:
+                continue
+
+            if result.get("reply_messages"):
+                reply_result = reply_line_messages(reply_token, result.get("reply_messages") or [])
+            elif result.get("reply_flex"):
+                reply_result = reply_line_flex(
+                    reply_token,
+                    result.get("reply_text", "CRM 卡片"),
+                    result.get("reply_flex"),
+                    quick_reply_items=result.get("reply_quick_reply"),
+                )
+            elif result.get("reply_text"):
+                reply_result = reply_line_text(
+                    reply_token,
+                    result["reply_text"] if result.get("ok") else result["reply_text"],
+                )
+
+            if result.get("ok") and result.get("target_type") and result.get("target_id") and reply_result:
+                for sent in reply_result.get("sent_messages", []):
+                    sent_id = str(sent.get("id", "")).strip()
+                    if sent_id:
+                        save_line_message_link(
+                            sent_id,
+                            result["target_type"],
+                            result["target_id"],
+                            tag=result.get("parsed_tag", ""),
+                            action="bot_reply",
+                            customer_name=result.get("customer_name", ""),
+                            phone=result.get("phone", ""),
+                            source_event=event,
+                        )
+        except Exception as e:
+            print("⚠️ 處理 LINE event 發生錯誤：", e)
+
+    return "OK", 200
+
+
+try:
+    app.view_functions["line_webhook"] = line_webhook_with_group_acl
+    print("✅ LINE 群組權限控管已啟用：未設定群組不可使用指令")
+except Exception as e:
+    print("⚠️ LINE 群組權限控管套用失敗：", e)
+
+# =============================================================================
+# LINE 設定中心 + 多群組權限 + 指令控管 Patch End
+# =============================================================================
+
+
+
+# =============================================================================
+# 行事曆：個人 / 公開分流 + LINE 個人帳號綁定 Patch v20260622B
+# - 公開行程：傳送到設定中心中可接收 calendar 的群組
+# - 個人行程：綁定 LINE 個人 userId，單獨 push 給該人
+# - LINE 私訊指令：只有設定中心已綁定的 LINE 個人帳號可使用
+# - 後台行事曆：公開 / 個人可分開篩選顯示
+# =============================================================================
+
+LINE_PERSONAL_USER_COUNT_DEFAULT = 8
+
+
+def _normalize_line_personal_user_config(user):
+    user = dict(user or {})
+    return {
+        "enabled": bool(user.get("enabled", True)),
+        "name": (user.get("name") or user.get("display_name") or "未命名使用者").strip(),
+        "user_id": (user.get("user_id") or user.get("line_user_id") or "").strip(),
+        "receive_types": _normalize_permission_list(user.get("receive_types") or user.get("receives") or ["calendar"]),
+        "command_types": _normalize_permission_list(user.get("command_types") or user.get("commands") or ["calendar", "todo", "followup"]),
+        "note": (user.get("note") or "").strip(),
+    }
+
+
+def get_line_personal_users(include_disabled=False):
+    settings = get_line_card_settings()
+    users = []
+    for u in settings.get("line_personal_users") or []:
+        nu = _normalize_line_personal_user_config(u)
+        if nu.get("user_id") and (include_disabled or nu.get("enabled")):
+            users.append(nu)
+    return users
+
+
+def find_line_personal_user_by_user_id(user_id: str):
+    user_id = (user_id or "").strip()
+    if not user_id:
+        return None
+    for u in get_line_personal_users(include_disabled=False):
+        if (u.get("user_id") or "").strip() == user_id:
+            return u
+    return None
+
+
+def line_personal_user_allows_receive(user, receive_type: str) -> bool:
+    if not user or not user.get("enabled"):
+        return False
+    allowed = set(user.get("receive_types") or [])
+    return "all" in allowed or receive_type in allowed
+
+
+def line_personal_user_allows_command(user, command_type: str) -> bool:
+    if not user or not user.get("enabled"):
+        return False
+    allowed = set(user.get("command_types") or [])
+    return "all" in allowed or command_type in allowed
+
+
+def calendar_event_visibility_text(event):
+    return "個人行程" if (event.get("visibility") or "") == "personal" else "公開行程"
+
+
+def calendar_event_target_line_user_id(event):
+    return (event.get("owner_line_user_id") or event.get("line_user_id") or event.get("target_user_id") or "").strip()
+
+
+def calendar_event_target_line_name(event):
+    return (event.get("owner_line_name") or event.get("line_user_name") or event.get("target_user_name") or "").strip()
+
+
+# 覆寫 doc_to_calendar_event：補個人 LINE 綁定欄位與可見性顯示。
+def doc_to_calendar_event(doc):
+    data = doc_to_dict(doc)
+    data["start_time"] = calendar_safe_time(data.get("start_time"), "09:00")
+    data["end_time"] = calendar_safe_time(data.get("end_time"), next_30_min_time(data["start_time"]))
+    data["event_date"] = calendar_safe_date(data.get("event_date"))
+    data["event_date_label"] = format_calendar_date_label(data.get("event_date"))
+    data["category"] = (data.get("category") or "其他").strip()
+    data["custom_category"] = data.get("custom_category") or ""
+    data["display_category"] = data.get("display_category") or (
+        data["custom_category"] if data["category"] == "其他" and data["custom_category"] else data["category"]
+    )
+    data["visibility"] = (data.get("visibility") or "public").strip()
+    if data["visibility"] not in ("public", "personal"):
+        data["visibility"] = "public"
+    data["owner_line_user_id"] = calendar_event_target_line_user_id(data)
+    data["owner_line_name"] = calendar_event_target_line_name(data)
+    data["visibility_text"] = calendar_event_visibility_text(data)
+    data["category_color"] = data.get("category_color") or get_calendar_category_color(data["category"])
+    return data
+
+
+# 讀取日期區間，支援後台篩選與 LINE 來源篩選。
+def fetch_calendar_events(start_date: str, end_date: str = None, line_only: bool = False, calendar_view: str = "all", line_source_kind: str = "", line_source_id: str = ""):
+    start_date = calendar_safe_date(start_date)
+    end_date = calendar_safe_date(end_date or start_date)
+    events = []
+
+    try:
+        if start_date == end_date:
+            docs = db.collection(CALENDAR_EVENT_COLLECTION).where("event_date", "==", start_date).stream()
+        else:
+            docs = db.collection(CALENDAR_EVENT_COLLECTION).where("event_date", ">=", start_date).where("event_date", "<=", end_date).stream()
+        docs = list(docs)
+    except Exception as e:
+        print("⚠️ Firestore 日期區間查詢失敗，改用備援讀取：", e)
+        docs = list(db.collection(CALENDAR_EVENT_COLLECTION).stream())
+
+    current_user_id = ""
+    try:
+        current_user_id = session.get("user_id", "") if request else ""
+    except Exception:
+        current_user_id = ""
+
+    for d in docs:
+        try:
+            item = doc_to_calendar_event(d)
+        except Exception:
+            continue
+        if not (start_date <= item.get("event_date", "") <= end_date):
+            continue
+        if line_only and not item.get("line_enabled", True):
+            continue
+
+        vis = item.get("visibility") or "public"
+        owner_uid = item.get("owner_user_id") or ""
+        owner_line_uid = calendar_event_target_line_user_id(item)
+
+        if line_only:
+            # LINE 群組 / 房間只看公開行程；私人使用者看公開行程 + 綁定給自己的個人行程。
+            if line_source_kind in ("group", "room"):
+                if vis != "public":
+                    continue
+            elif line_source_kind == "user":
+                if vis == "personal" and owner_line_uid != line_source_id:
+                    continue
+                # vis == public 仍顯示，讓個人也能看到公開行程。
+            else:
+                if vis != "public":
+                    continue
+        else:
+            # 後台：公開都可見；個人只給建立者看。若 calendar_view 指定，做分流。
+            if calendar_view == "public" and vis != "public":
+                continue
+            if calendar_view == "personal" and vis != "personal":
+                continue
+            if vis == "personal" and owner_uid and current_user_id and owner_uid != current_user_id:
+                continue
+
+        events.append(item)
+
+    events.sort(key=lambda x: (x.get("event_date", ""), x.get("start_time", ""), x.get("created_at", "")))
+    return events
+
+
+def build_calendar_event_payload(form, existing=None):
+    existing = existing or {}
+    event_date = calendar_safe_date(form.get("event_date") or existing.get("event_date"))
+    start_time = calendar_safe_time(form.get("start_time") or existing.get("start_time"), "09:00")
+    end_time = calendar_safe_time(form.get("end_time") or existing.get("end_time"), next_30_min_time(start_time))
+    if calendar_time_to_minutes(end_time) <= calendar_time_to_minutes(start_time):
+        end_time = next_30_min_time(start_time)
+
+    category_options = get_calendar_category_options()
+    category = (form.get("category", "") or existing.get("category") or "其他").strip()
+    if category not in category_options:
+        category = "其他"
+
+    custom_category = (form.get("custom_category", "") or existing.get("custom_category", "") or "").strip()
+    display_category = custom_category if category == "其他" and custom_category else category
+
+    visibility = (form.get("visibility", "") or existing.get("visibility") or "personal").strip()
+    if visibility not in ("personal", "public"):
+        visibility = "personal"
+
+    owner_line_user_id = (form.get("owner_line_user_id") or existing.get("owner_line_user_id") or "").strip()
+    owner_line_name = ""
+    for u in get_line_personal_users(include_disabled=True):
+        if u.get("user_id") == owner_line_user_id:
+            owner_line_name = u.get("name") or ""
+            break
+    if not owner_line_name:
+        owner_line_name = (form.get("owner_line_name") or existing.get("owner_line_name") or "").strip()
+
+    payload = {
+        "title": (form.get("title", "") or "").strip(),
+        "event_date": event_date,
+        "start_time": start_time,
+        "end_time": end_time,
+        "category": category,
+        "custom_category": custom_category,
+        "display_category": display_category,
+        "visibility": visibility,
+        "owner_user_id": existing.get("owner_user_id") or session.get("user_id", ""),
+        "owner_user_name": existing.get("owner_user_name") or session.get("user_name", ""),
+        "owner_line_user_id": owner_line_user_id if visibility == "personal" else "",
+        "owner_line_name": owner_line_name if visibility == "personal" else "",
+        "category_color": get_calendar_category_color(category),
+        "related_type": (form.get("related_type", "") or "").strip(),
+        "related_id": (form.get("related_id", "") or "").strip(),
+        "customer_name": (form.get("customer_name", "") or "").strip(),
+        "phone": (form.get("phone", "") or "").strip(),
+        "location": (form.get("location", "") or "").strip(),
+        "note": (form.get("note", "") or "").strip(),
+        "line_enabled": form.get("line_enabled") == "on",
+        "updated_at": now_taipei().isoformat(),
+        "updated_by_id": session.get("user_id", ""),
+        "updated_by_name": session.get("user_name", ""),
+    }
+    if not payload["title"]:
+        name = payload.get("customer_name") or payload.get("location") or category
+        payload["title"] = f"{name} {category}".strip()
+    return payload
+
+
+def calendar_page_personal_public():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    selected_date_label = format_calendar_date_label(selected_date)
+    calendar_view = (request.args.get("view") or "all").strip()
+    if calendar_view not in ("all", "public", "personal"):
+        calendar_view = "all"
+
+    events = fetch_calendar_events(selected_date, calendar_view=calendar_view)
+    public_events = [e for e in events if (e.get("visibility") or "public") == "public"]
+    personal_events = [e for e in events if (e.get("visibility") or "public") == "personal"]
+
+    slots = build_30_min_slots()
+    slot_cells = build_calendar_slot_cells(events, slots)
+    event_map = {}
+    for e in events:
+        event_map.setdefault(e.get("start_time"), []).append(e)
+
+    dates = calendar_prev_next_dates(selected_date)
+    return render_template(
+        "calendar.html",
+        selected_date=selected_date,
+        selected_date_label=selected_date_label,
+        calendar_view=calendar_view,
+        slots=slots,
+        slot_cells=slot_cells,
+        event_map=event_map,
+        events=events,
+        public_events=public_events,
+        personal_events=personal_events,
+        category_options=get_calendar_category_options(),
+        **dates,
+    )
+
+
+def calendar_new_personal_public():
+    selected_date = calendar_safe_date(request.args.get("date", ""))
+    default_start = calendar_safe_time(request.args.get("start", ""), "09:00")
+    default_end = calendar_safe_time(request.args.get("end", ""), next_30_min_time(default_start))
+
+    if request.method == "POST":
+        payload = build_calendar_event_payload(request.form)
+        payload.update({
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": session.get("user_id", ""),
+            "created_by_name": session.get("user_name", ""),
+        })
+        doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).add(payload)[1]
+        if request.form.get("send_line_now") == "on":
+            try:
+                _push_calendar_event_to_group(doc_ref.id, title_prefix="新增行程")
+            except Exception as e:
+                print("⚠️ 新增行程推播失敗：", e)
+        flash("已新增行程", "success")
+        return redirect(url_for("calendar_page", date=payload["event_date"], view=payload.get("visibility") or "all"))
+
+    prefill = {}
+    for key in ("title", "category", "custom_category", "related_type", "related_id", "customer_name", "phone", "location", "note", "visibility", "owner_line_user_id"):
+        value = (request.args.get(key) or "").strip()
+        if value:
+            prefill[key] = value
+    if prefill:
+        prefill["event_date"] = selected_date
+        prefill["start_time"] = default_start
+        prefill["end_time"] = default_end
+        prefill["line_enabled"] = True
+
+    return render_template(
+        "calendar_form.html",
+        event=prefill if prefill else None,
+        selected_date=selected_date,
+        default_start=default_start,
+        default_end=default_end,
+        slots=build_30_min_slots(),
+        category_options=get_calendar_category_options(),
+        line_user_options=get_line_personal_users(include_disabled=True),
+    )
+
+
+def calendar_edit_personal_public(event_id):
+    doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).document(event_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        flash("找不到這筆行程", "danger")
+        return redirect(url_for("calendar_page"))
+
+    event = doc_to_calendar_event(doc)
+    if request.method == "POST":
+        payload = build_calendar_event_payload(request.form, existing=event)
+        doc_ref.update(payload)
+        if request.form.get("send_line_now") == "on":
+            try:
+                _push_calendar_event_to_group(event_id, title_prefix="更新行程")
+            except Exception as e:
+                print("⚠️ 更新行程推播失敗：", e)
+        flash("已更新行程", "success")
+        return redirect(url_for("calendar_page", date=payload["event_date"], view=payload.get("visibility") or "all"))
+
+    return render_template(
+        "calendar_form.html",
+        event=event,
+        selected_date=event.get("event_date"),
+        default_start=event.get("start_time", "09:00"),
+        default_end=event.get("end_time", "09:30"),
+        slots=build_30_min_slots(),
+        category_options=get_calendar_category_options(),
+        line_user_options=get_line_personal_users(include_disabled=True),
+    )
+
+
+# LINE 行程卡片：顯示個人/公開與綁定對象。
+_original_build_calendar_event_bubble_before_personal_public = build_calendar_event_bubble
+
+
+def build_calendar_event_bubble(event, settings=None):
+    bubble = _original_build_calendar_event_bubble_before_personal_public(event, settings)
+    try:
+        vis_text = calendar_event_visibility_text(event)
+        line_name = calendar_event_target_line_name(event)
+        body = bubble.get("body", {}).get("contents", [])
+        # 加在標題與資訊間：LINE 手機上可清楚看到公開 / 個人。
+        insert_at = 3 if len(body) >= 3 else len(body)
+        extra_text = f"{vis_text}" + (f"｜{line_name}" if line_name and event.get("visibility") == "personal" else "")
+        body.insert(insert_at, flex_text(extra_text, size="xs", color="#8b6b4f", weight="bold", margin="sm"))
+    except Exception:
+        pass
+    return bubble
+
+
+# LINE 查詢行程：群組只看公開；個人已綁定帳號可看公開 + 自己的個人行程。
+def build_calendar_reply_for_range(start_date, end_date=None, mode="today", event=None):
+    settings = get_line_card_settings()
+    line_only = bool(settings.get("line_only_enabled_events", False))
+    kind = ""
+    target_id = ""
+    if event:
+        kind, target_id = line_event_source_kind_and_id(event)
+    events = fetch_calendar_events(
+        start_date,
+        end_date or start_date,
+        line_only=line_only,
+        line_source_kind=kind,
+        line_source_id=target_id,
+    )
+
+    if mode == "week":
+        title = settings.get("title_week") or DEFAULT_LINE_CARD_SETTINGS["title_week"]
+        date_text = f"{format_calendar_date_label(start_date)} ~ {format_calendar_date_label(end_date)}"
+    elif mode == "tomorrow":
+        title = settings.get("title_tomorrow") or DEFAULT_LINE_CARD_SETTINGS["title_tomorrow"]
+        date_text = format_calendar_date_label(start_date)
+    else:
+        title = settings.get("title_today") or DEFAULT_LINE_CARD_SETTINGS["title_today"]
+        date_text = format_calendar_date_label(start_date)
+
+    flex = build_calendar_carousel(events, title=title, date_text=date_text, settings=settings)
+    alt = f"{title} {len(events)} 筆"
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": alt,
+        "reply_flex": flex,
+        "reply_quick_reply": build_calendar_quick_reply(settings),
+        "parsed_tag": "行事曆",
+    }
+
+
+def process_line_calendar_message_event(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+
+    raw_text = (message.get("text") or "").strip()
+    normalized = raw_text.replace("＃", "#").strip()
+    today = now_taipei().date()
+
+    if normalized in ("#今日行程", "#今天行程", "今日行程", "今天行程"):
+        return build_calendar_reply_for_range(today.strftime("%Y-%m-%d"), mode="today", event=event)
+
+    if normalized in ("#明日行程", "#明天行程", "明日行程", "明天行程"):
+        return build_calendar_reply_for_range((today + timedelta(days=1)).strftime("%Y-%m-%d"), mode="tomorrow", event=event)
+
+    if normalized in ("#本週行程", "本週行程"):
+        start = today.strftime("%Y-%m-%d")
+        end = (today + timedelta(days=6)).strftime("%Y-%m-%d")
+        return build_calendar_reply_for_range(start, end, mode="week", event=event)
+
+    if normalized.startswith("#新增行程"):
+        fields = parse_line_calendar_create_fields(normalized)
+        category_options = get_calendar_category_options()
+        if len(normalized.splitlines()) == 1:
+            sample_category = category_options[0] if category_options else "帶看"
+            example = (
+                "新增行程格式：\n"
+                "#新增行程\n"
+                "日期: 今天\n"
+                "時間: 10:00-10:30\n"
+                f"類型: {sample_category}\n"
+                "可見性: 公開\n"
+                "標題: 童先生看農舍\n"
+                "客戶: 童先生\n"
+                "電話: 0921-123-456\n"
+                "地點: 清水、梧棲交界\n"
+                "備註: 退休夫妻，想看農舍、有空地\n\n"
+                "若要新增個人行程，請改成：可見性: 個人"
+            )
+            return {"handled": True, "ok": True, "reply_text": example, "parsed_tag": "新增行程格式"}
+
+        event_date = parse_calendar_date_word(fields.get("event_date_raw", "今天"))
+        start_time, end_time = parse_calendar_time_range(fields.get("time_raw", "09:00"), fields.get("end_time", ""))
+        category = (fields.get("category") or "其他").strip()
+        if category not in category_options:
+            category = "其他"
+
+        title = fields.get("title", "").strip()
+        if not title:
+            title = f"{fields.get('customer_name', '')} {category}".strip() or category
+
+        kind, target_id = line_event_source_kind_and_id(event)
+        visibility_raw = (fields.get("可見性") or fields.get("visibility") or fields.get("行程可見性") or "公開").strip()
+        visibility = "personal" if visibility_raw in ("個人", "私人", "personal") else "public"
+        owner_line_user_id = ""
+        owner_line_name = ""
+        if visibility == "personal" and kind == "user":
+            user_cfg = find_line_personal_user_by_user_id(target_id)
+            owner_line_user_id = target_id
+            owner_line_name = (user_cfg or {}).get("name") or get_line_sender_display_name(event) or ""
+
+        payload = {
+            "title": title,
+            "event_date": event_date,
+            "start_time": start_time,
+            "end_time": end_time,
+            "category": category,
+            "display_category": category,
+            "category_color": get_calendar_category_color(category),
+            "related_type": fields.get("related_type", ""),
+            "related_id": fields.get("related_id", ""),
+            "customer_name": fields.get("customer_name", ""),
+            "phone": fields.get("phone", ""),
+            "location": fields.get("location", ""),
+            "note": fields.get("note", ""),
+            "visibility": visibility,
+            "owner_line_user_id": owner_line_user_id,
+            "owner_line_name": owner_line_name,
+            "line_enabled": True,
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": "line_bot",
+            "created_by_name": get_line_sender_display_name(event) or "LINE Bot",
+            "updated_at": now_taipei().isoformat(),
+            "updated_by_id": "line_bot",
+            "updated_by_name": get_line_sender_display_name(event) or "LINE Bot",
+        }
+        doc_ref = db.collection(CALENDAR_EVENT_COLLECTION).document()
+        doc_ref.set(payload)
+        payload["id"] = doc_ref.id
+        settings = get_line_card_settings()
+        flex = build_calendar_event_bubble(dict(payload), settings)
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": f"已新增行程：{title}（{format_calendar_date_label(event_date)} {start_time}）",
+            "reply_flex": flex,
+            "reply_quick_reply": build_calendar_quick_reply(settings),
+            "parsed_tag": "新增行程",
+        }
+
+    return {"handled": False}
+
+
+# 個人行程推送：個人行程送到綁定的 LINE userId；公開行程送到可接收 calendar 的群組。
+def _push_calendar_event_to_group(event_id: str, title_prefix="行程資料"):
+    snap = db.collection(CALENDAR_EVENT_COLLECTION).document(event_id).get()
+    if not snap.exists:
+        return {"ok": False, "error": "找不到行程"}
+    event = doc_to_calendar_event(snap)
+    bubble = build_calendar_event_bubble(event)
+    message = {"type": "flex", "altText": f"{title_prefix}：{event.get('title','')}", "contents": bubble}
+
+    if (event.get("visibility") or "public") == "personal":
+        user_id = calendar_event_target_line_user_id(event)
+        if not user_id:
+            return {"ok": False, "error": "此個人行程尚未綁定 LINE 個人帳號，無法單獨傳送"}
+        user_cfg = find_line_personal_user_by_user_id(user_id)
+        if user_cfg and not line_personal_user_allows_receive(user_cfg, "calendar"):
+            return {"ok": False, "error": "此 LINE 個人帳號未開放接收行事曆訊息"}
+        res = line_push_messages(user_id, [message])
+        res["personal_target_name"] = calendar_event_target_line_name(event)
+        return res
+
+    return line_push_messages_to_allowed_groups("calendar", [message])
+
+
+# 私訊權限：只有設定中心已綁定的 LINE 個人帳號可以使用私人指令；群組仍照原本群組權限。
+def line_access_gate(event):
+    kind, target_id = line_event_source_kind_and_id(event)
+
+    if (event.get("message") or {}).get("type") == "text":
+        text = (event.get("message") or {}).get("text", "")
+        if detect_line_command_type(text) == "system_group_id":
+            return True, "system_group_id", None
+
+    if event.get("type") == "postback":
+        cmd_type = detect_line_postback_command_type(event)
+    else:
+        text = (event.get("message") or {}).get("text", "")
+        cmd_type = detect_line_command_type(text)
+
+    if kind == "user":
+        user_cfg = find_line_personal_user_by_user_id(target_id)
+        if not user_cfg:
+            return False, "未授權：此 LINE 個人帳號尚未在設定中心綁定，無法使用私人指令。請先輸入 #綁定 取得個人 ID 後交給管理員設定。", None
+        if cmd_type == "unknown":
+            return False, "這個指令無法辨識，請使用已開放的 #指令。", user_cfg
+        if cmd_type == "system_group_id":
+            return True, cmd_type, user_cfg
+        if not line_personal_user_allows_command(user_cfg, cmd_type):
+            return False, f"你的個人帳號未開放「{cmd_type}」類指令，請到設定中心調整個人權限。", user_cfg
+        return True, cmd_type, user_cfg
+
+    group = find_line_group_by_target_id(target_id)
+    if not group:
+        if target_id:
+            return False, f"未授權：此群組尚未在後台設定。\n群組ID：{target_id}\n請到「設定 → LINE群組權限」新增此群組。", None
+        return False, "未授權：無法辨識 LINE 來源。", None
+
+    if cmd_type == "unknown":
+        return False, "這個群組沒有可辨識的指令。請使用已開放的 #指令。", group
+    if cmd_type == "system_group_id":
+        return True, cmd_type, group
+    if not line_group_allows_command(group, cmd_type):
+        return False, f"此群組未開放「{cmd_type}」類指令，請到後台設定中心調整群組權限。", group
+    return True, cmd_type, group
+
+
+# 取得/綁定 ID 指令文案：同一指令可查群組 ID 或個人 userId。
+def _line_source_id_reply_text(event):
+    kind, target_id = line_event_source_kind_and_id(event)
+    label = {"group": "群組ID", "room": "聊天室ID", "user": "個人LINE ID"}.get(kind, "來源ID")
+    extra = ""
+    if kind == "user":
+        extra = "\n用途：可貼到設定中心的「LINE 個人帳號綁定」，用來接收個人行程。"
+    else:
+        extra = "\n用途：可貼到設定中心的「LINE 群組權限」。"
+    return f"來源類型：{kind}\n{label}：{target_id or '-'}{extra}"
+
+
+# 覆寫 webhook 一小段，讓 #綁定 私訊時文案顯示「個人LINE ID」。
+def line_webhook_with_group_acl():
+    raw_body = request.get_data(cache=False, as_text=False)
+    signature = request.headers.get("x-line-signature", "")
+
+    if not verify_line_signature(raw_body, signature):
+        return "Invalid signature", 400
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception as e:
+        print("⚠️ LINE webhook JSON 解析失敗：", e)
+        return "Bad Request", 400
+
+    events = payload.get("events", [])
+    for event in events:
+        try:
+            reply_token = event.get("replyToken")
+
+            if (event.get("message") or {}).get("type") == "text":
+                text = (event.get("message") or {}).get("text", "")
+                if detect_line_command_type(text) == "system_group_id":
+                    if reply_token:
+                        reply_line_text(reply_token, _line_source_id_reply_text(event))
+                    continue
+
+            allowed, reason_or_cmd, source_cfg = line_access_gate(event)
+            if not allowed:
+                if reply_token:
+                    reply_line_text(reply_token, reason_or_cmd)
+                continue
+
+            if event.get("type") == "postback":
+                result = process_line_postback_event(event)
+            else:
+                result = process_line_message_event(event)
+
+            if not result or not result.get("handled"):
+                continue
+
+            reply_result = None
+            if not reply_token:
+                continue
+
+            if result.get("reply_messages"):
+                reply_result = reply_line_messages(reply_token, result.get("reply_messages") or [])
+            elif result.get("reply_flex"):
+                reply_result = reply_line_flex(
+                    reply_token,
+                    result.get("reply_text", "CRM 卡片"),
+                    result.get("reply_flex"),
+                    quick_reply_items=result.get("reply_quick_reply"),
+                )
+            elif result.get("reply_text"):
+                reply_result = reply_line_text(reply_token, result["reply_text"] if result.get("ok") else result["reply_text"])
+
+            if result.get("ok") and result.get("target_type") and result.get("target_id") and reply_result:
+                for sent in reply_result.get("sent_messages", []):
+                    sent_id = str(sent.get("id", "")).strip()
+                    if sent_id:
+                        save_line_message_link(
+                            sent_id,
+                            result["target_type"],
+                            result["target_id"],
+                            tag=result.get("parsed_tag", ""),
+                            action="bot_reply",
+                            customer_name=result.get("customer_name", ""),
+                            phone=result.get("phone", ""),
+                            source_event=event,
+                        )
+        except Exception as e:
+            print("⚠️ 處理 LINE event 發生錯誤：", e)
+
+    return "OK", 200
+
+
+# 設定中心：加入 LINE 個人帳號綁定區塊。
+def parse_line_personal_users_from_form(form):
+    try:
+        count = int(form.get("personal_user_count", 0))
+    except Exception:
+        count = 0
+    count = max(0, min(30, count))
+    users = []
+    for i in range(count):
+        user_id = (form.get(f"personal_{i}_user_id") or "").strip()
+        name = (form.get(f"personal_{i}_name") or "").strip()
+        if not user_id and not name:
+            continue
+        users.append({
+            "enabled": form.get(f"personal_{i}_enabled") == "on",
+            "name": name or f"個人 {i+1}",
+            "user_id": user_id,
+            "receive_types": form.getlist(f"personal_{i}_receive_types"),
+            "command_types": form.getlist(f"personal_{i}_command_types"),
+            "note": (form.get(f"personal_{i}_note") or "").strip(),
+        })
+    return users
+
+
+def save_line_settings_center_from_form(form):
+    updates = save_line_card_settings_from_form(form)
+    groups = parse_line_groups_from_form(form)
+    personal_users = parse_line_personal_users_from_form(form)
+
+    if not groups:
+        old_target = (form.get("notify_target_id") or updates.get("notify_target_id") or os.environ.get("LINE_NOTIFY_TARGET_ID") or "").strip()
+        if old_target:
+            groups = [{
+                "enabled": True,
+                "name": "預設群組",
+                "target_id": old_target,
+                "receive_types": [x[0] for x in LINE_RECEIVE_TYPE_OPTIONS],
+                "command_types": [x[0] for x in LINE_COMMAND_TYPE_OPTIONS],
+                "note": "舊版單一群組相容",
+            }]
+
+    extra = {
+        "line_groups": groups,
+        "line_personal_users": personal_users,
+        "updated_at": now_taipei().isoformat(),
+        "updated_by_id": session.get("user_id", ""),
+        "updated_by_name": session.get("user_name", ""),
+    }
+
+    new_pw = (form.get("new_settings_admin_password") or "").strip()
+    new_pw2 = (form.get("new_settings_admin_password_confirm") or "").strip()
+    if new_pw or new_pw2:
+        if new_pw != new_pw2:
+            raise ValueError("兩次輸入的新管理員密碼不一致")
+        if len(new_pw) < 4:
+            raise ValueError("管理員密碼至少 4 碼")
+        extra["settings_admin_password_hash"] = generate_password_hash(new_pw)
+
+    db.collection(LINE_CARD_SETTINGS_COLLECTION).document("default").set(extra, merge=True)
+    return {**updates, **extra}
+
+
+LINE_SETTINGS_CENTER_TEMPLATE_V2 = """
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <title>設定中心｜厝米 Team M.E</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body{background:#f6f3ef}.setting-card{background:#fff;border:1px solid #eadbca;border-radius:18px;box-shadow:0 8px 24px rgba(120,80,40,.08)}
+    .group-box,.user-box{border:1px solid #eadbca;border-radius:14px;padding:14px;background:#fffaf5}.code{font-family:Consolas,monospace}.hint{font-size:.88rem;color:#8b6b4f;line-height:1.7}.sticky-nav{position:sticky;top:16px}
+  </style>
+</head>
+<body>
+<div class="container-fluid py-4">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <div><h2 class="mb-1">設定中心</h2><div class="text-muted small">管理 LINE 群組、個人帳號、指令權限與行事曆卡片。</div></div>
+    <div class="d-flex gap-2">
+      <a href="{{ url_for('buyers') }}" class="btn btn-outline-secondary btn-sm">回後台</a>
+      <form method="post" action="{{ url_for('line_settings_admin_logout') }}"><button class="btn btn-outline-danger btn-sm">離開管理模式</button></form>
+    </div>
+  </div>
+  {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}{% for category, msg in messages %}<div class="alert alert-{{ category }} py-2">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}
+  <form method="post">
+    <div class="row g-3">
+      <div class="col-lg-3">
+        <div class="setting-card p-3 sticky-nav">
+          <div class="list-group small">
+            <a class="list-group-item list-group-item-action" href="#security">管理員密碼</a>
+            <a class="list-group-item list-group-item-action" href="#groups">LINE 群組權限</a>
+            <a class="list-group-item list-group-item-action" href="#personal">LINE 個人帳號綁定</a>
+            <a class="list-group-item list-group-item-action" href="#card">LINE 卡片樣式</a>
+            <a class="list-group-item list-group-item-action" href="#calendar">行事曆設定</a>
+            <a class="list-group-item list-group-item-action" href="#help">指令說明</a>
+          </div>
+        </div>
+      </div>
+      <div class="col-lg-9">
+        <div id="security" class="setting-card p-4 mb-4">
+          <h5>管理員密碼</h5>
+          <div class="hint mb-3">第一次預設密碼是 <span class="code">123456</span>，建議修改；忘記時可用環境變數 <span class="code">LINE_SETTINGS_ADMIN_PASSWORD</span> 覆蓋。</div>
+          <div class="row g-2">
+            <div class="col-md-6"><label class="form-label">新密碼</label><input type="password" name="new_settings_admin_password" class="form-control" placeholder="留空則不修改"></div>
+            <div class="col-md-6"><label class="form-label">再次輸入</label><input type="password" name="new_settings_admin_password_confirm" class="form-control" placeholder="留空則不修改"></div>
+          </div>
+        </div>
+        <div id="groups" class="setting-card p-4 mb-4">
+          <h5>LINE 群組權限</h5>
+          <div class="hint mb-3">群組輸入 <span class="code">#綁定</span> 可取得/綁定 ID。公開行程會傳送到有勾選「行事曆」接收權限的群組。</div>
+          <input type="hidden" name="group_count" value="{{ group_rows|length }}">
+          {% for g in group_rows %}{% set idx = loop.index0 %}
+          <div class="group-box mb-3">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-1"><label class="form-label">啟用</label><input class="form-check-input d-block" type="checkbox" name="group_{{ idx }}_enabled" {% if g.enabled %}checked{% endif %}></div>
+              <div class="col-md-3"><label class="form-label">群組名稱</label><input class="form-control" name="group_{{ idx }}_name" value="{{ g.name }}" placeholder="例如：業務群"></div>
+              <div class="col-md-5"><label class="form-label">群組 / 房間 ID</label><input class="form-control code" name="group_{{ idx }}_target_id" value="{{ g.target_id }}" placeholder="Cxxxxxxxx 或 Rxxxxxxxx"></div>
+              <div class="col-md-3"><label class="form-label">備註</label><input class="form-control" name="group_{{ idx }}_note" value="{{ g.note }}"></div>
+            </div>
+            <div class="row mt-2">
+              <div class="col-md-6"><div class="fw-bold small mb-1">可接收訊息</div>{% for key,label in receive_options %}<label class="form-check form-check-inline small"><input class="form-check-input" type="checkbox" name="group_{{ idx }}_receive_types" value="{{ key }}" {% if key in g.receive_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div>
+              <div class="col-md-6"><div class="fw-bold small mb-1">可使用指令</div>{% for key,label in command_options %}<label class="form-check d-block small"><input class="form-check-input" type="checkbox" name="group_{{ idx }}_command_types" value="{{ key }}" {% if key in g.command_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        <div id="personal" class="setting-card p-4 mb-4">
+          <h5>LINE 個人帳號綁定</h5>
+          <div class="hint mb-3">個人私訊官方帳號輸入 <span class="code">#綁定</span>，會回覆「個人LINE ID」。把該 ID 貼到這裡，個人行程就可以單獨推送給他。</div>
+          <input type="hidden" name="personal_user_count" value="{{ personal_user_rows|length }}">
+          {% for u in personal_user_rows %}{% set idx = loop.index0 %}
+          <div class="user-box mb-3">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-1"><label class="form-label">啟用</label><input class="form-check-input d-block" type="checkbox" name="personal_{{ idx }}_enabled" {% if u.enabled %}checked{% endif %}></div>
+              <div class="col-md-3"><label class="form-label">姓名 / 暱稱</label><input class="form-control" name="personal_{{ idx }}_name" value="{{ u.name }}" placeholder="例如：曜昀"></div>
+              <div class="col-md-5"><label class="form-label">LINE 個人 userId</label><input class="form-control code" name="personal_{{ idx }}_user_id" value="{{ u.user_id }}" placeholder="Uxxxxxxxx"></div>
+              <div class="col-md-3"><label class="form-label">備註</label><input class="form-control" name="personal_{{ idx }}_note" value="{{ u.note }}"></div>
+            </div>
+            <div class="row mt-2">
+              <div class="col-md-6"><div class="fw-bold small mb-1">可接收訊息</div>{% for key,label in receive_options %}<label class="form-check form-check-inline small"><input class="form-check-input" type="checkbox" name="personal_{{ idx }}_receive_types" value="{{ key }}" {% if key in u.receive_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div>
+              <div class="col-md-6"><div class="fw-bold small mb-1">可使用指令</div>{% for key,label in command_options %}<label class="form-check d-block small"><input class="form-check-input" type="checkbox" name="personal_{{ idx }}_command_types" value="{{ key }}" {% if key in u.command_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        <div id="card" class="setting-card p-4 mb-4">
+          <h5>LINE 卡片樣式</h5>
+          <div class="row g-2">
+            <div class="col-12"><label class="form-label">今日行程標題</label><input class="form-control" name="title_today" value="{{ settings.title_today }}"></div>
+            <div class="col-12"><label class="form-label">明日行程標題</label><input class="form-control" name="title_tomorrow" value="{{ settings.title_tomorrow }}"></div>
+            <div class="col-12"><label class="form-label">本週行程標題</label><input class="form-control" name="title_week" value="{{ settings.title_week }}"></div>
+            <div class="col-md-6"><label class="form-label">主色</label><input class="form-control" name="primary_color" value="{{ settings.primary_color }}"></div>
+            <div class="col-md-6"><label class="form-label">按鈕色</label><input class="form-control" name="button_color" value="{{ settings.button_color }}"></div>
+            <div class="col-12">
+              <label class="form-label">LINE 卡片顯示內容</label><br>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_customer" {% if settings.show_customer %}checked{% endif %}> 客戶</label>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_phone" {% if settings.show_phone %}checked{% endif %}> 電話</label>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_location" {% if settings.show_location %}checked{% endif %}> 地點</label>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_note" {% if settings.show_note %}checked{% endif %}> 備註</label>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_quick_actions" {% if settings.show_quick_actions %}checked{% endif %}> 快速操作</label>
+              <label class="form-check d-block mt-2"><input class="form-check-input" type="checkbox" name="line_only_enabled_events" {% if settings.line_only_enabled_events %}checked{% endif %}> LINE 只顯示有勾「LINE查詢顯示」的行程</label>
+            </div>
+            <div class="col-12"><label class="form-label">快速操作按鈕文字</label><textarea class="form-control" rows="4" name="quick_actions">{{ quick_actions_text }}</textarea></div>
+          </div>
+        </div>
+        <div id="calendar" class="setting-card p-4 mb-4">
+          <h5>行事曆設定</h5>
+          <div class="row g-2">
+            <div class="col-md-6"><label class="form-label">行事曆開始小時</label><input class="form-control" name="calendar_start_hour" value="{{ settings.calendar_start_hour }}"></div>
+            <div class="col-md-6"><label class="form-label">行事曆結束小時</label><input class="form-control" name="calendar_end_hour" value="{{ settings.calendar_end_hour }}"></div>
+            <div class="col-12"><label class="form-label">行事曆行程分類</label><textarea class="form-control" rows="5" name="calendar_categories">{{ calendar_categories_text }}</textarea><div class="hint">一行一個分類，例如：帶看、回電、開發、簽約、拍照、私人行程、其他。</div></div>
+          </div>
+        </div>
+        <div id="help" class="setting-card p-4 mb-4"><h5>指令說明</h5><div class="row g-2 small"><div class="col-md-6"><strong>取得/綁定 ID</strong><br><span class="code">#綁定</span><br>群組中回覆群組ID；私訊中回覆個人LINE ID。</div><div class="col-md-6"><strong>行程</strong><br><span class="code">#今日行程 / #新增行程</span><br>群組只看公開行程；個人可看公開 + 自己的個人行程。</div></div></div>
+        <button class="btn btn-primary btn-lg w-100" type="submit">儲存全部設定</button>
+      </div>
+    </div>
+  </form>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
+
+
+def line_card_settings_center():
+    if request.method == "POST" and request.form.get("admin_login") == "1":
+        if _settings_admin_password_ok(request.form.get("admin_password", "")):
+            session[LINE_SETTINGS_ADMIN_SESSION_KEY] = True
+            flash("已進入設定中心", "success")
+            return redirect(url_for("line_card_settings"))
+        flash("管理員密碼錯誤", "danger")
+        return render_template_string(LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE)
+
+    if not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
+        return render_template_string(LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE)
+
+    if request.method == "POST":
+        try:
+            save_line_settings_center_from_form(request.form)
+            flash("設定已更新", "success")
+        except Exception as e:
+            flash(f"設定儲存失敗：{e}", "danger")
+        return redirect(url_for("line_card_settings"))
+
+    settings = get_line_card_settings()
+    group_rows = list(get_line_group_settings())
+    while len(group_rows) < 6:
+        group_rows.append({"enabled": False, "name": "", "target_id": "", "receive_types": [], "command_types": [], "note": ""})
+
+    personal_user_rows = list(get_line_personal_users(include_disabled=True))
+    while len(personal_user_rows) < LINE_PERSONAL_USER_COUNT_DEFAULT:
+        personal_user_rows.append({"enabled": False, "name": "", "user_id": "", "receive_types": ["calendar"], "command_types": ["calendar", "todo", "followup"], "note": ""})
+
+    return render_template_string(
+        LINE_SETTINGS_CENTER_TEMPLATE_V2,
+        settings=settings,
+        group_rows=group_rows,
+        personal_user_rows=personal_user_rows,
+        receive_options=LINE_RECEIVE_TYPE_OPTIONS,
+        command_options=LINE_COMMAND_TYPE_OPTIONS,
+        quick_actions_text="\n".join(settings.get("quick_actions") or []),
+        calendar_categories_text="\n".join(get_calendar_category_options()),
+    )
+
+
+try:
+    app.view_functions["calendar_page"] = login_required(calendar_page_personal_public)
+    app.view_functions["calendar_new"] = login_required(calendar_new_personal_public)
+    app.view_functions["calendar_edit"] = login_required(calendar_edit_personal_public)
+    app.view_functions["line_card_settings"] = login_required(line_card_settings_center)
+    app.view_functions["line_webhook"] = line_webhook_with_group_acl
+    print("✅ 行事曆個人/公開分流已啟用：個人行程可綁定 LINE 個人帳號並單獨推送")
+except Exception as e:
+    print("⚠️ 行事曆個人/公開分流套用失敗：", e)
+
+# =============================================================================
+# 行事曆：個人 / 公開分流 + LINE 個人帳號綁定 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# 個人後台：點擊右上角使用者名稱綁定 LINE 個人帳號 Patch v20260622C
+# - 不再需要到設定中心新增個人帳號；每位後台使用者可在自己的個人後台綁定 LINE userId
+# - 綁定後會同步寫入 users 文件與 line_card_settings.default.line_personal_users
+# - 行事曆個人行程可直接選擇已綁定的 LINE 個人帳號並單獨推送
+# =============================================================================
+
+DEFAULT_PERSONAL_RECEIVE_TYPES = ["calendar"]
+DEFAULT_PERSONAL_COMMAND_TYPES = ["calendar", "todo", "followup"]
+
+
+def _current_crm_user_doc():
+    user_id = session.get("user_id", "")
+    if not user_id:
+        return None, {}
+    try:
+        doc_ref = db.collection("users").document(user_id)
+        snap = doc_ref.get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+        else:
+            data = {}
+        return doc_ref, data
+    except Exception as e:
+        print("⚠️ 讀取個人使用者資料失敗：", e)
+        return None, {}
+
+
+def _find_personal_user_raw_by_crm_user_id(settings, crm_user_id):
+    crm_user_id = (crm_user_id or "").strip()
+    if not crm_user_id:
+        return None
+    for item in settings.get("line_personal_users") or []:
+        if (item.get("crm_user_id") or "").strip() == crm_user_id:
+            return item
+    return None
+
+
+def get_current_user_line_binding():
+    """取得目前登入者的 LINE 綁定資料，優先讀 users 文件，沒有就從設定中心舊資料找。"""
+    user_id = session.get("user_id", "")
+    user_name = session.get("user_name", "") or "未命名使用者"
+    user_email = session.get("user_email", "") or ""
+
+    _, user_doc = _current_crm_user_doc()
+    settings = get_line_card_settings()
+    raw = _find_personal_user_raw_by_crm_user_id(settings, user_id) or {}
+
+    line_user_id = (
+        user_doc.get("line_user_id")
+        or user_doc.get("line_personal_user_id")
+        or raw.get("user_id")
+        or raw.get("line_user_id")
+        or ""
+    ).strip()
+
+    return {
+        "crm_user_id": user_id,
+        "crm_user_name": user_name,
+        "crm_user_email": user_email,
+        "enabled": bool(user_doc.get("line_bind_enabled", raw.get("enabled", True))),
+        "name": (user_doc.get("line_display_name") or raw.get("name") or user_name or "未命名使用者").strip(),
+        "user_id": line_user_id,
+        "receive_types": _normalize_permission_list(user_doc.get("line_receive_types") or raw.get("receive_types") or DEFAULT_PERSONAL_RECEIVE_TYPES),
+        "command_types": _normalize_permission_list(user_doc.get("line_command_types") or raw.get("command_types") or DEFAULT_PERSONAL_COMMAND_TYPES),
+        "note": (user_doc.get("line_bind_note") or raw.get("note") or "").strip(),
+        "updated_at": user_doc.get("line_bound_at") or raw.get("updated_at") or "",
+    }
+
+
+def upsert_current_user_line_binding(form):
+    user_id = session.get("user_id", "")
+    user_name = session.get("user_name", "") or "未命名使用者"
+    user_email = session.get("user_email", "") or ""
+    if not user_id:
+        raise ValueError("請先登入")
+
+    line_user_id = (form.get("line_user_id") or "").strip()
+    display_name = (form.get("line_display_name") or user_name).strip()
+    enabled = form.get("enabled") == "on"
+    receive_types = _normalize_permission_list(form.getlist("receive_types") or DEFAULT_PERSONAL_RECEIVE_TYPES)
+    command_types = _normalize_permission_list(form.getlist("command_types") or DEFAULT_PERSONAL_COMMAND_TYPES)
+    note = (form.get("note") or "").strip()
+
+    # LINE userId 通常是 U 開頭；不強制擋掉，避免測試環境或未來格式調整。
+    if line_user_id and len(line_user_id) < 10:
+        raise ValueError("LINE 個人 ID 看起來太短，請確認是否貼到完整 ID")
+
+    now = now_taipei().isoformat()
+
+    doc_ref, _ = _current_crm_user_doc()
+    if doc_ref:
+        doc_ref.set({
+            "line_user_id": line_user_id,
+            "line_personal_user_id": line_user_id,
+            "line_display_name": display_name,
+            "line_bind_enabled": enabled,
+            "line_receive_types": receive_types,
+            "line_command_types": command_types,
+            "line_bind_note": note,
+            "line_bound_at": now,
+            "updated_at": now,
+            "updated_by_id": user_id,
+            "updated_by_name": user_name,
+        }, merge=True)
+
+    settings = get_line_card_settings()
+    rows = []
+    updated = False
+    for item in settings.get("line_personal_users") or []:
+        old_crm_user_id = (item.get("crm_user_id") or "").strip()
+        old_user_id = (item.get("user_id") or item.get("line_user_id") or "").strip()
+        # 同一位 CRM 使用者，或同一個 LINE userId，都視為同一筆綁定。
+        if (old_crm_user_id and old_crm_user_id == user_id) or (line_user_id and old_user_id == line_user_id):
+            item = dict(item)
+            item.update({
+                "enabled": enabled,
+                "name": display_name or user_name,
+                "user_id": line_user_id,
+                "line_user_id": line_user_id,
+                "crm_user_id": user_id,
+                "crm_user_email": user_email,
+                "receive_types": receive_types,
+                "command_types": command_types,
+                "note": note,
+                "updated_at": now,
+            })
+            rows.append(item)
+            updated = True
+        else:
+            rows.append(item)
+
+    if not updated and line_user_id:
+        rows.append({
+            "enabled": enabled,
+            "name": display_name or user_name,
+            "user_id": line_user_id,
+            "line_user_id": line_user_id,
+            "crm_user_id": user_id,
+            "crm_user_email": user_email,
+            "receive_types": receive_types,
+            "command_types": command_types,
+            "note": note,
+            "updated_at": now,
+        })
+
+    db.collection(LINE_CARD_SETTINGS_COLLECTION).document("default").set({
+        "line_personal_users": rows,
+        "updated_at": now,
+        "updated_by_id": user_id,
+        "updated_by_name": user_name,
+    }, merge=True)
+
+    return get_current_user_line_binding()
+
+
+PERSONAL_PROFILE_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-1">個人後台</h3>
+    <div class="text-muted small">設定你的 LINE 個人帳號，個人行程會單獨推送到這個帳號。</div>
+  </div>
+  <a href="{{ url_for('calendar_page') }}" class="btn btn-outline-secondary btn-sm">回行事曆</a>
+</div>
+
+<div class="row g-4">
+  <div class="col-lg-5">
+    <div class="card shadow-sm border-0 h-100">
+      <div class="card-body">
+        <h5 class="card-title mb-3">後台使用者資料</h5>
+        <p class="mb-1"><strong>姓名：</strong>{{ binding.crm_user_name or '-' }}</p>
+        <p class="mb-1"><strong>Email：</strong>{{ binding.crm_user_email or '-' }}</p>
+        <p class="mb-1"><strong>綁定狀態：</strong>
+          {% if binding.user_id and binding.enabled %}
+            <span class="badge bg-success">已啟用</span>
+          {% elif binding.user_id %}
+            <span class="badge bg-secondary">已綁定但停用</span>
+          {% else %}
+            <span class="badge bg-warning text-dark">尚未綁定</span>
+          {% endif %}
+        </p>
+        {% if binding.updated_at %}
+          <p class="small text-muted mt-2 mb-0">最後更新：{{ binding.updated_at[:16] }}</p>
+        {% endif %}
+        <hr>
+        <div class="alert alert-info small mb-0">
+          <div class="fw-bold mb-1">如何取得 LINE 個人 ID？</div>
+          <ol class="mb-0 ps-3">
+            <li>用你的個人 LINE 私訊官方帳號。</li>
+            <li>輸入 <span class="font-monospace">#綁定</span>。</li>
+            <li>Bot 會回覆「個人LINE ID」，複製後貼到右側欄位。</li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-7">
+    <div class="card shadow-sm border-0">
+      <div class="card-body">
+        <h5 class="card-title mb-3">LINE 個人帳號綁定</h5>
+        <form method="post">
+          <div class="form-check form-switch mb-3">
+            <input class="form-check-input" type="checkbox" name="enabled" id="enabled" {% if binding.enabled %}checked{% endif %}>
+            <label class="form-check-label" for="enabled">啟用此 LINE 個人帳號</label>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label">顯示名稱</label>
+            <input type="text" class="form-control" name="line_display_name" value="{{ binding.name }}" placeholder="例：黃曜昀">
+            <div class="form-text">這個名稱會出現在行事曆個人行程的指派選單。</div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label">LINE 個人 ID</label>
+            <input type="text" class="form-control font-monospace" name="line_user_id" value="{{ binding.user_id }}" placeholder="Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+          </div>
+
+          <div class="row">
+            <div class="col-md-6 mb-3">
+              <label class="form-label">可接收訊息</label>
+              <div class="border rounded p-3 bg-light">
+                {% for key, label in receive_options %}
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" name="receive_types" value="{{ key }}" id="receive_{{ key }}"
+                      {% if key in binding.receive_types %}checked{% endif %}>
+                    <label class="form-check-label" for="receive_{{ key }}">{{ label }}</label>
+                  </div>
+                {% endfor %}
+              </div>
+            </div>
+            <div class="col-md-6 mb-3">
+              <label class="form-label">可使用指令</label>
+              <div class="border rounded p-3 bg-light">
+                {% for key, label in command_options %}
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" name="command_types" value="{{ key }}" id="command_{{ key }}"
+                      {% if key in binding.command_types %}checked{% endif %}>
+                    <label class="form-check-label" for="command_{{ key }}">{{ label }}</label>
+                  </div>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label">備註</label>
+            <textarea class="form-control" name="note" rows="2" placeholder="例：曜昀個人帳號">{{ binding.note }}</textarea>
+          </div>
+
+          <button type="submit" class="btn btn-primary">儲存 LINE 綁定</button>
+          <a href="{{ url_for('calendar_new') }}" class="btn btn-outline-primary">新增個人行程</a>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+"""
+
+
+@app.route("/me", methods=["GET", "POST"], endpoint="personal_profile")
+@login_required
+def personal_profile():
+    if request.method == "POST":
+        try:
+            upsert_current_user_line_binding(request.form)
+            flash("LINE 個人帳號綁定已更新", "success")
+        except Exception as e:
+            flash(f"LINE 綁定更新失敗：{e}", "danger")
+        return redirect(url_for("personal_profile"))
+
+    binding = get_current_user_line_binding()
+    return render_template_string(
+        PERSONAL_PROFILE_TEMPLATE,
+        binding=binding,
+        receive_options=LINE_RECEIVE_TYPE_OPTIONS,
+        command_options=LINE_COMMAND_TYPE_OPTIONS,
+    )
+
+
+# 覆寫設定中心：個人帳號綁定移到右上角使用者名稱的「個人後台」，設定中心保留群組與權限設定。
+_original_line_card_settings_center_before_profile = line_card_settings_center
+
+def line_card_settings_center_with_profile_hint():
+    response = _original_line_card_settings_center_before_profile()
+    return response
+
+try:
+    app.view_functions["line_card_settings"] = login_required(line_card_settings_center_with_profile_hint)
+    print("✅ 個人後台 LINE 綁定已啟用：點右上角使用者名稱可設定個人 LINE 帳號")
+except Exception as e:
+    print("⚠️ 個人後台 LINE 綁定套用失敗：", e)
+
+# =============================================================================
+# 個人後台 LINE 綁定 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# CRM 客需 / 委託 / 開發 個人 / 公開 Patch Start
+# =============================================================================
+
+CRM_VISIBILITY_OPTIONS = [("public", "公開資料"), ("personal", "個人資料")]
+
+
+def crm_record_visibility_payload_from_form(form, existing=None):
+    """客需/委託/開發共用：公開或個人，個人可綁 LINE 個人帳號。"""
+    existing = existing or {}
+    visibility = (form.get("visibility") or existing.get("visibility") or "public").strip()
+    if visibility not in ("public", "personal"):
+        visibility = "public"
+
+    owner_line_user_id = (form.get("owner_line_user_id") or existing.get("owner_line_user_id") or "").strip()
+    owner_line_name = ""
+    try:
+        for u in get_line_personal_users(include_disabled=True):
+            if u.get("user_id") == owner_line_user_id:
+                owner_line_name = u.get("name") or ""
+                break
+    except Exception:
+        pass
+    if not owner_line_name:
+        owner_line_name = (form.get("owner_line_name") or existing.get("owner_line_name") or "").strip()
+
+    return {
+        "visibility": visibility,
+        "owner_user_id": existing.get("owner_user_id") or session.get("user_id", ""),
+        "owner_user_name": existing.get("owner_user_name") or session.get("user_name", ""),
+        "owner_line_user_id": owner_line_user_id if visibility == "personal" else "",
+        "owner_line_name": owner_line_name if visibility == "personal" else "",
+    }
+
+
+def crm_record_visibility_text(data: dict):
+    return "個人資料" if (data or {}).get("visibility") == "personal" else "公開資料"
+
+
+def crm_record_target_line_user_id(data: dict):
+    return ((data or {}).get("owner_line_user_id") or "").strip()
+
+
+def crm_record_target_line_name(data: dict):
+    uid = crm_record_target_line_user_id(data)
+    if uid:
+        try:
+            u = find_line_personal_user_by_user_id(uid)
+            if u and u.get("name"):
+                return u.get("name")
+        except Exception:
+            pass
+    return (data or {}).get("owner_line_name") or (data or {}).get("owner_user_name") or ""
+
+
+@app.context_processor
+def inject_crm_visibility_options():
+    try:
+        users = get_line_personal_users(include_disabled=True)
+    except Exception:
+        users = []
+    return {
+        "crm_visibility_options": CRM_VISIBILITY_OPTIONS,
+        "line_user_options": users,
+    }
+
+
+# LINE 群組卡片：補上公開/個人與對象顯示。
+_original_build_record_flex_bubble_before_visibility = _build_record_flex_bubble
+
+def _build_record_flex_bubble(record_type: str, record_id: str, data: dict, title_prefix="CRM 資料"):
+    bubble = _original_build_record_flex_bubble_before_visibility(record_type, record_id, data, title_prefix=title_prefix)
+    try:
+        vis_text = crm_record_visibility_text(data)
+        target_name = crm_record_target_line_name(data)
+        extra = vis_text + (f"｜{target_name}" if data.get("visibility") == "personal" and target_name else "")
+        body = bubble.get("body", {}).get("contents", [])
+        insert_at = 2 if len(body) >= 2 else len(body)
+        body.insert(insert_at, flex_text(extra, size="xs", color="#8b6b4f", weight="bold", margin="sm"))
+    except Exception as e:
+        print("⚠️ CRM 卡片補上公開/個人標示失敗：", e)
+    return bubble
+
+
+# 加入行事曆時，把客需/委託/開發的公開/個人設定一起帶進行程。
+def _record_calendar_params(record_type: str, record_id: str, data: dict):
+    record_type = record_type or ""
+    name = data.get("name") or data.get("customer_name") or ""
+    phone = data.get("phone") or ""
+    location = data.get("address") or data.get("preferred_areas") or data.get("registered_address") or ""
+    if record_type == "buyer":
+        title = f"{name} 客需追蹤".strip()
+        note = data.get("note") or data.get("requirement_must") or data.get("preferred_areas") or ""
+        category = "回電"
+    elif record_type == "seller":
+        title = f"{name} 委託追蹤".strip()
+        note = data.get("note") or data.get("reason") or ""
+        category = "回電"
+    else:
+        title = f"{name or data.get('address') or '開發'} 開發追蹤".strip()
+        note = data.get("note") or data.get("next_action") or ""
+        category = "開發"
+    return {
+        "related_type": record_type,
+        "related_id": record_id,
+        "title": title,
+        "category": category,
+        "customer_name": name,
+        "phone": phone,
+        "location": location,
+        "note": note,
+        "visibility": data.get("visibility") or "public",
+        "owner_line_user_id": data.get("owner_line_user_id") or "",
+    }
+
+
+# 傳送客需 / 委託 / 開發：公開傳群組，個人傳該 LINE 個人帳號。
+def _push_record_to_group(record_type: str, record_id: str, title_prefix="CRM 資料"):
+    coll = {"buyer": "buyers", "seller": "sellers", "development": "developments"}.get(record_type)
+    if not coll:
+        return {"ok": False, "error": "record_type 不正確"}
+    snap = db.collection(coll).document(record_id).get()
+    if not snap.exists:
+        return {"ok": False, "error": "找不到資料"}
+    data = snap.to_dict() or {}
+    bubble = _build_record_flex_bubble(record_type, record_id, data, title_prefix=title_prefix)
+    message = {"type": "flex", "altText": f"{title_prefix}：{data.get('name','')}", "contents": bubble}
+
+    if (data.get("visibility") or "public") == "personal":
+        user_id = crm_record_target_line_user_id(data)
+        if not user_id:
+            return {"ok": False, "error": "此資料設定為個人，但尚未綁定 LINE 個人帳號"}
+        try:
+            user_cfg = find_line_personal_user_by_user_id(user_id)
+            if user_cfg and not line_personal_user_allows_receive(user_cfg, record_type):
+                return {"ok": False, "error": f"{crm_record_target_line_name(data) or '此帳號'} 未開放接收「{record_type}」訊息"}
+        except Exception:
+            pass
+        res = line_push_messages(user_id, [message])
+        res["personal_target_name"] = crm_record_target_line_name(data)
+        return res
+
+    return line_push_messages_to_allowed_groups(record_type, [message])
+
+
+# 重新套用送出按鈕 view，確保使用新的公開/個人邏輯。
+def buyer_send_to_line_multi_group(buyer_id):
+    res = _push_record_to_group("buyer", buyer_id, title_prefix="後台傳送")
+    msg, cat = _line_push_result_flash_message(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("buyer_detail", buyer_id=buyer_id))
+
+
+def seller_send_to_line_multi_group(seller_id):
+    res = _push_record_to_group("seller", seller_id, title_prefix="後台傳送")
+    msg, cat = _line_push_result_flash_message(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("seller_detail", seller_id=seller_id))
+
+
+def development_send_to_line_multi_group(development_id):
+    res = _push_record_to_group("development", development_id, title_prefix="後台傳送")
+    msg, cat = _line_push_result_flash_message(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("development_detail", development_id=development_id))
+
+try:
+    app.view_functions["buyer_send_to_line"] = login_required(buyer_send_to_line_multi_group)
+    app.view_functions["seller_send_to_line"] = login_required(seller_send_to_line_multi_group)
+    app.view_functions["development_send_to_line"] = login_required(development_send_to_line_multi_group)
+    print("✅ CRM 客需/委託/開發公開/個人傳送已啟用")
+except Exception as e:
+    print("⚠️ CRM 公開/個人傳送套用失敗：", e)
+
+# =============================================================================
+# CRM 客需 / 委託 / 開發 個人 / 公開 Patch End
+# =============================================================================
+
+
+
+# =============================================================================
+# 設定中心：誰可以看什麼 / 全客製化權限 Patch v20260623A
+# - 群組 / 個人可分別設定：可接收、可使用指令、可查詢資料類型、可見範圍
+# - LINE 群組查詢預設只看公開資料；可在後台設定成店長/管理員權限看全部
+# - LINE 個人查詢預設看公開 + 自己綁定的個人資料；也可客製為只看自己 / 看全部
+# =============================================================================
+
+LINE_VIEW_TYPE_OPTIONS = [
+    ("buyer", "客需資料"),
+    ("seller", "委託資料"),
+    ("development", "開發資料"),
+    ("calendar", "行事曆資料"),
+    ("todo", "待辦事項"),
+]
+
+LINE_VISIBILITY_SCOPE_OPTIONS = [
+    ("public_only", "只看公開資料"),
+    ("public_and_own", "公開資料 + 自己的個人資料"),
+    ("own_only", "只看自己的個人資料"),
+    ("all", "全部資料（公開 + 所有人個人資料）"),
+]
+
+_LINE_PERMISSION_CONTEXT = {}
+
+
+def _permission_normalize_scope(value, default="public_only"):
+    value = (value or "").strip()
+    valid = {x[0] for x in LINE_VISIBILITY_SCOPE_OPTIONS}
+    return value if value in valid else default
+
+
+def _permission_record_type_from_collection(collection_name: str):
+    mapping = {
+        "buyers": "buyer",
+        "sellers": "seller",
+        "developments": "development",
+        CALENDAR_EVENT_COLLECTION if 'CALENDAR_EVENT_COLLECTION' in globals() else 'calendar_events': "calendar",
+        "todos": "todo",
+        "line_todos": "todo",
+    }
+    return mapping.get(collection_name, "")
+
+
+def _permission_normalize_view_types(values, default=None):
+    vals = _normalize_permission_list(values)
+    if vals:
+        return vals
+    return list(default or [])
+
+
+# 重新覆寫群組設定 normalize：加上 view_types / visibility_scope。
+def _normalize_line_group_config(group):
+    group = dict(group or {})
+    return {
+        "enabled": bool(group.get("enabled", True)),
+        "name": (group.get("name") or "未命名群組").strip(),
+        "target_id": (group.get("target_id") or group.get("group_id") or group.get("room_id") or "").strip(),
+        "receive_types": _normalize_permission_list(group.get("receive_types") or group.get("receives") or []),
+        "command_types": _normalize_permission_list(group.get("command_types") or group.get("commands") or []),
+        "view_types": _permission_normalize_view_types(group.get("view_types") or group.get("visible_types") or [], default=[x[0] for x in LINE_VIEW_TYPE_OPTIONS]),
+        "visibility_scope": _permission_normalize_scope(group.get("visibility_scope"), default="public_only"),
+        "note": (group.get("note") or "").strip(),
+    }
+
+
+# 重新覆寫個人帳號 normalize：加上 view_types / visibility_scope。
+def _normalize_line_personal_user_config(user):
+    user = dict(user or {})
+    return {
+        "enabled": bool(user.get("enabled", True)),
+        "name": (user.get("name") or "未命名使用者").strip(),
+        "user_id": (user.get("user_id") or user.get("line_user_id") or "").strip(),
+        "receive_types": _normalize_permission_list(user.get("receive_types") or user.get("receives") or []),
+        "command_types": _normalize_permission_list(user.get("command_types") or user.get("commands") or []),
+        "view_types": _permission_normalize_view_types(user.get("view_types") or user.get("visible_types") or [], default=[x[0] for x in LINE_VIEW_TYPE_OPTIONS]),
+        "visibility_scope": _permission_normalize_scope(user.get("visibility_scope"), default="public_and_own"),
+        "note": (user.get("note") or "").strip(),
+    }
+
+
+def permission_config_can_view(source_cfg, data_type: str, data: dict, source_kind: str = "", source_id: str = "") -> bool:
+    """依設定中心權限判斷 LINE 來源是否可看某筆資料。"""
+    data_type = (data_type or "").strip()
+    if not source_cfg:
+        return False
+
+    view_types = set(source_cfg.get("view_types") or [])
+    if "all" not in view_types and data_type and data_type not in view_types:
+        return False
+
+    visibility = (data or {}).get("visibility") or "public"
+    if visibility not in ("public", "personal"):
+        visibility = "public"
+
+    scope = _permission_normalize_scope(source_cfg.get("visibility_scope"), default="public_only")
+    owner_line_id = (
+        (data or {}).get("owner_line_user_id")
+        or (data or {}).get("line_user_id")
+        or (data or {}).get("target_user_id")
+        or ""
+    ).strip()
+
+    # 舊資料如果沒有 visibility，視為公開資料，避免舊資料突然完全查不到。
+    if visibility == "public":
+        return scope in ("public_only", "public_and_own", "all")
+
+    # 個人資料
+    if scope == "all":
+        return True
+    if scope in ("public_and_own", "own_only"):
+        return bool(source_kind == "user" and owner_line_id and owner_line_id == source_id)
+    return False
+
+
+def permission_current_line_source():
+    ctx = dict(_LINE_PERMISSION_CONTEXT or {})
+    if ctx.get("source_cfg"):
+        return ctx
+    return {"kind": "", "target_id": "", "source_cfg": None}
+
+
+def permission_filter_doc_snapshot(record_type: str, doc_snapshot):
+    ctx = permission_current_line_source()
+    if not ctx.get("source_cfg"):
+        return True
+    try:
+        data = doc_snapshot.to_dict() or {}
+    except Exception:
+        data = {}
+    return permission_config_can_view(ctx.get("source_cfg"), record_type, data, ctx.get("kind"), ctx.get("target_id"))
+
+
+# 讓 LINE 處理期間帶入目前來源權限；後台操作不受影響。
+try:
+    _process_line_message_event_before_permission_matrix = process_line_message_event
+
+    def process_line_message_event(event):
+        global _LINE_PERMISSION_CONTEXT
+        old_ctx = dict(_LINE_PERMISSION_CONTEXT or {})
+        kind, target_id = line_event_source_kind_and_id(event)
+        cfg = None
+        if kind == "user":
+            cfg = find_line_personal_user_by_user_id(target_id)
+        elif kind in ("group", "room"):
+            cfg = find_line_group_by_target_id(target_id)
+        _LINE_PERMISSION_CONTEXT = {"kind": kind, "target_id": target_id, "source_cfg": cfg}
+        try:
+            return _process_line_message_event_before_permission_matrix(event)
+        finally:
+            _LINE_PERMISSION_CONTEXT = old_ctx
+
+    print("✅ LINE 查詢權限矩陣：已掛入 process_line_message_event")
+except Exception as e:
+    print("⚠️ LINE 查詢權限矩陣 process_line_message_event 掛入失敗：", e)
+
+
+# 過濾電話搜尋結果，避免群組 / 個人查到不該看的私有資料。
+try:
+    _find_records_by_phone_before_permission_matrix = find_records_by_phone
+
+    def find_records_by_phone(collection_name: str, phone: str):
+        docs = _find_records_by_phone_before_permission_matrix(collection_name, phone)
+        record_type = _permission_record_type_from_collection(collection_name)
+        ctx = permission_current_line_source()
+        if not ctx.get("source_cfg") or not record_type:
+            return docs
+        return [d for d in docs if permission_filter_doc_snapshot(record_type, d)]
+
+    print("✅ LINE 查詢權限矩陣：已過濾電話搜尋")
+except Exception as e:
+    print("⚠️ LINE 查詢權限矩陣 find_records_by_phone 掛入失敗：", e)
+
+
+# 過濾單筆查詢結果。
+try:
+    _find_customer_record_before_permission_matrix = find_customer_record
+
+    def find_customer_record(target_type: str, record_id: str = "", phone: str = "", name: str = "", address: str = ""):
+        try:
+            doc = _find_customer_record_before_permission_matrix(target_type, record_id, phone, name, address)
+        except TypeError:
+            doc = _find_customer_record_before_permission_matrix(target_type, record_id, phone, name)
+        if not doc:
+            return doc
+        record_type = "development" if target_type in ("development", "developments") else target_type
+        ctx = permission_current_line_source()
+        if ctx.get("source_cfg") and record_type in ("buyer", "seller", "development"):
+            if not permission_filter_doc_snapshot(record_type, doc):
+                return None
+        return doc
+
+    print("✅ LINE 查詢權限矩陣：已過濾單筆查詢")
+except Exception as e:
+    print("⚠️ LINE 查詢權限矩陣 find_customer_record 掛入失敗：", e)
+
+
+# 行事曆查詢依權限矩陣過濾，不再固定「群組只能公開、個人只能自己」。
+try:
+    _fetch_calendar_events_before_permission_matrix = fetch_calendar_events
+
+    def fetch_calendar_events(start_date: str, end_date: str = None, line_only: bool = False, calendar_view: str = "all", line_source_kind: str = "", line_source_id: str = ""):
+        start_date = calendar_safe_date(start_date)
+        end_date = calendar_safe_date(end_date or start_date)
+        if not line_source_kind and permission_current_line_source().get("kind"):
+            ctx = permission_current_line_source()
+            line_source_kind = ctx.get("kind") or ""
+            line_source_id = ctx.get("target_id") or ""
+
+        # 後台照舊。
+        if not line_source_kind:
+            return _fetch_calendar_events_before_permission_matrix(start_date, end_date, line_only=line_only, calendar_view=calendar_view)
+
+        try:
+            if start_date == end_date:
+                docs = list(db.collection(CALENDAR_EVENT_COLLECTION).where("event_date", "==", start_date).stream())
+            else:
+                docs = list(db.collection(CALENDAR_EVENT_COLLECTION).where("event_date", ">=", start_date).where("event_date", "<=", end_date).stream())
+        except Exception as e:
+            print("⚠️ 權限矩陣行事曆查詢失敗，改用全表掃描：", e)
+            docs = list(db.collection(CALENDAR_EVENT_COLLECTION).stream())
+
+        source_cfg = None
+        if line_source_kind == "user":
+            source_cfg = find_line_personal_user_by_user_id(line_source_id)
+        elif line_source_kind in ("group", "room"):
+            source_cfg = find_line_group_by_target_id(line_source_id)
+
+        events = []
+        for d in docs:
+            try:
+                item = doc_to_calendar_event(d)
+            except Exception:
+                continue
+            if not (start_date <= item.get("event_date", "") <= end_date):
+                continue
+            if line_only and not item.get("line_enabled", True):
+                continue
+            if not permission_config_can_view(source_cfg, "calendar", item, line_source_kind, line_source_id):
+                continue
+            events.append(item)
+        events.sort(key=lambda x: (x.get("event_date", ""), x.get("start_time", ""), x.get("created_at", "")))
+        return events
+
+    print("✅ LINE 查詢權限矩陣：行事曆查詢已套用")
+except Exception as e:
+    print("⚠️ LINE 查詢權限矩陣 fetch_calendar_events 掛入失敗：", e)
+
+
+# line_access_gate 加一道「資料可查詢類型」檢查：有指令權限但沒有可看資料，也不放行查詢。
+try:
+    _line_access_gate_before_permission_matrix = line_access_gate
+
+    def line_access_gate(event):
+        allowed, reason_or_cmd, source_cfg = _line_access_gate_before_permission_matrix(event)
+        if not allowed:
+            return allowed, reason_or_cmd, source_cfg
+
+        cmd_type = reason_or_cmd
+        if cmd_type in ("system_group_id", "followup"):
+            return allowed, reason_or_cmd, source_cfg
+
+        view_map = {
+            "calendar": "calendar",
+            "todo": "todo",
+            "buyer": "buyer",
+            "seller": "seller",
+            "development": "development",
+        }
+        view_type = view_map.get(cmd_type)
+        if view_type and source_cfg:
+            view_types = set(source_cfg.get("view_types") or [])
+            if "all" not in view_types and view_type not in view_types:
+                return False, f"此來源未開放查看「{view_type}」資料，請到設定中心調整『可查詢資料』。", source_cfg
+        return allowed, reason_or_cmd, source_cfg
+
+    print("✅ LINE 查詢權限矩陣：line_access_gate 已加上可查詢資料檢查")
+except Exception as e:
+    print("⚠️ LINE 查詢權限矩陣 line_access_gate 掛入失敗：", e)
+
+
+def parse_line_groups_from_form(form):
+    try:
+        count = int(form.get("group_count", 0))
+    except Exception:
+        count = 0
+    count = max(0, min(30, count))
+    groups = []
+    for i in range(count):
+        target_id = (form.get(f"group_{i}_target_id") or "").strip()
+        name = (form.get(f"group_{i}_name") or "").strip()
+        if not target_id and not name:
+            continue
+        groups.append({
+            "enabled": form.get(f"group_{i}_enabled") == "on",
+            "name": name or f"群組 {i+1}",
+            "target_id": target_id,
+            "receive_types": form.getlist(f"group_{i}_receive_types"),
+            "command_types": form.getlist(f"group_{i}_command_types"),
+            "view_types": form.getlist(f"group_{i}_view_types"),
+            "visibility_scope": _permission_normalize_scope(form.get(f"group_{i}_visibility_scope"), default="public_only"),
+            "note": (form.get(f"group_{i}_note") or "").strip(),
+        })
+    return groups
+
+
+def parse_line_personal_users_from_form(form):
+    try:
+        count = int(form.get("personal_user_count", 0))
+    except Exception:
+        count = 0
+    count = max(0, min(50, count))
+    users = []
+    for i in range(count):
+        user_id = (form.get(f"personal_{i}_user_id") or "").strip()
+        name = (form.get(f"personal_{i}_name") or "").strip()
+        if not user_id and not name:
+            continue
+        users.append({
+            "enabled": form.get(f"personal_{i}_enabled") == "on",
+            "name": name or f"個人 {i+1}",
+            "user_id": user_id,
+            "receive_types": form.getlist(f"personal_{i}_receive_types"),
+            "command_types": form.getlist(f"personal_{i}_command_types"),
+            "view_types": form.getlist(f"personal_{i}_view_types"),
+            "visibility_scope": _permission_normalize_scope(form.get(f"personal_{i}_visibility_scope"), default="public_and_own"),
+            "note": (form.get(f"personal_{i}_note") or "").strip(),
+        })
+    return users
+
+
+def save_line_settings_center_from_form(form):
+    updates = save_line_card_settings_from_form(form)
+    groups = parse_line_groups_from_form(form)
+    personal_users = parse_line_personal_users_from_form(form)
+
+    if not groups:
+        old_target = (form.get("notify_target_id") or updates.get("notify_target_id") or os.environ.get("LINE_NOTIFY_TARGET_ID") or "").strip()
+        if old_target:
+            groups = [{
+                "enabled": True,
+                "name": "預設群組",
+                "target_id": old_target,
+                "receive_types": [x[0] for x in LINE_RECEIVE_TYPE_OPTIONS],
+                "command_types": [x[0] for x in LINE_COMMAND_TYPE_OPTIONS],
+                "view_types": [x[0] for x in LINE_VIEW_TYPE_OPTIONS],
+                "visibility_scope": "public_only",
+                "note": "舊版單一群組相容",
+            }]
+
+    extra = {
+        "line_groups": groups,
+        "line_personal_users": personal_users,
+        "updated_at": now_taipei().isoformat(),
+        "updated_by_id": session.get("user_id", ""),
+        "updated_by_name": session.get("user_name", ""),
+    }
+
+    new_pw = (form.get("new_settings_admin_password") or "").strip()
+    new_pw2 = (form.get("new_settings_admin_password_confirm") or "").strip()
+    if new_pw or new_pw2:
+        if new_pw != new_pw2:
+            raise ValueError("兩次輸入的新管理員密碼不一致")
+        if len(new_pw) < 4:
+            raise ValueError("管理員密碼至少 4 碼")
+        extra["settings_admin_password_hash"] = generate_password_hash(new_pw)
+
+    db.collection(LINE_CARD_SETTINGS_COLLECTION).document("default").set(extra, merge=True)
+    return {**updates, **extra}
+
+
+LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX = """
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <title>設定中心｜厝米 Team M.E</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body{background:#f6f3ef}.setting-card{background:#fff;border:1px solid #eadbca;border-radius:18px;box-shadow:0 8px 24px rgba(120,80,40,.08)}
+    .group-box,.user-box{border:1px solid #eadbca;border-radius:14px;padding:14px;background:#fffaf5}.code{font-family:Consolas,monospace}.hint{font-size:.88rem;color:#8b6b4f;line-height:1.7}.sticky-nav{position:sticky;top:16px}.small-check label{margin-right:.65rem;margin-bottom:.25rem}.scope-select{max-width:360px}.badge-soft{background:#f8eadc;color:#7a4e2d;border:1px solid #eadbca}
+  </style>
+</head>
+<body>
+<div class="container-fluid py-4">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <div><h2 class="mb-1">設定中心</h2><div class="text-muted small">自訂誰可以接收、誰可以下指令、誰可以看哪些資料。</div></div>
+    <div class="d-flex gap-2"><a href="{{ url_for('buyers') }}" class="btn btn-outline-secondary btn-sm">回後台</a><form method="post" action="{{ url_for('line_settings_admin_logout') }}"><button class="btn btn-outline-danger btn-sm">離開管理模式</button></form></div>
+  </div>
+  {% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}{% for category, msg in messages %}<div class="alert alert-{{ category }} py-2">{{ msg }}</div>{% endfor %}{% endif %}{% endwith %}
+  <form method="post">
+    <div class="row g-3">
+      <div class="col-lg-3"><div class="setting-card p-3 sticky-nav"><div class="list-group small">
+        <a class="list-group-item list-group-item-action" href="#security">管理員密碼</a>
+        <a class="list-group-item list-group-item-action" href="#groups">LINE 群組權限</a>
+        <a class="list-group-item list-group-item-action" href="#personal">LINE 個人權限</a>
+        <a class="list-group-item list-group-item-action" href="#card">LINE 卡片樣式</a>
+        <a class="list-group-item list-group-item-action" href="#calendar">行事曆設定</a>
+        <a class="list-group-item list-group-item-action" href="#rules">權限規則</a>
+      </div></div></div>
+      <div class="col-lg-9">
+        <div id="security" class="setting-card p-4 mb-4">
+          <h5>管理員密碼</h5><div class="hint mb-3">第一次預設密碼是 <span class="code">123456</span>。修改後，下次進入設定中心需輸入新密碼。</div>
+          <div class="row g-2"><div class="col-md-6"><label class="form-label">新密碼</label><input type="password" name="new_settings_admin_password" class="form-control" placeholder="留空則不修改"></div><div class="col-md-6"><label class="form-label">再次輸入</label><input type="password" name="new_settings_admin_password_confirm" class="form-control" placeholder="留空則不修改"></div></div>
+        </div>
+
+        <div id="groups" class="setting-card p-4 mb-4">
+          <h5>LINE 群組權限</h5>
+          <div class="hint mb-3">群組輸入 <span class="code">#綁定</span> 可取得群組 ID。每個群組可以獨立設定：接收什麼、能下什麼指令、能查什麼資料、能看公開或全部。</div>
+          <input type="hidden" name="group_count" value="{{ group_rows|length }}">
+          {% for g in group_rows %}{% set idx = loop.index0 %}
+          <div class="group-box mb-3">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-1"><label class="form-label">啟用</label><input class="form-check-input d-block" type="checkbox" name="group_{{ idx }}_enabled" {% if g.enabled %}checked{% endif %}></div>
+              <div class="col-md-3"><label class="form-label">群組名稱</label><input class="form-control" name="group_{{ idx }}_name" value="{{ g.name }}" placeholder="例如：業務群"></div>
+              <div class="col-md-5"><label class="form-label">群組 / 房間 ID</label><input class="form-control code" name="group_{{ idx }}_target_id" value="{{ g.target_id }}" placeholder="Cxxxxxxxx 或 Rxxxxxxxx"></div>
+              <div class="col-md-3"><label class="form-label">備註</label><input class="form-control" name="group_{{ idx }}_note" value="{{ g.note }}"></div>
+            </div>
+            <div class="row mt-3 g-3">
+              <div class="col-md-6"><div class="fw-bold small mb-1">1. 可接收推播</div><div class="small-check">{% for key,label in receive_options %}<label class="form-check form-check-inline small"><input class="form-check-input" type="checkbox" name="group_{{ idx }}_receive_types" value="{{ key }}" {% if key in g.receive_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div></div>
+              <div class="col-md-6"><div class="fw-bold small mb-1">2. 可使用指令</div>{% for key,label in command_options %}<label class="form-check d-block small"><input class="form-check-input" type="checkbox" name="group_{{ idx }}_command_types" value="{{ key }}" {% if key in g.command_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div>
+              <div class="col-md-6"><div class="fw-bold small mb-1">3. 可查詢資料</div><div class="small-check">{% for key,label in view_options %}<label class="form-check form-check-inline small"><input class="form-check-input" type="checkbox" name="group_{{ idx }}_view_types" value="{{ key }}" {% if key in g.view_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div></div>
+              <div class="col-md-6"><div class="fw-bold small mb-1">4. 可見範圍</div><select class="form-select scope-select" name="group_{{ idx }}_visibility_scope">{% for key,label in visibility_scope_options %}<option value="{{ key }}" {% if g.visibility_scope == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select><div class="hint mt-1">一般群組建議用「只看公開資料」；店長群可改「全部資料」。</div></div>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div id="personal" class="setting-card p-4 mb-4">
+          <h5>LINE 個人權限</h5>
+          <div class="hint mb-3">個人私訊官方帳號輸入 <span class="code">#綁定</span>，會回覆個人 LINE ID。把 ID 貼在這裡後，就可以設定這個人能看什麼。</div>
+          <input type="hidden" name="personal_user_count" value="{{ personal_user_rows|length }}">
+          {% for u in personal_user_rows %}{% set idx = loop.index0 %}
+          <div class="user-box mb-3">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-1"><label class="form-label">啟用</label><input class="form-check-input d-block" type="checkbox" name="personal_{{ idx }}_enabled" {% if u.enabled %}checked{% endif %}></div>
+              <div class="col-md-3"><label class="form-label">姓名 / 暱稱</label><input class="form-control" name="personal_{{ idx }}_name" value="{{ u.name }}" placeholder="例如：曜昀"></div>
+              <div class="col-md-5"><label class="form-label">LINE 個人 userId</label><input class="form-control code" name="personal_{{ idx }}_user_id" value="{{ u.user_id }}" placeholder="Uxxxxxxxx"></div>
+              <div class="col-md-3"><label class="form-label">備註</label><input class="form-control" name="personal_{{ idx }}_note" value="{{ u.note }}"></div>
+            </div>
+            <div class="row mt-3 g-3">
+              <div class="col-md-6"><div class="fw-bold small mb-1">1. 可接收推播</div><div class="small-check">{% for key,label in receive_options %}<label class="form-check form-check-inline small"><input class="form-check-input" type="checkbox" name="personal_{{ idx }}_receive_types" value="{{ key }}" {% if key in u.receive_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div></div>
+              <div class="col-md-6"><div class="fw-bold small mb-1">2. 可使用指令</div>{% for key,label in command_options %}<label class="form-check d-block small"><input class="form-check-input" type="checkbox" name="personal_{{ idx }}_command_types" value="{{ key }}" {% if key in u.command_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div>
+              <div class="col-md-6"><div class="fw-bold small mb-1">3. 可查詢資料</div><div class="small-check">{% for key,label in view_options %}<label class="form-check form-check-inline small"><input class="form-check-input" type="checkbox" name="personal_{{ idx }}_view_types" value="{{ key }}" {% if key in u.view_types %}checked{% endif %}> {{ label }}</label>{% endfor %}</div></div>
+              <div class="col-md-6"><div class="fw-bold small mb-1">4. 可見範圍</div><select class="form-select scope-select" name="personal_{{ idx }}_visibility_scope">{% for key,label in visibility_scope_options %}<option value="{{ key }}" {% if u.visibility_scope == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select><div class="hint mt-1">一般個人建議用「公開資料 + 自己的個人資料」。</div></div>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div id="card" class="setting-card p-4 mb-4">
+          <h5>LINE 卡片樣式</h5>
+          <div class="row g-2">
+            <div class="col-12"><label class="form-label">今日行程標題</label><input class="form-control" name="title_today" value="{{ settings.title_today }}"></div>
+            <div class="col-12"><label class="form-label">明日行程標題</label><input class="form-control" name="title_tomorrow" value="{{ settings.title_tomorrow }}"></div>
+            <div class="col-12"><label class="form-label">本週行程標題</label><input class="form-control" name="title_week" value="{{ settings.title_week }}"></div>
+            <div class="col-md-6"><label class="form-label">主色</label><input class="form-control" name="primary_color" value="{{ settings.primary_color }}"></div>
+            <div class="col-md-6"><label class="form-label">按鈕色</label><input class="form-control" name="button_color" value="{{ settings.button_color }}"></div>
+            <div class="col-12"><label class="form-label">LINE 卡片顯示內容</label><br>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_customer" {% if settings.show_customer %}checked{% endif %}> 客戶</label>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_phone" {% if settings.show_phone %}checked{% endif %}> 電話</label>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_location" {% if settings.show_location %}checked{% endif %}> 地點</label>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_note" {% if settings.show_note %}checked{% endif %}> 備註</label>
+              <label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="show_quick_actions" {% if settings.show_quick_actions %}checked{% endif %}> 快速操作</label>
+              <label class="form-check d-block mt-2"><input class="form-check-input" type="checkbox" name="line_only_enabled_events" {% if settings.line_only_enabled_events %}checked{% endif %}> LINE 只顯示有勾「LINE查詢顯示」的行程</label>
+            </div>
+            <div class="col-12"><label class="form-label">快速操作按鈕文字</label><textarea class="form-control" rows="4" name="quick_actions">{{ quick_actions_text }}</textarea></div>
+          </div>
+        </div>
+
+        <div id="calendar" class="setting-card p-4 mb-4">
+          <h5>行事曆設定</h5>
+          <div class="row g-2">
+            <div class="col-md-6"><label class="form-label">行事曆開始小時</label><input class="form-control" name="calendar_start_hour" value="{{ settings.calendar_start_hour }}"></div>
+            <div class="col-md-6"><label class="form-label">行事曆結束小時</label><input class="form-control" name="calendar_end_hour" value="{{ settings.calendar_end_hour }}"></div>
+            <div class="col-12"><label class="form-label">行事曆行程分類</label><textarea class="form-control" rows="5" name="calendar_categories">{{ calendar_categories_text }}</textarea><div class="hint">一行一個分類，例如：帶看、回電、開發、簽約、拍照、私人行程、其他。</div></div>
+          </div>
+        </div>
+
+        <div id="rules" class="setting-card p-4 mb-4">
+          <h5>權限規則說明</h5>
+          <div class="row g-3 small">
+            <div class="col-md-6"><span class="badge badge-soft mb-2">群組</span><br>群組通常設定「只看公開資料」。如果設定為「全部資料」，該群組查詢時會看得到所有人的個人資料，請只給店長或管理者群組。</div>
+            <div class="col-md-6"><span class="badge badge-soft mb-2">個人</span><br>個人建議設定「公開資料 + 自己的個人資料」。這樣他私訊查詢時，看得到公開資料和綁定給自己的資料，但看不到別人的個人資料。</div>
+            <div class="col-md-6"><span class="badge badge-soft mb-2">可使用指令</span><br>控制能不能下 #今日行程、#新增客需、#查詢紀錄 等指令。</div>
+            <div class="col-md-6"><span class="badge badge-soft mb-2">可查詢資料</span><br>控制指令通過後，實際能不能看到客需、委託、開發、行事曆、待辦。</div>
+          </div>
+        </div>
+        <button class="btn btn-primary btn-lg w-100" type="submit">儲存全部設定</button>
+      </div>
+    </div>
+  </form>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+"""
+
+
+def line_card_settings_center():
+    if request.method == "POST" and request.form.get("admin_login") == "1":
+        if _settings_admin_password_ok(request.form.get("admin_password", "")):
+            session[LINE_SETTINGS_ADMIN_SESSION_KEY] = True
+            flash("已進入設定中心", "success")
+            return redirect(url_for("line_card_settings"))
+        flash("管理員密碼錯誤", "danger")
+        return render_template_string(LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE)
+
+    if not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
+        return render_template_string(LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE)
+
+    if request.method == "POST":
+        try:
+            save_line_settings_center_from_form(request.form)
+            flash("設定已更新", "success")
+        except Exception as e:
+            flash(f"設定儲存失敗：{e}", "danger")
+        return redirect(url_for("line_card_settings"))
+
+    settings = get_line_card_settings()
+    group_rows = list(get_line_group_settings())
+    while len(group_rows) < 8:
+        group_rows.append({"enabled": False, "name": "", "target_id": "", "receive_types": [], "command_types": [], "view_types": ["buyer", "seller", "development", "calendar", "todo"], "visibility_scope": "public_only", "note": ""})
+
+    personal_user_rows = list(get_line_personal_users(include_disabled=True))
+    while len(personal_user_rows) < max(10, LINE_PERSONAL_USER_COUNT_DEFAULT if 'LINE_PERSONAL_USER_COUNT_DEFAULT' in globals() else 8):
+        personal_user_rows.append({"enabled": False, "name": "", "user_id": "", "receive_types": ["calendar"], "command_types": ["calendar", "todo", "followup"], "view_types": ["buyer", "seller", "development", "calendar", "todo"], "visibility_scope": "public_and_own", "note": ""})
+
+    return render_template_string(
+        LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX,
+        settings=settings,
+        group_rows=group_rows,
+        personal_user_rows=personal_user_rows,
+        receive_options=LINE_RECEIVE_TYPE_OPTIONS,
+        command_options=LINE_COMMAND_TYPE_OPTIONS,
+        view_options=LINE_VIEW_TYPE_OPTIONS,
+        visibility_scope_options=LINE_VISIBILITY_SCOPE_OPTIONS,
+        quick_actions_text="\n".join(settings.get("quick_actions") or []),
+        calendar_categories_text="\n".join(get_calendar_category_options()),
+    )
+
+try:
+    app.view_functions["line_card_settings"] = login_required(line_card_settings_center)
+    print("✅ 設定中心權限矩陣已啟用：可客製誰可以看什麼")
+except Exception as e:
+    print("⚠️ 設定中心權限矩陣套用失敗：", e)
+
+# =============================================================================
+# 設定中心：誰可以看什麼 / 全客製化權限 Patch End
 # =============================================================================
 
 if __name__ == "__main__":
