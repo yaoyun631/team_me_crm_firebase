@@ -18,9 +18,21 @@
   <div class="card-header fw-bold">新增待辦事項</div>
   <div class="card-body">
     <form method="post" action="{{ url_for('todos_new') }}" class="row g-2">
-      <div class="col-md-3"><input type="date" name="todo_date" class="form-control" value="{{ selected_date }}"></div>
-      <div class="col-md-5"><input type="text" name="title" class="form-control" placeholder="待辦事項，例如：提醒客戶補資料" required></div>
-      <div class="col-md-3"><input type="text" name="note" class="form-control" placeholder="備註（可空白）"></div>
+      <div class="col-md-2"><input type="date" name="todo_date" class="form-control" value="{{ selected_date }}"></div>
+      <div class="col-md-4"><input type="text" name="title" class="form-control" placeholder="待辦事項，例如：提醒客戶補資料" required></div>
+      <div class="col-md-2"><input type="text" name="note" class="form-control" placeholder="備註（可空白）"></div>
+      <div class="col-md-2">
+        <select name="visibility" class="form-select">
+          <option value="public">公開待辦</option>
+          <option value="personal">個人待辦</option>
+        </select>
+      </div>
+      <div class="col-md-1">
+        <select name="owner_line_user_id" class="form-select" title="個人待辦對象">
+          <option value="">自己</option>
+          {% for opt in line_delivery_options('todo') %}{% if opt.value.startswith('user:') %}<option value="{{ opt.value.split(':',1)[1] }}">{{ opt.label }}</option>{% endif %}{% endfor %}
+        </select>
+      </div>
       <div class="col-md-1 d-grid"><button class="btn btn-primary">新增</button></div>
     </form>
   </div>
@@ -30,13 +42,14 @@
   <div class="card-header fw-bold">待辦清單</div>
   <div class="card-body p-0">
     <table class="table table-hover align-middle mb-0">
-      <thead class="table-light"><tr><th style="width:120px;">日期</th><th>事項</th><th>備註</th><th style="width:120px;">狀態</th><th style="width:180px;">操作</th></tr></thead>
+      <thead class="table-light"><tr><th style="width:120px;">日期</th><th>事項</th><th>備註</th><th style="width:120px;">類型</th><th style="width:120px;">狀態</th><th style="width:180px;">操作</th></tr></thead>
       <tbody>
         {% for item in items %}
           <tr>
             <td>{{ item.todo_date or '-' }}</td>
             <td class="fw-bold">{{ item.title or item.content or '-' }}</td>
             <td class="text-muted small">{{ item.content if item.title else '' }}</td>
+            <td>{% if item.visibility == 'personal' %}<span class="badge bg-warning text-dark">個人</span>{% else %}<span class="badge bg-success">公開</span>{% endif %}</td>
             <td>{% if item.status == 'done' %}<span class="badge bg-success">已完成</span>{% else %}<span class="badge bg-warning text-dark">待處理</span>{% endif %}</td>
             <td>
               <div class="d-flex gap-2">
@@ -48,7 +61,7 @@
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="5" class="text-center text-muted py-4">目前沒有待辦事項</td></tr>
+          <tr><td colspan="6" class="text-center text-muted py-4">目前沒有待辦事項</td></tr>
         {% endfor %}
       </tbody>
     </table>

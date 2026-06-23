@@ -18922,6 +18922,537 @@ except Exception as e:
 # 設定中心：誰可以看什麼 / 全客製化權限 Patch End
 # =============================================================================
 
+
+
+# =============================================================================
+# LINE 個人 / 群組精準權限 + 可選傳送對象 + 待辦公開/個人 Patch v20260623B
+# - LINE 私訊新增客需/委託/開發：自動個人資料
+# - LINE 群組新增客需/委託/開發：自動公開資料
+# - 後台傳 LINE：可選傳給「目前登入者個人」或「目前登入者所在且已設定的群組」
+# - 待辦事項：也支援公開 / 個人，LINE 查詢與勾選依權限過濾
+# =============================================================================
+
+
+def _line_source_kind_id_safe(event=None):
+    try:
+        return line_event_source_kind_and_id(event or {})
+    except Exception:
+        source = ((event or {}).get("source") or {})
+        if source.get("groupId"):
+            return "group", source.get("groupId")
+        if source.get("roomId"):
+            return "room", source.get("roomId")
+        return "user", source.get("userId", "")
+
+
+def _line_visibility_payload_from_event(event=None):
+    """LINE 建立資料時：群組/聊天室=公開，個人私訊=個人。"""
+    kind, target_id = _line_source_kind_id_safe(event)
+    payload = {
+        "line_created_source_kind": kind,
+        "line_created_source_id": target_id,
+        "updated_at": now_taipei().isoformat(),
+    }
+    if kind == "user":
+        try:
+            user_cfg = find_line_personal_user_by_user_id(target_id) or {}
+        except Exception:
+            user_cfg = {}
+        name = (user_cfg.get("name") or get_line_sender_display_name(event or {}) or "").strip()
+        payload.update({
+            "visibility": "personal",
+            "owner_line_user_id": target_id,
+            "owner_line_name": name,
+        })
+    else:
+        payload.update({
+            "visibility": "public",
+            "owner_line_user_id": "",
+            "owner_line_name": "",
+        })
+    return payload
+
+
+def _apply_line_visibility_to_created_result(result, event=None):
+    if not result or not result.get("ok"):
+        return result
+    target_type = (result.get("target_type") or "").strip()
+    target_id = (result.get("target_id") or "").strip()
+    coll = {"buyer": "buyers", "seller": "sellers", "development": "developments"}.get(target_type)
+    if not coll or not target_id:
+        return result
+    try:
+        payload = _line_visibility_payload_from_event(event)
+        db.collection(coll).document(target_id).set(payload, merge=True)
+        result["visibility"] = payload.get("visibility")
+        result["owner_line_user_id"] = payload.get("owner_line_user_id")
+        result["owner_line_name"] = payload.get("owner_line_name")
+        if payload.get("visibility") == "personal":
+            result["reply_text"] = (result.get("reply_text") or "已寫入") + "\n已設為：個人資料"
+        else:
+            result["reply_text"] = (result.get("reply_text") or "已寫入") + "\n已設為：公開資料"
+    except Exception as e:
+        print("⚠️ 自動設定 LINE 新增資料公開/個人失敗：", e)
+    return result
+
+
+try:
+    _create_buyer_need_before_visibility_auto = create_buyer_need
+    def create_buyer_need(fields, event):
+        result = _create_buyer_need_before_visibility_auto(fields, event)
+        return _apply_line_visibility_to_created_result(result, event)
+except Exception as e:
+    print("⚠️ 掛入客需 LINE 自動公開/個人失敗：", e)
+
+try:
+    _create_seller_listing_before_visibility_auto = create_seller_listing
+    def create_seller_listing(fields, event):
+        result = _create_seller_listing_before_visibility_auto(fields, event)
+        return _apply_line_visibility_to_created_result(result, event)
+except Exception as e:
+    print("⚠️ 掛入委託 LINE 自動公開/個人失敗：", e)
+
+try:
+    _create_development_before_visibility_auto = create_development
+    def create_development(fields, event):
+        result = _create_development_before_visibility_auto(fields, event)
+        return _apply_line_visibility_to_created_result(result, event)
+except Exception as e:
+    print("⚠️ 掛入開發 LINE 自動公開/個人失敗：", e)
+
+
+# ---------- 後台：可選擇傳送到哪個群組或個人 ----------
+
+def _current_bound_line_user_id():
+    try:
+        binding = get_current_user_line_binding()
+        return (binding.get("user_id") or "").strip(), (binding.get("name") or binding.get("crm_user_name") or session.get("user_name") or "個人").strip()
+    except Exception:
+        return "", (session.get("user_name") or "個人").strip()
+
+
+def _line_group_contains_user(group_id: str, line_user_id: str) -> bool:
+    """只列出官方帳號所在、且目前登入者也在的群組。"""
+    group_id = (group_id or "").strip()
+    line_user_id = (line_user_id or "").strip()
+    if not group_id or not line_user_id:
+        return False
+
+    cache_key = f"member:{group_id}:{line_user_id}"
+    cache = app.config.setdefault("LINE_GROUP_MEMBER_CACHE", {})
+    if cache_key in cache:
+        return bool(cache[cache_key])
+
+    # 先用 webhook log 判斷：此 user 曾在此群組傳訊息給 bot，就代表兩者同群。
+    try:
+        logs = db.collection("line_logs").where("line_group_id", "==", group_id).where("line_user_id", "==", line_user_id).limit(1).stream()
+        if list(logs):
+            cache[cache_key] = True
+            return True
+    except Exception:
+        pass
+
+    # 再用 LINE API 判斷 member profile。官方帳號不在該群或 user 不在，通常會失敗。
+    if LINE_CHANNEL_ACCESS_TOKEN:
+        try:
+            import requests
+            res = requests.get(
+                f"https://api.line.me/v2/bot/group/{group_id}/member/{line_user_id}",
+                headers=line_api_headers(),
+                timeout=5,
+            )
+            ok = (res.status_code == 200)
+            cache[cache_key] = ok
+            return ok
+        except Exception as e:
+            print("⚠️ 檢查 LINE 群組成員失敗：", e)
+
+    cache[cache_key] = False
+    return False
+
+
+def _source_config_for_delivery_value(value: str):
+    value = (value or "").strip()
+    if value.startswith("user:"):
+        uid = value.split(":", 1)[1].strip()
+        return "user", uid, find_line_personal_user_by_user_id(uid)
+    if value.startswith("group:"):
+        gid = value.split(":", 1)[1].strip()
+        return "group", gid, find_line_group_by_target_id(gid)
+    return "", "", None
+
+
+def line_delivery_options(record_type: str):
+    """Jinja 使用：列出目前登入者可傳送的個人/群組。"""
+    record_type = (record_type or "").strip()
+    options = []
+    line_user_id, line_name = _current_bound_line_user_id()
+
+    if line_user_id:
+        try:
+            personal_cfg = find_line_personal_user_by_user_id(line_user_id)
+            if personal_cfg and line_personal_user_allows_receive(personal_cfg, record_type):
+                options.append({"value": f"user:{line_user_id}", "label": f"傳給個人｜{personal_cfg.get('name') or line_name}"})
+            elif record_type in ("buyer", "seller", "development", "calendar", "todo"):
+                # 即使未在接收設定勾選，仍顯示個人選項，但送出時會再次檢查。
+                options.append({"value": f"user:{line_user_id}", "label": f"傳給個人｜{line_name}"})
+        except Exception:
+            options.append({"value": f"user:{line_user_id}", "label": f"傳給個人｜{line_name}"})
+
+    for g in get_enabled_line_groups():
+        try:
+            if not line_group_allows_receive(g, record_type):
+                continue
+            gid = (g.get("target_id") or "").strip()
+            if not gid:
+                continue
+            if line_user_id and not _line_group_contains_user(gid, line_user_id):
+                continue
+            options.append({"value": f"group:{gid}", "label": f"傳到群組｜{g.get('name') or gid[-6:]}"})
+        except Exception:
+            continue
+    return options
+
+
+@app.context_processor
+def inject_line_delivery_options_patch():
+    return {"line_delivery_options": line_delivery_options}
+
+
+def _line_push_result_flash_message_selected(res):
+    if not res or not res.get("ok"):
+        return f"傳送失敗：{(res or {}).get('error') or (res or {}).get('text') or res}", "danger"
+    label = (res.get("target_label") or res.get("group_name") or res.get("personal_target_name") or "LINE").strip()
+    return f"已傳送到：{label}", "success"
+
+
+def _build_record_message_for_delivery(record_type, record_id, title_prefix="後台傳送"):
+    coll = {"buyer": "buyers", "seller": "sellers", "development": "developments"}.get(record_type)
+    if not coll:
+        return None, None, {"ok": False, "error": "record_type 不正確"}
+    snap = db.collection(coll).document(record_id).get()
+    if not snap.exists:
+        return None, None, {"ok": False, "error": "找不到資料"}
+    data = snap.to_dict() or {}
+    bubble = _build_record_flex_bubble(record_type, record_id, data, title_prefix=title_prefix)
+    msg = {"type": "flex", "altText": f"{title_prefix}：{data.get('name','')}", "contents": bubble}
+    return data, msg, None
+
+
+def _push_record_to_selected_destination(record_type, record_id, destination, title_prefix="後台傳送"):
+    data, msg, err = _build_record_message_for_delivery(record_type, record_id, title_prefix=title_prefix)
+    if err:
+        return err
+    kind, target_id, cfg = _source_config_for_delivery_value(destination)
+    if not kind or not target_id:
+        # 沒有選擇時保留舊邏輯：依公開/個人自動傳。
+        return _push_record_to_group(record_type, record_id, title_prefix=title_prefix)
+
+    # 目前登入者只能傳到自己個人，或自己也在的群組。
+    my_line_id, my_name = _current_bound_line_user_id()
+    if kind == "user" and my_line_id and target_id != my_line_id:
+        return {"ok": False, "error": "只能傳送到目前登入者綁定的個人 LINE。"}
+    if kind == "group" and my_line_id and not _line_group_contains_user(target_id, my_line_id):
+        return {"ok": False, "error": "你不是這個 LINE 群組成員，或官方帳號不在該群組，不能傳送。"}
+
+    if cfg:
+        if kind == "user":
+            if not line_personal_user_allows_receive(cfg, record_type):
+                return {"ok": False, "error": "此個人帳號未開放接收這類訊息。"}
+        else:
+            if not line_group_allows_receive(cfg, record_type):
+                return {"ok": False, "error": "此群組未開放接收這類訊息。"}
+        if not permission_config_can_view(cfg, record_type, data, kind, target_id):
+            return {"ok": False, "error": "依權限設定，此對象不可查看這筆資料。"}
+
+    res = line_push_messages(target_id, [msg])
+    res["target_label"] = (cfg or {}).get("name") or ("個人" if kind == "user" else "群組")
+    return res
+
+
+def _push_calendar_to_selected_destination(event_id, destination, title_prefix="後台傳送行程"):
+    snap = db.collection(CALENDAR_EVENT_COLLECTION).document(event_id).get()
+    if not snap.exists:
+        return {"ok": False, "error": "找不到行程"}
+    event = doc_to_calendar_event(snap)
+    bubble = build_calendar_event_bubble(event)
+    msg = {"type": "flex", "altText": f"{title_prefix}：{event.get('title','')}", "contents": bubble}
+    kind, target_id, cfg = _source_config_for_delivery_value(destination)
+    if not kind or not target_id:
+        return _push_calendar_event_to_group(event_id, title_prefix=title_prefix)
+
+    my_line_id, my_name = _current_bound_line_user_id()
+    if kind == "user" and my_line_id and target_id != my_line_id:
+        return {"ok": False, "error": "只能傳送到目前登入者綁定的個人 LINE。"}
+    if kind == "group" and my_line_id and not _line_group_contains_user(target_id, my_line_id):
+        return {"ok": False, "error": "你不是這個 LINE 群組成員，或官方帳號不在該群組，不能傳送。"}
+
+    if cfg:
+        if kind == "user" and not line_personal_user_allows_receive(cfg, "calendar"):
+            return {"ok": False, "error": "此個人帳號未開放接收行事曆。"}
+        if kind == "group" and not line_group_allows_receive(cfg, "calendar"):
+            return {"ok": False, "error": "此群組未開放接收行事曆。"}
+        if not permission_config_can_view(cfg, "calendar", event, kind, target_id):
+            return {"ok": False, "error": "依權限設定，此對象不可查看這筆行程。"}
+
+    res = line_push_messages(target_id, [msg])
+    res["target_label"] = (cfg or {}).get("name") or ("個人" if kind == "user" else "群組")
+    return res
+
+
+def buyer_send_to_line_selected(buyer_id):
+    res = _push_record_to_selected_destination("buyer", buyer_id, request.form.get("line_destination", ""), title_prefix="後台傳送")
+    msg, cat = _line_push_result_flash_message_selected(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("buyer_detail", buyer_id=buyer_id))
+
+
+def seller_send_to_line_selected(seller_id):
+    res = _push_record_to_selected_destination("seller", seller_id, request.form.get("line_destination", ""), title_prefix="後台傳送")
+    msg, cat = _line_push_result_flash_message_selected(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("seller_detail", seller_id=seller_id))
+
+
+def development_send_to_line_selected(development_id):
+    res = _push_record_to_selected_destination("development", development_id, request.form.get("line_destination", ""), title_prefix="後台傳送")
+    msg, cat = _line_push_result_flash_message_selected(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("development_detail", development_id=development_id))
+
+
+def calendar_send_to_line_selected(event_id):
+    res = _push_calendar_to_selected_destination(event_id, request.form.get("line_destination", ""), title_prefix="後台傳送行程")
+    msg, cat = _line_push_result_flash_message_selected(res)
+    flash(msg, cat)
+    return redirect(request.referrer or url_for("calendar_page"))
+
+try:
+    app.view_functions["buyer_send_to_line"] = login_required(buyer_send_to_line_selected)
+    app.view_functions["seller_send_to_line"] = login_required(seller_send_to_line_selected)
+    app.view_functions["development_send_to_line"] = login_required(development_send_to_line_selected)
+    app.view_functions["calendar_send_to_line"] = login_required(calendar_send_to_line_selected)
+    print("✅ LINE 後台傳送：已改成可選群組/個人，且群組需包含目前使用者與官方帳號")
+except Exception as e:
+    print("⚠️ LINE 可選傳送對象套用失敗：", e)
+
+
+# ---------- 待辦事項：公開 / 個人 ----------
+
+def _todo_visibility_payload_from_event(event=None):
+    return _line_visibility_payload_from_event(event)
+
+
+def _todo_normalize_visibility(data: dict):
+    data = dict(data or {})
+    visibility = (data.get("visibility") or "").strip()
+    if visibility not in ("public", "personal"):
+        # 舊資料兼容：個人 userId 建立的視為個人；後台共用/群組視為公開。
+        if (data.get("line_target_type") == "user") or (str(data.get("line_target_id") or "").startswith("U")):
+            visibility = "personal"
+        else:
+            visibility = "public"
+    data["visibility"] = visibility
+    if visibility == "personal":
+        data["owner_line_user_id"] = (data.get("owner_line_user_id") or data.get("line_user_id") or (data.get("line_target_id") if str(data.get("line_target_id") or "").startswith("U") else "") or "").strip()
+        data["owner_line_name"] = (data.get("owner_line_name") or data.get("sender_display_name") or "").strip()
+    else:
+        data["owner_line_user_id"] = data.get("owner_line_user_id") or ""
+        data["owner_line_name"] = data.get("owner_line_name") or ""
+    return data
+
+
+def _todo_source_cfg_for_target(target_id: str):
+    target_id = (target_id or "").strip()
+    if target_id.startswith("U"):
+        return "user", find_line_personal_user_by_user_id(target_id)
+    if target_id.startswith("C") or target_id.startswith("R"):
+        return "group", find_line_group_by_target_id(target_id)
+    ctx = permission_current_line_source()
+    return ctx.get("kind", ""), ctx.get("source_cfg")
+
+
+def _todo_doc_visible_for_target(doc, target_id=""):
+    try:
+        raw = doc.to_dict() or {}
+    except Exception:
+        raw = {}
+    data = _todo_normalize_visibility(raw)
+    # 後台無 target 時顯示全部，後台頁面再用篩選控制。
+    if not target_id:
+        ctx = permission_current_line_source()
+        if not ctx.get("source_cfg"):
+            return True
+        return permission_config_can_view(ctx.get("source_cfg"), "todo", data, ctx.get("kind"), ctx.get("target_id"))
+    kind, cfg = _todo_source_cfg_for_target(target_id)
+    if not cfg:
+        # 舊相容：沒有設定的來源，只看完全綁在自己 target 的資料。
+        return (data.get("line_target_id") or "") == target_id
+    return permission_config_can_view(cfg, "todo", data, kind, target_id)
+
+
+def _is_open_todo_doc(doc, target_id=''):
+    data = doc.to_dict() or {}
+    if data.get('status', 'open') != 'open':
+        return False
+    if not (data.get('todo_date') or '').strip():
+        return False
+    if target_id and not _todo_doc_visible_for_target(doc, target_id=target_id):
+        return False
+    if not target_id and not _todo_doc_visible_for_target(doc, target_id=''):
+        return False
+    return True
+
+
+def _get_open_line_todos(todo_date='', target_id='', include_overdue=False):
+    query_date = todo_date or now_taipei().strftime('%Y-%m-%d')
+    result = []
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        if not _is_open_todo_doc(doc, target_id=target_id):
+            continue
+        d = (doc.to_dict() or {}).get('todo_date', '')
+        if include_overdue:
+            if d <= query_date:
+                result.append(doc)
+        else:
+            if d == query_date:
+                result.append(doc)
+    return _sort_line_todo_docs(result)
+
+
+def _get_overdue_line_todos(todo_date='', target_id=''):
+    query_date = todo_date or now_taipei().strftime('%Y-%m-%d')
+    result = []
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        if not _is_open_todo_doc(doc, target_id=target_id):
+            continue
+        d = (doc.to_dict() or {}).get('todo_date', '')
+        if d < query_date:
+            result.append(doc)
+    return _sort_line_todo_docs(result)
+
+
+def _find_line_todo(todo_key: str, target_id=''):
+    key = (todo_key or '').strip()
+    if not key:
+        return None, '請提供代辦 ID 或事項關鍵字。'
+    direct = db.collection(LINE_TODO_COLLECTION).document(key).get()
+    if direct.exists:
+        if target_id and not _todo_doc_visible_for_target(direct, target_id=target_id):
+            return None, '依權限設定，這筆待辦不能在目前 LINE 來源查看或完成。'
+        return direct, ''
+    matches = []
+    for doc in db.collection(LINE_TODO_COLLECTION).stream():
+        data = doc.to_dict() or {}
+        if data.get('status', 'open') != 'open':
+            continue
+        if target_id and not _todo_doc_visible_for_target(doc, target_id=target_id):
+            continue
+        title = data.get('title', '') or data.get('content', '')
+        if doc.id.startswith(key) or key in title:
+            matches.append(doc)
+    if len(matches) == 1:
+        return matches[0], ''
+    if len(matches) > 1:
+        preview = '\n'.join([f"- [{d.id[:6]}] {(d.to_dict() or {}).get('title','')}" for d in matches[:8]])
+        return None, '找到多筆待辦，請用 ID 完成：\n' + preview
+    return None, '找不到這筆未完成待辦，請先輸入 #今日待辦 查看 ID。'
+
+
+try:
+    _create_line_todo_before_visibility_patch = create_line_todo
+except Exception:
+    _create_line_todo_before_visibility_patch = None
+
+
+def create_line_todo(fields, event):
+    title = (fields.get('title') or '').strip()
+    todo_date = _parse_line_todo_date(fields.get('todo_date') or fields.get('todo_date_raw') or '')
+    note = (fields.get('note') or '').strip()
+    if not title:
+        return {'handled': True, 'ok': False, 'reply_text': '未新增：請填「事項」。\n\n範例：\n#新增待辦\n日期: 明天\n事項: 打給王小姐確認貸款資料'}
+    if not todo_date:
+        return {'handled': True, 'ok': False, 'reply_text': '未新增：日期格式看不懂，請用 2026-05-29、5/29、今天、明天。'}
+
+    target_id, target_type = _line_todo_target_from_event(event)
+    source = event.get('source') or {}
+    sender_display_name = get_line_sender_display_name(event)
+    now = now_taipei().isoformat()
+    vis_payload = _todo_visibility_payload_from_event(event)
+
+    doc_ref = db.collection(LINE_TODO_COLLECTION).document()
+    doc_ref.set({
+        'title': title,
+        'content': note,
+        'todo_date': todo_date,
+        'note': note,
+        'status': 'open',
+        'visibility': vis_payload.get('visibility'),
+        'owner_line_user_id': vis_payload.get('owner_line_user_id', ''),
+        'owner_line_name': vis_payload.get('owner_line_name', ''),
+        'line_target_id': target_id,
+        'line_target_type': target_type,
+        'line_group_id': source.get('groupId', ''),
+        'line_room_id': source.get('roomId', ''),
+        'line_user_id': source.get('userId', ''),
+        'sender_display_name': sender_display_name,
+        'created_at': now,
+        'created_by_id': 'line_bot',
+        'created_by_name': sender_display_name or 'LINE Bot',
+        'reminder_sent_dates': [],
+    })
+    vis_text = '個人待辦' if vis_payload.get('visibility') == 'personal' else '公開待辦'
+    return {'handled': True, 'ok': True, 'reply_text': f"已新增{vis_text}：{title}\n日期：{todo_date}\nID：{doc_ref.id[:6]}", 'parsed_tag': '新增代辦'}
+
+
+# 後台新增待辦：可選公開 / 個人。
+def todos_new_visibility_compatible():
+    title = (request.form.get('title') or '').strip()
+    todo_date = calendar_safe_date(request.form.get('todo_date') or '')
+    note = (request.form.get('note') or '').strip()
+    visibility = (request.form.get('visibility') or 'public').strip()
+    if visibility not in ('public', 'personal'):
+        visibility = 'public'
+    owner_line_user_id = (request.form.get('owner_line_user_id') or '').strip()
+    owner_line_name = ''
+    if visibility == 'personal':
+        if not owner_line_user_id:
+            owner_line_user_id, owner_line_name = _current_bound_line_user_id()
+        else:
+            cfg = find_line_personal_user_by_user_id(owner_line_user_id) or {}
+            owner_line_name = cfg.get('name') or ''
+    if not title:
+        flash('請輸入待辦事項', 'warning')
+        return redirect(url_for('todos_page', date=todo_date))
+    db.collection(LINE_TODO_COLLECTION).add({
+        'title': title,
+        'content': note,
+        'note': note,
+        'todo_date': todo_date,
+        'status': 'open',
+        'visibility': visibility,
+        'owner_line_user_id': owner_line_user_id if visibility == 'personal' else '',
+        'owner_line_name': owner_line_name if visibility == 'personal' else '',
+        'source': '後台',
+        'line_target_id': owner_line_user_id if visibility == 'personal' else '',
+        'line_target_type': 'user' if visibility == 'personal' else 'backend_shared',
+        'created_at': now_taipei().isoformat(),
+        'created_by_id': session.get('user_id'),
+        'created_by_name': session.get('user_name'),
+    })
+    flash('已新增待辦事項', 'success')
+    return redirect(url_for('todos_page', date=todo_date))
+
+try:
+    app.view_functions['todos_new'] = login_required(todos_new_visibility_compatible)
+    print('✅ 待辦事項公開/個人設定已啟用')
+except Exception as e:
+    print('⚠️ 待辦事項公開/個人設定套用失敗：', e)
+
+# =============================================================================
+# LINE 個人 / 群組精準權限 + 可選傳送對象 + 待辦公開/個人 Patch End
+# =============================================================================
+
 if __name__ == "__main__":
     print("✅ FULL_READY_20260621 已載入")
     print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))

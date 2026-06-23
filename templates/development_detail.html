@@ -4,8 +4,12 @@
   <h3 class="mb-0">開發詳細資料</h3>
   <div>
     <a href="{{ url_for('calendar_new', related_type='development', related_id=development.id, title=((development.name or development.address or '開發') ~ ' 開發追蹤'), customer_name=development.name, phone=development.phone, location=(development.address or development.registered_address), note=development.note) }}" class="btn btn-outline-success me-2">加入行事曆</a>
-    <form method="post" action="{{ url_for('development_send_to_line', development_id=development.id) }}" style="display:inline;" onsubmit="return confirm('確定要把這筆開發資料傳到 LINE 群組嗎？');">
-      <button type="submit" class="btn btn-outline-info me-2">傳到群組</button>
+    <form method="post" action="{{ url_for('development_send_to_line', development_id=development.id) }}" class="d-inline-flex align-items-center gap-1 me-2 flex-wrap" onsubmit="return confirm('確定要把這筆開發資料傳到選擇的 LINE 對象嗎？');">
+      {% set opts = line_delivery_options('development') %}
+      <select name="line_destination" class="form-select form-select-sm" style="width:auto; min-width:180px;">
+        {% for opt in opts %}<option value="{{ opt.value }}">{{ opt.label }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="btn btn-outline-info">傳LINE</button>
     </form>
     <a href="{{ url_for('development_edit', development_id=development.id) }}" class="btn btn-warning me-2">編輯資料</a>
     <a href="{{ session.get('developments_return_url') or url_for('developments') }}" class="btn btn-secondary">返回列表</a>

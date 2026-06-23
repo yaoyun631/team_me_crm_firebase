@@ -144,8 +144,12 @@
                   {% endif %}
                   <div class="d-flex gap-2 mt-3 flex-wrap">
                     <a href="{{ url_for('calendar_edit', event_id=e.id) }}" class="btn btn-sm btn-outline-primary">編輯</a>
-                    <form method="post" action="{{ url_for('calendar_send_to_line', event_id=e.id) }}">
-                      <button type="submit" class="btn btn-sm btn-outline-success">{% if e.visibility == 'personal' %}傳給個人{% else %}傳群組{% endif %}</button>
+                    <form method="post" action="{{ url_for('calendar_send_to_line', event_id=e.id) }}" class="d-inline-flex align-items-center gap-1 flex-wrap">
+                      {% set opts = line_delivery_options('calendar') %}
+                      <select name="line_destination" class="form-select form-select-sm" style="width:auto; min-width:160px;">
+                        {% for opt in opts %}<option value="{{ opt.value }}">{{ opt.label }}</option>{% endfor %}
+                      </select>
+                      <button type="submit" class="btn btn-sm btn-outline-success">傳LINE</button>
                     </form>
                     <form method="post" action="{{ url_for('calendar_delete', event_id=e.id) }}" onsubmit="return confirm('確定要刪除這筆行程嗎？');">
                       <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>

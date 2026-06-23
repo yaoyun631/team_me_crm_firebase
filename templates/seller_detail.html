@@ -6,7 +6,13 @@
   <div>
     
     <a href="{{ url_for('calendar_new', related_type='seller', related_id=seller.id, title=(seller.name ~ ' 委託追蹤'), customer_name=seller.name, phone=seller.phone, location=seller.address, note=seller.note) }}" class="btn btn-outline-success me-2">加入行事曆</a>
-    <form method="post" action="{{ url_for('seller_send_to_line', seller_id=seller.id) }}" style="display:inline;"><button type="submit" class="btn btn-outline-info me-2">傳到群組</button></form>
+    <form method="post" action="{{ url_for('seller_send_to_line', seller_id=seller.id) }}" class="d-inline-flex align-items-center gap-1 me-2 flex-wrap">
+      {% set opts = line_delivery_options('seller') %}
+      <select name="line_destination" class="form-select form-select-sm" style="width:auto; min-width:180px;">
+        {% for opt in opts %}<option value="{{ opt.value }}">{{ opt.label }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="btn btn-outline-info">傳LINE</button>
+    </form>
     <a href="{{ url_for('seller_edit', seller_id=seller.id) }}" class="btn btn-warning me-2">編輯資料</a>
     <a href="{{ url_for('sellers') }}" class="btn btn-secondary">返回列表</a>
   </div>
