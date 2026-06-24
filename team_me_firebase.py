@@ -19958,6 +19958,33 @@ def _ai_compact_text(text, max_len=240):
     return text[:max_len - 1] + "…"
 
 
+
+
+def _ai_should_show_risk(text):
+    """只有 Gemini 真的有判斷出具體風險時才顯示。"""
+    text = re.sub(r"\s+", " ", str(text or "").strip())
+    if not text:
+        return False
+    bad_phrases = [
+        "尚未由 Gemini",
+        "尚未設定 Gemini",
+        "規則粗篩",
+        "建議再人工確認",
+        "需現場確認細節",
+        "可再人工確認",
+        "無",
+        "-",
+        "—",
+        "無明顯風險",
+        "目前沒有",
+    ]
+    return not any(p in text for p in bad_phrases)
+
+try:
+    app.jinja_env.globals["_ai_should_show_risk"] = _ai_should_show_risk
+except Exception:
+    pass
+
 def _ai_json_loads(text):
     if not text:
         return {}
@@ -20314,7 +20341,7 @@ def _rank_properties_with_gemini(parsed_need: dict, candidates: list, top_n=AI_P
             item["ai_score"] = min(100, max(0, int(c.get("rule_score", 0))))
             item["fit_level"] = "可介紹"
             item["reason"] = "、".join(c.get("basic_reasons") or []) or "依條件粗篩後符合度較高。"
-            item["risk"] = "尚未設定 Gemini API Key，這是規則粗篩結果。"
+            item["risk"] = ""
             item["talking_point"] = "可先確認客戶是否接受此物件條件，再安排進一步介紹。"
             fallback.append(item)
         return fallback
@@ -20376,7 +20403,7 @@ def _rank_properties_with_gemini(parsed_need: dict, candidates: list, top_n=AI_P
             item["ai_score"] = _ai_safe_int(rec.get("ai_score"), base.get("rule_score") or 0)
             item["fit_level"] = rec.get("fit_level") or "可介紹"
             item["reason"] = rec.get("reason") or "依條件判斷符合度較高。"
-            item["risk"] = rec.get("risk") or "需現場確認細節。"
+            item["risk"] = rec.get("risk") or ""
             item["talking_point"] = rec.get("talking_point") or "可先提供給客戶參考。"
             results.append(item)
         results.sort(key=lambda x: x.get("ai_score") or 0, reverse=True)
@@ -20447,11 +20474,12 @@ def build_property_recommend_bubble(item, idx=1):
         {"type": "text", "text": "推薦原因", "size": "xs", "color": "#999999", "margin": "md"},
         {"type": "text", "text": _ai_compact_text(item.get("reason"), 150) or "符合條件，可先介紹。", "size": "sm", "color": "#333333", "wrap": True},
     ]
-    if item.get("risk"):
+    if _ai_should_show_risk(item.get("risk")):
         body.extend([
             {"type": "text", "text": "注意", "size": "xs", "color": "#B00020", "margin": "md"},
             {"type": "text", "text": _ai_compact_text(item.get("risk"), 120), "size": "sm", "color": "#B00020", "wrap": True},
         ])
+
     footer = []
     if url:
         footer.append({
@@ -20786,7 +20814,7 @@ def buyer_ai_recommend_page(buyer_id):
             </div>
             <div class="mt-2"><strong>適合度：</strong>{{ item.fit_level or '-' }}</div>
             <div class="mt-2"><strong>推薦原因：</strong>{{ item.reason or '-' }}</div>
-            <div class="mt-2 text-danger"><strong>注意：</strong>{{ item.risk or '-' }}</div>
+            {% if _ai_should_show_risk(item.risk) %}<div class="mt-2 text-danger"><strong>注意：</strong>{{ item.risk }}</div>{% endif %}
             <div class="mt-2"><strong>話術：</strong>{{ item.talking_point or '-' }}</div>
             {% if item.url %}<a class="btn btn-sm btn-outline-primary mt-2" target="_blank" href="{{ item.url }}">查看物件</a>{% endif %}
           </div>
@@ -21199,7 +21227,7 @@ def _render_ai_recommend_html(buyer, parsed_need=None, recommendations=None, run
             </div>
             <div class="mt-2"><strong>適合度：</strong>{{ item.fit_level or '-' }}</div>
             <div class="mt-2"><strong>推薦原因：</strong>{{ item.reason or '-' }}</div>
-            <div class="mt-2 text-danger"><strong>注意：</strong>{{ item.risk or '-' }}</div>
+            {% if _ai_should_show_risk(item.risk) %}<div class="mt-2 text-danger"><strong>注意：</strong>{{ item.risk }}</div>{% endif %}
             <div class="mt-2"><strong>話術：</strong>{{ item.talking_point or '-' }}</div>
             {% if item.url %}<a class="btn btn-sm btn-outline-primary mt-2" target="_blank" href="{{ item.url }}">查看物件</a>{% endif %}
           </div>
@@ -21268,3 +21296,235 @@ if __name__ == "__main__":
     print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
     print("✅ 可用 /debug/routes 檢查目前所有 route")
     app.run(debug=True)
+
+
+# =============================================================================
+# AI推薦 V3：風險顯示邏輯 / 條件找物件 / 設定中心開關 Patch
+# =============================================================================
+
+def ai_recommend_feature_enabled():
+    """後台設定中心可控制 AI推薦是否啟用；預設啟用。"""
+    env_val = os.environ.get("AI_RECOMMEND_ENABLED", "").strip().lower()
+    if env_val in ("0", "false", "no", "off"):
+        return False
+    try:
+        settings = get_line_card_settings() if "get_line_card_settings" in globals() else {}
+        if "ai_recommend_enabled" in settings:
+            return bool(settings.get("ai_recommend_enabled"))
+    except Exception:
+        pass
+    return True
+
+try:
+    _save_line_settings_center_from_form_before_ai_toggle = save_line_settings_center_from_form
+
+    def save_line_settings_center_from_form(form):
+        result = _save_line_settings_center_from_form_before_ai_toggle(form)
+        extra = {
+            "ai_recommend_enabled": form.get("ai_recommend_enabled") == "on",
+            "ai_free_search_enabled": form.get("ai_free_search_enabled") == "on",
+            "updated_at": now_taipei().isoformat(),
+            "updated_by_id": session.get("user_id", ""),
+            "updated_by_name": session.get("user_name", ""),
+        }
+        db.collection(LINE_CARD_SETTINGS_COLLECTION).document("default").set(extra, merge=True)
+        result.update(extra)
+        return result
+
+    _ai_sidebar_link = '<a class="list-group-item list-group-item-action" href="#ai-recommend">AI推薦設定</a>'
+    if _ai_sidebar_link not in LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX:
+        LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX = LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX.replace(
+            '<a class="list-group-item list-group-item-action" href="#rules">權限規則</a>',
+            _ai_sidebar_link + '\n        <a class="list-group-item list-group-item-action" href="#rules">權限規則</a>'
+        )
+
+    _ai_settings_card = """
+        <div id="ai-recommend" class="setting-card p-4 mb-4">
+          <h5>AI推薦設定</h5>
+          <div class="hint mb-3">控制 Gemini AI推薦物件與條件找物件功能是否開啟。關閉後，LINE 指令與後台 AI推薦都會停止執行，避免誤用額度。</div>
+          <label class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" name="ai_recommend_enabled" {% if settings.ai_recommend_enabled is not defined or settings.ai_recommend_enabled %}checked{% endif %}>
+            啟用 AI推薦物件功能
+          </label>
+          <label class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" name="ai_free_search_enabled" {% if settings.ai_free_search_enabled is not defined or settings.ai_free_search_enabled %}checked{% endif %}>
+            啟用 LINE 條件找物件指令（#找物件 / #搜尋物件）
+          </label>
+          <div class="hint mt-2">
+            建議開啟方式：平常啟用，需要控管 Gemini 額度時可先關閉。<br>
+            指令範例：<span class="code">#找物件 清水 18000內 2房 平車</span>
+          </div>
+        </div>
+"""
+    if 'id="ai-recommend"' not in LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX:
+        LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX = LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX.replace(
+            '        <div id="rules" class="setting-card p-4 mb-4">',
+            _ai_settings_card + '\n        <div id="rules" class="setting-card p-4 mb-4">'
+        )
+
+    try:
+        app.jinja_env.globals["ai_recommend_feature_enabled"] = ai_recommend_feature_enabled
+    except Exception:
+        pass
+    print("✅ 設定中心已加入 AI推薦開關")
+except Exception as e:
+    print("⚠️ AI推薦開關套用失敗：", e)
+
+
+def _ai_free_search_feature_enabled():
+    if not ai_recommend_feature_enabled():
+        return False
+    try:
+        settings = get_line_card_settings() if "get_line_card_settings" in globals() else {}
+        if "ai_free_search_enabled" in settings:
+            return bool(settings.get("ai_free_search_enabled"))
+    except Exception:
+        pass
+    return True
+
+
+def _parse_ai_free_property_search_text(text: str):
+    text = (text or "").strip()
+    if not text:
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    first = lines[0].strip()
+    first_no_space = first.replace(" ", "")
+    valid = ("#找物件", "#搜尋物件", "#AI找物件", "#查物件", "#找公司物件")
+    if not any(first_no_space.startswith(v) for v in valid):
+        return None
+
+    inline = first
+    for v in valid:
+        if inline.replace(" ", "").startswith(v):
+            inline = re.sub(r"^\s*" + re.escape(v) + r"\s*", "", inline, flags=re.I)
+            break
+
+    fields = {}
+    free_parts = []
+    if inline.strip():
+        free_parts.append(inline.strip())
+    for line in lines[1:]:
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", line)
+        if m:
+            key = normalize_line_key(m.group(1)) if "normalize_line_key" in globals() else m.group(1).strip()
+            fields[key] = (m.group(2) or "").strip()
+        else:
+            free_parts.append(line)
+
+    all_text = "\n".join(free_parts + [f"{k}: {v}" for k, v in fields.items() if v]).strip()
+    if not all_text:
+        all_text = "請依一般客需條件推薦物件"
+
+    all_text_for_type = all_text + " " + " ".join(str(v) for v in fields.values())
+    is_rent = any(k in all_text_for_type for k in ["租", "月租", "租金", "出租", "承租"])
+
+    budget = fields.get("budget") or fields.get("預算") or fields.get("price") or ""
+    rent_max = fields.get("rent_max") or fields.get("租金") or ""
+    if is_rent and not rent_max:
+        rent_max = budget
+
+    buyer = {
+        "id": "free_search_" + hashlib.sha1(all_text.encode("utf-8")).hexdigest()[:16],
+        "name": "條件搜尋",
+        "phone": "",
+        "intent_type": "rent" if is_rent else "buy",
+        "budget_max": "" if is_rent else budget,
+        "rent_max": rent_max if is_rent else "",
+        "preferred_areas": fields.get("preferred_areas") or fields.get("區域") or "",
+        "property_type": fields.get("property_type") or fields.get("產品類型") or fields.get("類型") or "",
+        "room_range": fields.get("room_range") or fields.get("房數") or "",
+        "car_need": fields.get("car_need") or fields.get("車位") or "",
+        "requirement_must": fields.get("必要條件") or fields.get("must_have") or "",
+        "requirement_nice": fields.get("加分條件") or fields.get("nice_to_have") or "",
+        "note": all_text,
+        "source": "LINE條件搜尋",
+        "visibility": "public",
+    }
+    top_n = parse_int_limit(fields.get("limit") or fields.get("筆數") or 5, default=5, max_value=10) if "parse_int_limit" in globals() else 5
+    return buyer, all_text, top_n
+
+
+def process_line_free_property_search_event(event):
+    msg = (event or {}).get("message") or {}
+    if msg.get("type") != "text":
+        return {"handled": False}
+    parsed = _parse_ai_free_property_search_text(msg.get("text") or "")
+    if not parsed:
+        return {"handled": False}
+    if not _ai_free_search_feature_enabled():
+        return {"handled": True, "ok": False, "reply_text": "AI條件找物件功能目前尚未啟用，請到設定中心開啟。"}
+
+    buyer, extra_text, top_n = parsed
+    cached = _get_ai_recommend_cache(buyer, top_n=top_n, extra_text=extra_text) if "_get_ai_recommend_cache" in globals() else None
+    if cached:
+        result = {"parsed_need": cached.get("parsed_need") or {}, "recommendations": cached.get("recommendations") or [], "cache_hit": True}
+        flex = build_property_recommend_flex(buyer, result.get("recommendations") or [], parsed_need=result.get("parsed_need") or {})
+        return {"handled": True, "ok": True, "reply_text": "條件搜尋推薦物件", "reply_flex": flex, "parsed_tag": "找物件"}
+
+    target_id = _line_event_target_id(event) if "_line_event_target_id" in globals() else ""
+    if AI_RECOMMEND_BACKGROUND_ENABLED and "_start_ai_recommend_background_job" in globals():
+        started = _start_ai_recommend_background_job(buyer, top_n=top_n, extra_text=extra_text, target_id=target_id)
+        if started:
+            return {"handled": True, "ok": True, "reply_text": "已收到，正在依照你輸入的條件 AI 搜尋公司物件。完成後會自動把推薦卡片傳回來。", "parsed_tag": "找物件"}
+
+    try:
+        result = recommend_properties_for_buyer_data(buyer, top_n=top_n, extra_text=extra_text, force_refresh=False)
+        flex = build_property_recommend_flex(buyer, result.get("recommendations") or [], parsed_need=result.get("parsed_need") or {})
+        return {"handled": True, "ok": True, "reply_text": "條件搜尋推薦物件", "reply_flex": flex, "parsed_tag": "找物件"}
+    except Exception as e:
+        return {"handled": True, "ok": False, "reply_text": f"AI找物件失敗：{e}"}
+
+
+try:
+    _process_line_message_event_before_ai_free_search = process_line_message_event
+
+    def process_line_message_event(event):
+        msg = (event or {}).get("message") or {}
+        if msg.get("type") == "text":
+            text = (msg.get("text") or "").strip()
+            first = text.splitlines()[0].strip().replace(" ", "") if text else ""
+            if first.startswith(("#推薦物件", "#AI推薦物件", "#物件推薦")) and not ai_recommend_feature_enabled():
+                return {"handled": True, "ok": False, "reply_text": "AI推薦物件功能目前尚未啟用，請到設定中心開啟。"}
+            free_result = process_line_free_property_search_event(event)
+            if free_result.get("handled"):
+                return free_result
+        return _process_line_message_event_before_ai_free_search(event)
+
+    print("✅ LINE 已支援 #找物件 / #搜尋物件 條件搜尋")
+except Exception as e:
+    print("⚠️ #找物件 指令套用失敗：", e)
+
+try:
+    _detect_line_command_type_before_ai_free_search = detect_line_command_type
+
+    def detect_line_command_type(text: str, event=None) -> str:
+        first = (text or "").strip().splitlines()[0].strip().replace(" ", "") if (text or "").strip() else ""
+        first_no_hash = first[1:] if first.startswith("#") else first
+        if first_no_hash in ("找物件", "搜尋物件", "AI找物件", "查物件", "找公司物件"):
+            return "buyer"
+        return _detect_line_command_type_before_ai_free_search(text, event=event)
+
+    print("✅ LINE 指令權限已加入 #找物件")
+except Exception as e:
+    print("⚠️ #找物件 權限套用失敗：", e)
+
+try:
+    _buyer_ai_recommend_page_before_ai_toggle = app.view_functions.get("buyer_ai_recommend_page")
+
+    def buyer_ai_recommend_page_ai_toggle_wrapper(buyer_id):
+        if not ai_recommend_feature_enabled():
+            flash("AI推薦物件功能目前尚未啟用，請到設定中心開啟。", "warning")
+            return redirect(url_for("buyer_detail", buyer_id=buyer_id))
+        return _buyer_ai_recommend_page_before_ai_toggle(buyer_id)
+
+    if _buyer_ai_recommend_page_before_ai_toggle:
+        app.view_functions["buyer_ai_recommend_page"] = login_required(buyer_ai_recommend_page_ai_toggle_wrapper)
+        print("✅ 後台 AI推薦頁已加入開關控制")
+except Exception as e:
+    print("⚠️ 後台 AI推薦頁開關控制套用失敗：", e)
+
+print("✅ AI推薦 V3 已載入：風險有內容才顯示、保留介紹話術、支援 #找物件、設定中心可開關")
+# =============================================================================
+# AI推薦 V3 Patch End
+# =============================================================================
