@@ -20804,6 +20804,465 @@ print("✅ Gemini AI 物件推薦 Patch 已載入：#推薦物件 / 客需卡片
 # Gemini AI 物件推薦 + LINE #推薦物件 指令 Patch End
 # =============================================================================
 
+
+# =============================================================================
+# AI 推薦物件效能優化 Patch v20260624_FAST
+# - Firestore properties 加入短時間記憶體快取，避免每次推薦都重新讀 1000+ 筆
+# - Gemini 推薦結果寫入 ai_recommendation_cache
+# - 後台 AI推薦物件頁改成：有快取立即顯示；無快取先建立背景任務，不阻塞後台
+# - LINE #推薦物件 / 卡片推薦按鈕：有快取立即回卡片；無快取先回覆「AI推薦中」，完成後再推送卡片
+# =============================================================================
+
+AI_PROPERTY_CACHE_TTL_SECONDS = int(os.environ.get("AI_PROPERTY_CACHE_TTL_SECONDS", "600") or 600)
+AI_RECOMMEND_BACKGROUND_ENABLED = os.environ.get("AI_RECOMMEND_BACKGROUND_ENABLED", "1").strip() not in ("0", "false", "False", "no", "NO")
+AI_RECOMMEND_CACHE_COLLECTION = os.environ.get("AI_RECOMMEND_CACHE_COLLECTION", "ai_recommendation_cache")
+
+try:
+    import threading as _ai_threading
+    import traceback as _ai_traceback
+except Exception:
+    _ai_threading = None
+    _ai_traceback = None
+
+_AI_PROPERTY_MEMORY_CACHE = globals().get("_AI_PROPERTY_MEMORY_CACHE") or {}
+_AI_RUNNING_RECOMMEND_JOBS = globals().get("_AI_RUNNING_RECOMMEND_JOBS") or set()
+
+try:
+    _fetch_active_properties_before_fast_patch = _fetch_active_properties
+except Exception:
+    _fetch_active_properties_before_fast_patch = None
+
+
+def _ai_now_ts():
+    try:
+        return time.time()
+    except Exception:
+        return 0
+
+
+def _ai_property_import_token(deal_type: str):
+    """取得目前 sale/rent 物件資料版本。用 import_logs 判斷，找不到就用 properties 數量備援。"""
+    deal_type = "rent" if deal_type == "rent" else "sale"
+    try:
+        logs = []
+        for d in db.collection("property_import_logs").where("deal_type", "==", deal_type).stream():
+            item = d.to_dict() or {}
+            item["id"] = d.id
+            logs.append(item)
+        if logs:
+            logs.sort(key=lambda x: x.get("created_at") or x.get("uploaded_at") or x.get("imported_at") or "", reverse=True)
+            latest = logs[0]
+            return "|".join([
+                deal_type,
+                str(latest.get("id") or ""),
+                str(latest.get("created_at") or latest.get("uploaded_at") or latest.get("imported_at") or ""),
+                str(latest.get("inserted_count") or latest.get("total_count") or ""),
+                str(latest.get("file_name") or ""),
+            ])
+    except Exception as e:
+        print("⚠️ 讀取 property_import_logs 失敗，改用 properties 備援：", e)
+
+    try:
+        # 備援：最多只計算到 3000 筆，避免過慢。
+        count = 0
+        latest_imported_at = ""
+        for d in db.collection("properties").where("deal_type", "==", deal_type).limit(3000).stream():
+            data = d.to_dict() or {}
+            if data.get("active") is False:
+                continue
+            count += 1
+            ts = data.get("imported_at") or data.get("created_at") or ""
+            if ts > latest_imported_at:
+                latest_imported_at = ts
+        return f"{deal_type}|fallback|{count}|{latest_imported_at}"
+    except Exception:
+        return f"{deal_type}|unknown"
+
+
+def clear_ai_property_memory_cache(deal_type: str = ""):
+    """物件 CSV 匯入後可呼叫這個，讓下一次推薦重新讀 Firestore。"""
+    try:
+        if not deal_type:
+            _AI_PROPERTY_MEMORY_CACHE.clear()
+        else:
+            deal_type = "rent" if deal_type == "rent" else "sale"
+            for k in list(_AI_PROPERTY_MEMORY_CACHE.keys()):
+                if str(k).startswith(deal_type + "|"):
+                    _AI_PROPERTY_MEMORY_CACHE.pop(k, None)
+        print("✅ AI 物件記憶體快取已清除", deal_type or "all")
+    except Exception as e:
+        print("⚠️ 清除 AI 物件快取失敗：", e)
+
+
+def _fetch_active_properties(deal_type="sale", max_docs=2500):
+    """覆寫原本讀物件資料的方法：加入 TTL 快取 + 物件版本 token。"""
+    deal_type = "rent" if deal_type == "rent" else "sale"
+    token = _ai_property_import_token(deal_type)
+    key = f"{deal_type}|{max_docs}|{token}"
+    now_ts = _ai_now_ts()
+    cached = _AI_PROPERTY_MEMORY_CACHE.get(key)
+    if cached and (now_ts - cached.get("ts", 0) <= AI_PROPERTY_CACHE_TTL_SECONDS):
+        return deepcopy(cached.get("items") or [])
+
+    # 清掉同類型舊版本快取，避免記憶體一直累積。
+    for old_key in list(_AI_PROPERTY_MEMORY_CACHE.keys()):
+        if str(old_key).startswith(deal_type + "|") and old_key != key:
+            _AI_PROPERTY_MEMORY_CACHE.pop(old_key, None)
+
+    if _fetch_active_properties_before_fast_patch:
+        items = _fetch_active_properties_before_fast_patch(deal_type=deal_type, max_docs=max_docs)
+    else:
+        items = []
+        docs = db.collection("properties").where("deal_type", "==", deal_type).limit(max_docs).stream()
+        for d in docs:
+            data = d.to_dict() or {}
+            data["id"] = d.id
+            if data.get("active") is False:
+                continue
+            items.append(_property_normalized(data))
+
+    _AI_PROPERTY_MEMORY_CACHE[key] = {"ts": now_ts, "items": deepcopy(items), "token": token}
+    return items
+
+
+def _ai_buyer_cache_signature(buyer: dict, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text: str = ""):
+    buyer = buyer or {}
+    intent = (buyer.get("intent_type") or "buy").strip()
+    deal_type = "rent" if intent in ("rent", "租", "租屋", "承租") else "sale"
+    prop_token = _ai_property_import_token(deal_type)
+    important = {
+        "buyer_id": buyer.get("id") or "",
+        "updated_at": buyer.get("updated_at") or buyer.get("created_at") or "",
+        "name": buyer.get("name") or "",
+        "phone": normalize_phone(buyer.get("phone") or ""),
+        "intent_type": buyer.get("intent_type") or "",
+        "budget_max": buyer.get("budget_max") or "",
+        "rent_max": buyer.get("rent_max") or "",
+        "preferred_areas": buyer.get("preferred_areas") or "",
+        "property_type": buyer.get("property_type") or "",
+        "room_range": buyer.get("room_range") or "",
+        "car_need": buyer.get("car_need") or "",
+        "requirement_must": buyer.get("requirement_must") or "",
+        "requirement_nice": buyer.get("requirement_nice") or "",
+        "note": buyer.get("note") or "",
+        "extra_text": extra_text or "",
+        "top_n": int(top_n or AI_PROPERTY_DEFAULT_TOP_N),
+        "gemini_model": os.environ.get("GEMINI_MODEL", GEMINI_DEFAULT_MODEL),
+        "property_token": prop_token,
+        "deal_type": deal_type,
+    }
+    raw = json.dumps(important, ensure_ascii=False, sort_keys=True)
+    doc_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return doc_id, important
+
+
+def _get_ai_recommend_cache(buyer: dict, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text: str = ""):
+    doc_id, sig = _ai_buyer_cache_signature(buyer, top_n=top_n, extra_text=extra_text)
+    try:
+        doc = db.collection(AI_RECOMMEND_CACHE_COLLECTION).document(doc_id).get()
+        if doc.exists:
+            data = doc.to_dict() or {}
+            if data.get("signature") == sig and data.get("status") == "success":
+                return data
+    except Exception as e:
+        print("⚠️ 讀取 AI 推薦快取失敗：", e)
+    return None
+
+
+def _save_ai_recommend_cache(buyer: dict, result: dict, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text: str = ""):
+    doc_id, sig = _ai_buyer_cache_signature(buyer, top_n=top_n, extra_text=extra_text)
+    try:
+        db.collection(AI_RECOMMEND_CACHE_COLLECTION).document(doc_id).set({
+            "status": "success",
+            "buyer_id": buyer.get("id") or "",
+            "buyer_name": buyer.get("name") or "",
+            "buyer_phone": buyer.get("phone") or "",
+            "signature": sig,
+            "parsed_need": result.get("parsed_need") or {},
+            "recommendations": result.get("recommendations") or [],
+            "created_at": now_taipei().isoformat(),
+            "updated_at": now_taipei().isoformat(),
+        }, merge=True)
+    except Exception as e:
+        print("⚠️ 寫入 AI 推薦快取失敗：", e)
+
+
+def _mark_ai_recommend_job_status(buyer: dict, status: str, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text: str = "", error: str = ""):
+    doc_id, sig = _ai_buyer_cache_signature(buyer, top_n=top_n, extra_text=extra_text)
+    try:
+        db.collection(AI_RECOMMEND_CACHE_COLLECTION).document(doc_id).set({
+            "status": status,
+            "buyer_id": buyer.get("id") or "",
+            "buyer_name": buyer.get("name") or "",
+            "buyer_phone": buyer.get("phone") or "",
+            "signature": sig,
+            "error": error,
+            "updated_at": now_taipei().isoformat(),
+        }, merge=True)
+    except Exception as e:
+        print("⚠️ 更新 AI 推薦任務狀態失敗：", e)
+
+
+try:
+    _recommend_properties_for_buyer_data_before_fast_patch = recommend_properties_for_buyer_data
+except Exception:
+    _recommend_properties_for_buyer_data_before_fast_patch = None
+
+
+def recommend_properties_for_buyer_data(buyer: dict, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text: str = "", force_refresh: bool = False):
+    """覆寫推薦主流程：先看 Firestore 快取；需要重算才跑 Gemini。"""
+    buyer = buyer or {}
+    top_n = max(1, min(10, int(top_n or AI_PROPERTY_DEFAULT_TOP_N)))
+    if not force_refresh:
+        cached = _get_ai_recommend_cache(buyer, top_n=top_n, extra_text=extra_text)
+        if cached:
+            return {
+                "parsed_need": cached.get("parsed_need") or {},
+                "recommendations": cached.get("recommendations") or [],
+                "cache_hit": True,
+                "cached_at": cached.get("created_at") or "",
+            }
+
+    parsed = _ai_try_parse_buyer_need_with_gemini(buyer, extra_text=extra_text)
+    candidates = _hard_filter_properties_for_buyer(parsed, top_limit=AI_PROPERTY_MAX_CANDIDATES)
+    ranked = _rank_properties_with_gemini(parsed, candidates, top_n=top_n)
+    result = {"parsed_need": parsed, "recommendations": ranked, "cache_hit": False}
+    _save_ai_recommend_cache(buyer, result, top_n=top_n, extra_text=extra_text)
+    return result
+
+
+def _line_event_target_id(event):
+    source = (event or {}).get("source") or {}
+    return source.get("groupId") or source.get("roomId") or source.get("userId") or ""
+
+
+def _push_ai_recommendation_to_line(target_id: str, buyer: dict, result: dict):
+    if not target_id:
+        return False, "missing target_id"
+    try:
+        flex = build_property_recommend_flex(buyer, result.get("recommendations") or [], parsed_need=result.get("parsed_need") or {})
+        messages = [{"type": "flex", "altText": f"推薦物件：{buyer.get('name') or ''}", "contents": flex}]
+        if "line_push_messages" in globals():
+            return line_push_messages(target_id, messages)
+        if "push_line_flex" in globals():
+            return push_line_flex(target_id, f"推薦物件：{buyer.get('name') or ''}", flex)
+        if "push_line_text" in globals():
+            return push_line_text(target_id, f"推薦物件完成：{buyer.get('name') or ''}")
+    except Exception as e:
+        print("⚠️ 推送 AI 推薦卡片失敗：", e)
+        return False, str(e)
+    return False, "no push function"
+
+
+def _start_ai_recommend_background_job(buyer: dict, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text: str = "", target_id: str = ""):
+    """建立背景推薦任務。完成後如果有 target_id，會把卡片推回 LINE。"""
+    if not AI_RECOMMEND_BACKGROUND_ENABLED or not _ai_threading:
+        return False
+    buyer = dict(buyer or {})
+    top_n = max(1, min(10, int(top_n or AI_PROPERTY_DEFAULT_TOP_N)))
+    doc_id, _sig = _ai_buyer_cache_signature(buyer, top_n=top_n, extra_text=extra_text)
+    if doc_id in _AI_RUNNING_RECOMMEND_JOBS:
+        return True
+
+    def _runner():
+        _AI_RUNNING_RECOMMEND_JOBS.add(doc_id)
+        try:
+            _mark_ai_recommend_job_status(buyer, "running", top_n=top_n, extra_text=extra_text)
+            result = recommend_properties_for_buyer_data(buyer, top_n=top_n, extra_text=extra_text, force_refresh=True)
+            if target_id:
+                _push_ai_recommendation_to_line(target_id, buyer, result)
+        except Exception as e:
+            print("❌ AI推薦背景任務失敗：", e)
+            if _ai_traceback:
+                print(_ai_traceback.format_exc())
+            _mark_ai_recommend_job_status(buyer, "failed", top_n=top_n, extra_text=extra_text, error=str(e))
+            if target_id and "push_line_text" in globals():
+                try:
+                    push_line_text(target_id, f"AI推薦物件失敗：{e}")
+                except Exception:
+                    pass
+        finally:
+            _AI_RUNNING_RECOMMEND_JOBS.discard(doc_id)
+
+    t = _ai_threading.Thread(target=_runner, daemon=True)
+    t.start()
+    return True
+
+
+try:
+    _make_recommendation_result_for_buyer_doc_before_fast_patch = _make_recommendation_result_for_buyer_doc
+except Exception:
+    _make_recommendation_result_for_buyer_doc_before_fast_patch = None
+
+
+def _make_recommendation_result_for_buyer_doc(buyer_doc, event=None, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text=""):
+    if not buyer_doc or not getattr(buyer_doc, "exists", False):
+        return {"handled": True, "ok": False, "reply_text": "找不到這筆客需，無法推薦物件。"}
+    buyer = buyer_doc.to_dict() or {}
+    buyer["id"] = buyer_doc.id
+    top_n = max(1, min(10, int(top_n or AI_PROPERTY_DEFAULT_TOP_N)))
+
+    cached = _get_ai_recommend_cache(buyer, top_n=top_n, extra_text=extra_text)
+    if cached:
+        result = {"parsed_need": cached.get("parsed_need") or {}, "recommendations": cached.get("recommendations") or [], "cache_hit": True}
+        flex = build_property_recommend_flex(buyer, result.get("recommendations") or [], parsed_need=result.get("parsed_need") or {})
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": f"推薦物件：{buyer.get('name','')}",
+            "reply_flex": flex,
+            "target_type": "buyer",
+            "target_id": buyer_doc.id,
+            "customer_name": buyer.get("name", ""),
+            "phone": buyer.get("phone", ""),
+            "parsed_tag": "推薦物件",
+        }
+
+    target_id = _line_event_target_id(event) if event else ""
+    if event and AI_RECOMMEND_BACKGROUND_ENABLED:
+        started = _start_ai_recommend_background_job(buyer, top_n=top_n, extra_text=extra_text, target_id=target_id)
+        if started:
+            return {
+                "handled": True,
+                "ok": True,
+                "reply_text": f"已收到，正在幫 {buyer.get('name','這位客戶')} AI推薦物件。完成後會自動把物件卡片傳回來。",
+                "target_type": "buyer",
+                "target_id": buyer_doc.id,
+                "customer_name": buyer.get("name", ""),
+                "phone": buyer.get("phone", ""),
+                "parsed_tag": "推薦物件",
+            }
+
+    # 如果背景任務不可用，就保留同步模式。
+    try:
+        result = recommend_properties_for_buyer_data(buyer, top_n=top_n, extra_text=extra_text, force_refresh=False)
+        flex = build_property_recommend_flex(buyer, result.get("recommendations") or [], parsed_need=result.get("parsed_need") or {})
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": f"推薦物件：{buyer.get('name','')}",
+            "reply_flex": flex,
+            "target_type": "buyer",
+            "target_id": buyer_doc.id,
+            "customer_name": buyer.get("name", ""),
+            "phone": buyer.get("phone", ""),
+            "parsed_tag": "推薦物件",
+        }
+    except Exception as e:
+        return {"handled": True, "ok": False, "reply_text": f"AI推薦物件失敗：{e}"}
+
+
+def _render_ai_recommend_html(buyer, parsed_need=None, recommendations=None, running=False, cache_hit=False, error=""):
+    html = """
+    {% extends "base.html" %}
+    {% block content %}
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <div>
+        <h3 class="mb-1">AI推薦物件</h3>
+        <div class="text-muted small">客戶：{{ buyer.name or '-' }}｜電話：{{ buyer.phone or '-' }}</div>
+      </div>
+      <div class="d-flex gap-2">
+        <a class="btn btn-outline-primary" href="{{ url_for('buyer_ai_recommend_page', buyer_id=buyer.id) }}?refresh=1">重新AI推薦</a>
+        <a class="btn btn-secondary" href="{{ url_for('buyer_detail', buyer_id=buyer.id) }}">回客需詳細</a>
+      </div>
+    </div>
+
+    {% if running %}
+      <meta http-equiv="refresh" content="5">
+      <div class="card border-warning mb-3">
+        <div class="card-body">
+          <h5 class="mb-2">AI推薦中...</h5>
+          <div class="text-muted">系統已在背景處理，這個頁面會每 5 秒自動更新。你也可以先回後台做其他事情。</div>
+        </div>
+      </div>
+    {% endif %}
+
+    {% if error %}
+      <div class="alert alert-danger">{{ error }}</div>
+    {% endif %}
+
+    {% if cache_hit %}
+      <div class="alert alert-success small">已使用上次推薦快取，所以開啟速度會比較快。若客需或物件資料有變動，可按「重新AI推薦」。</div>
+    {% endif %}
+
+    {% if parsed_need %}
+      <div class="card mb-3"><div class="card-header fw-bold">AI解析客需</div><div class="card-body"><pre class="mb-0" style="white-space:pre-wrap;">{{ parsed_need | tojson(indent=2, ensure_ascii=False) }}</pre></div></div>
+    {% endif %}
+
+    <div class="card"><div class="card-header fw-bold">推薦物件</div><div class="card-body">
+      {% if recommendations %}
+        {% for item in recommendations %}
+          <div class="border rounded p-3 mb-3 bg-white">
+            <div class="d-flex justify-content-between align-items-start gap-3">
+              <div><h5 class="mb-1">{{ loop.index }}. {{ item.title }}</h5><div class="text-muted small">{{ item.area or '-' }}｜{{ item.property_type or '-' }}｜{% if item.price_wan %}{{ item.price_wan }}萬{% elif item.rent_price %}租金 {{ item.rent_price }}元{% else %}價格未填{% endif %}{% if item.age %}｜屋齡 {{ item.age }}年{% endif %}</div></div>
+              <span class="badge bg-success fs-6">{{ item.ai_score or item.rule_score }} 分</span>
+            </div>
+            <div class="mt-2"><strong>適合度：</strong>{{ item.fit_level or '-' }}</div>
+            <div class="mt-2"><strong>推薦原因：</strong>{{ item.reason or '-' }}</div>
+            <div class="mt-2 text-danger"><strong>注意：</strong>{{ item.risk or '-' }}</div>
+            <div class="mt-2"><strong>話術：</strong>{{ item.talking_point or '-' }}</div>
+            {% if item.url %}<a class="btn btn-sm btn-outline-primary mt-2" target="_blank" href="{{ item.url }}">查看物件</a>{% endif %}
+          </div>
+        {% endfor %}
+      {% elif not running %}
+        <div class="text-muted">目前沒有找到符合條件的物件。</div>
+      {% endif %}
+    </div></div>
+    {% endblock %}
+    """
+    return render_template_string(html, buyer=buyer, parsed_need=parsed_need or {}, recommendations=recommendations or [], running=running, cache_hit=cache_hit, error=error)
+
+
+def _buyer_ai_recommend_page_fast(buyer_id):
+    snap = db.collection("buyers").document(buyer_id).get()
+    if not snap.exists:
+        flash("找不到這筆客需", "danger")
+        return redirect(url_for("buyers"))
+    buyer = snap.to_dict() or {}
+    buyer["id"] = snap.id
+    try:
+        if "backend_can_view_personal_record" in globals() and not backend_can_view_personal_record(buyer):
+            flash("你沒有權限查看這筆個人客需", "danger")
+            return redirect(url_for("buyers"))
+    except Exception:
+        pass
+
+    force_refresh = (request.args.get("refresh") or "").strip() in ("1", "true", "yes")
+    top_n = parse_int_limit(request.args.get("top_n") or 10, default=10, max_value=10)
+
+    if not force_refresh:
+        cached = _get_ai_recommend_cache(buyer, top_n=top_n, extra_text="")
+        if cached:
+            return _render_ai_recommend_html(
+                buyer,
+                parsed_need=cached.get("parsed_need") or {},
+                recommendations=cached.get("recommendations") or [],
+                cache_hit=True,
+            )
+
+    # 背景處理，不阻塞後台。
+    if AI_RECOMMEND_BACKGROUND_ENABLED:
+        _start_ai_recommend_background_job(buyer, top_n=top_n, extra_text="", target_id="")
+        return _render_ai_recommend_html(buyer, running=True)
+
+    # 背景關閉時才同步跑。
+    try:
+        result = recommend_properties_for_buyer_data(buyer, top_n=top_n, force_refresh=force_refresh)
+        return _render_ai_recommend_html(buyer, parsed_need=result.get("parsed_need") or {}, recommendations=result.get("recommendations") or [], cache_hit=bool(result.get("cache_hit")))
+    except Exception as e:
+        return _render_ai_recommend_html(buyer, error=f"AI推薦失敗：{e}")
+
+try:
+    app.view_functions["buyer_ai_recommend_page"] = _buyer_ai_recommend_page_fast
+    print("✅ 後台 AI推薦物件頁已改成快取 + 背景任務，不再長時間卡住後台")
+except Exception as e:
+    print("⚠️ 覆寫後台 AI推薦頁失敗：", e)
+
+print("✅ AI 推薦效能優化已啟用：properties快取 / 推薦快取 / 背景任務")
+# =============================================================================
+# AI 推薦物件效能優化 Patch End
+# =============================================================================
+
 if __name__ == "__main__":
     print("✅ FULL_READY_20260621 已載入")
     print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
