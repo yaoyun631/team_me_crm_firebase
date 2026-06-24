@@ -20047,6 +20047,30 @@ def _ai_parse_age_max_from_text(text):
     return None
 
 
+def _ai_parse_ping_min_from_text(text, keyword_group=None):
+    """
+    從口語條件抓坪數下限。
+    例如：主建物坪30坪以上、主建30坪以上、室內25坪以上、使用坪數20坪以上、建物40坪以上。
+    """
+    text = str(text or "")
+    if not text.strip():
+        return None
+    keyword_group = keyword_group or ["坪"]
+    # 關鍵字在數字前：主建物坪30坪以上 / 室內 25 坪以上
+    for kw in keyword_group:
+        pattern = rf"{re.escape(kw)}[^0-9]{{0,8}}(\d+(?:\.\d+)?)\s*坪?\s*(?:以上|起|up|UP|至少|不低於|大於|超過)?"
+        m = re.search(pattern, text)
+        if m:
+            return float(m.group(1))
+    # 數字在關鍵字前：30坪以上主建物 / 25坪以上室內
+    for kw in keyword_group:
+        pattern = rf"(\d+(?:\.\d+)?)\s*坪\s*(?:以上|起|至少|不低於|大於|超過)?[^，,。；;\n]{{0,12}}{re.escape(kw)}"
+        m = re.search(pattern, text)
+        if m:
+            return float(m.group(1))
+    return None
+
+
 def _ai_parse_budget_max_buy_wan(value):
     text = str(value or "")
     num = _ai_safe_float(text, None)
@@ -20086,6 +20110,8 @@ def _ai_buyer_need_to_parsed(buyer: dict, extra_text: str = ""):
     property_types = _ai_split_keywords(buyer.get("property_type") or "")
     room_min = _ai_parse_room_min(buyer.get("room_range") or "")
     age_max = _ai_parse_age_max_from_text(raw_all)
+    main_building_area_min = _ai_parse_ping_min_from_text(raw_all, ["主建物坪", "主建物", "主建", "室內坪", "室內", "使用坪數", "使用坪"])
+    building_area_min = _ai_parse_ping_min_from_text(raw_all, ["建物坪", "建物面積", "建坪", "權狀坪", "登記坪數", "權狀面積"])
     need_parking = None
     if any(k in raw_all for k in ["車位", "停車", "平車", "機械", "雙車", "車庫"]):
         need_parking = True
@@ -20108,6 +20134,8 @@ def _ai_buyer_need_to_parsed(buyer: dict, extra_text: str = ""):
         "property_types": property_types,
         "room_min": room_min,
         "age_max": age_max,
+        "main_building_area_min": main_building_area_min,
+        "building_area_min": building_area_min,
         "need_parking": need_parking,
         "must_have": _ai_split_keywords(buyer.get("requirement_must") or ""),
         "nice_to_have": _ai_split_keywords(buyer.get("requirement_nice") or ""),
@@ -20150,6 +20178,8 @@ def _ai_try_parse_buyer_need_with_gemini(buyer: dict, extra_text: str = ""):
   "property_types": ["透天", "別墅", "電梯大樓", "華廈", "土地", "農舍", "店面", "廠房", "公寓"],
   "room_min": 數字或 null,
   "age_max": 數字或 null,
+  "main_building_area_min": 主建物坪數下限，數字或 null,
+  "building_area_min": 建物/權狀坪數下限，數字或 null,
   "need_parking": true/false/null,
   "must_have": ["必要條件"],
   "nice_to_have": ["加分條件"],
@@ -20198,8 +20228,22 @@ def _property_normalized(prop: dict):
     halls = _ai_safe_float(_property_field(prop, "halls", "rakuya_廳", "廳"), None)
     baths = _ai_safe_float(_property_field(prop, "baths", "rakuya_衛", "衛"), None)
     age = _ai_safe_float(_property_field(prop, "age", "rakuya_屋齡", "屋齡"), None)
+    main_building_area = _ai_safe_float(_property_field(
+        prop,
+        "main_building_area", "rakuya_主建物", "raw_主建物坪", "主建物", "主建物坪",
+        "rakuya_使用坪數", "使用坪數", "室內坪"
+    ), None)
+    building_area = _ai_safe_float(_property_field(
+        prop,
+        "building_area", "rakuya_建物登記", "rakuya_權狀面積", "raw_建物面積",
+        "raw_登記坪數", "建物面積", "權狀面積", "登記坪數"
+    ), None)
     parking = _ai_norm(_property_field(prop, "parking", "車位", "rakuya_車位"))
-    full_text = " ".join([title, area, address, ptype, desc, parking, _ai_norm(prop.get("searchable_text"))])
+    full_text = " ".join([
+        title, area, address, ptype, desc, parking, _ai_norm(prop.get("searchable_text")),
+        f"主建物{main_building_area}坪" if main_building_area is not None else "",
+        f"建物{building_area}坪" if building_area is not None else ""
+    ])
     return {
         "id": prop.get("id") or "",
         "deal_type": prop.get("deal_type") or "sale",
@@ -20215,6 +20259,8 @@ def _property_normalized(prop: dict):
         "halls": halls,
         "baths": baths,
         "age": age,
+        "main_building_area": main_building_area,
+        "building_area": building_area,
         "parking": parking,
         "searchable_text": full_text,
         "raw": prop,
@@ -20250,6 +20296,8 @@ def _hard_filter_properties_for_buyer(parsed_need: dict, top_limit=AI_PROPERTY_M
     rent_max = _ai_safe_float(parsed_need.get("rent_max"), None)
     room_min = _ai_safe_float(parsed_need.get("room_min"), None)
     age_max = _ai_safe_float(parsed_need.get("age_max"), None)
+    main_building_area_min = _ai_safe_float(parsed_need.get("main_building_area_min"), None)
+    building_area_min = _ai_safe_float(parsed_need.get("building_area_min"), None)
     need_parking = parsed_need.get("need_parking")
 
     scored = []
@@ -20302,6 +20350,21 @@ def _hard_filter_properties_for_buyer(parsed_need: dict, top_limit=AI_PROPERTY_M
                 reasons.append("屋齡符合")
             elif p.get("age") is not None:
                 score -= 8
+
+        # 坪數條件是硬條件：使用者指定主建物/室內/使用坪數時，沒有達標就排除。
+        if main_building_area_min:
+            if p.get("main_building_area") is not None and p["main_building_area"] >= main_building_area_min:
+                score += 18
+                reasons.append(f"主建物坪數符合 {main_building_area_min:g} 坪以上")
+            else:
+                continue
+
+        if building_area_min:
+            if p.get("building_area") is not None and p["building_area"] >= building_area_min:
+                score += 12
+                reasons.append(f"建物坪數符合 {building_area_min:g} 坪以上")
+            else:
+                continue
 
         if need_parking is True:
             if any(k in full_text for k in ["車位", "平車", "雙車", "停車", "車庫", "前院"]):
@@ -20358,6 +20421,8 @@ def _rank_properties_with_gemini(parsed_need: dict, candidates: list, top_n=AI_P
             "rent_price": c.get("rent_price"),
             "rooms": c.get("rooms"),
             "age": c.get("age"),
+            "main_building_area": c.get("main_building_area"),
+            "building_area": c.get("building_area"),
             "parking": c.get("parking"),
             "description": _ai_compact_text(c.get("description"), 260),
             "url": c.get("url"),
@@ -20463,6 +20528,7 @@ def build_property_recommend_bubble(item, idx=1):
         flex_info_row("類型", item.get("property_type") or "-"),
         flex_info_row("格局", f"{_ai_safe_int(item.get('rooms'), '-') }房" if item.get("rooms") is not None else "-"),
         flex_info_row("屋齡", f"{item.get('age')}年" if item.get("age") is not None else "-"),
+        flex_info_row("主建物", f"{item.get('main_building_area')}坪" if item.get("main_building_area") is not None else "-"),
     ]
     body = [
         {"type": "text", "text": f"推薦物件 #{idx}", "size": "xs", "color": "#C9874A", "weight": "bold"},
@@ -21431,8 +21497,8 @@ def _parse_ai_free_property_search_text(text: str):
         "intent_type": "rent" if is_rent else "buy",
         "budget_max": "" if is_rent else budget,
         "rent_max": rent_max if is_rent else "",
-        "preferred_areas": fields.get("preferred_areas") or fields.get("區域") or "",
-        "property_type": fields.get("property_type") or fields.get("產品類型") or fields.get("類型") or "",
+        "preferred_areas": fields.get("preferred_areas") or fields.get("區域") or _ai_extract_areas_from_text(all_text),
+        "property_type": fields.get("property_type") or fields.get("產品類型") or fields.get("類型") or _ai_extract_property_types_from_text(all_text),
         "room_range": fields.get("room_range") or fields.get("房數") or "",
         "car_need": fields.get("car_need") or fields.get("車位") or "",
         "requirement_must": fields.get("必要條件") or fields.get("must_have") or "",
@@ -21657,8 +21723,29 @@ def _detect_property_search_deal_type(text: str, fields: dict = None):
     return ""
 
 
+def _ai_extract_areas_from_text(text: str):
+    text = str(text or "")
+    area_words = ["清水", "清水區", "梧棲", "梧棲區", "沙鹿", "沙鹿區", "龍井", "龍井區", "大甲", "大甲區", "大安", "大安區", "外埔", "外埔區", "后里", "后里區", "神岡", "神岡區", "西屯", "西屯區", "北屯", "北屯區", "南屯", "南屯區"]
+    found = []
+    for a in area_words:
+        if a in text:
+            name = a if a.endswith("區") else a + "區"
+            found.append(name)
+    return " ".join(dedupe_keep_order(found))
+
+
+def _ai_extract_property_types_from_text(text: str):
+    text = str(text or "")
+    types = ["透天", "別墅", "大樓", "電梯大樓", "華廈", "公寓", "套房", "店面", "土地", "農地", "農舍", "廠房", "倉庫"]
+    found = []
+    for t in types:
+        if t in text:
+            found.append(t)
+    return " ".join(dedupe_keep_order(found))
+
+
 def _parse_ai_free_property_search_text(text: str):
-    """解析 #找物件；V4 起必須能判斷買賣或租賃。"""
+    """解析 #找物件；V5 支援主建物坪/室內坪/使用坪數硬篩。"""
     text = (text or "").strip()
     if not text:
         return None
@@ -21710,8 +21797,21 @@ def _parse_ai_free_property_search_text(text: str):
 
     budget = fields.get("budget") or fields.get("price") or fields.get("預算") or ""
     rent_max = fields.get("rent_max") or fields.get("租金") or ""
+    # 支援口語：租 2.5萬 / 25000內 / 月租18000內
+    if not budget and deal_type == "buy":
+        m = re.search(r"(\d+(?:\.\d+)?)\s*萬\s*(?:內|以下|以內)?", all_text)
+        if m:
+            budget = m.group(1)
     if deal_type == "rent" and not rent_max:
-        rent_max = budget
+        m = re.search(r"(?:租金|月租|租)?\s*(\d+(?:\.\d+)?)\s*萬\s*(?:內|以下|以內)?", all_text)
+        if m:
+            rent_max = str(float(m.group(1)) * 10000)
+        else:
+            m = re.search(r"(?:租金|月租|租)?\s*(\d{4,6})\s*(?:元|內|以下|以內)?", all_text)
+            if m:
+                rent_max = m.group(1)
+        if not rent_max:
+            rent_max = budget
 
     buyer = {
         "id": f"free_search_{deal_type}_" + hashlib.sha1((deal_type + "\n" + all_text).encode("utf-8")).hexdigest()[:16],
