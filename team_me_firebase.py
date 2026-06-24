@@ -21357,12 +21357,6 @@ print("✅ AI 推薦效能優化已啟用：properties快取 / 推薦快取 / �
 # AI 推薦物件效能優化 Patch End
 # =============================================================================
 
-if __name__ == "__main__":
-    print("✅ FULL_READY_20260621 已載入")
-    print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
-    print("✅ 可用 /debug/routes 檢查目前所有 route")
-    app.run(debug=True)
-
 
 # =============================================================================
 # AI推薦 V3：風險顯示邏輯 / 條件找物件 / 設定中心開關 Patch
@@ -21945,3 +21939,481 @@ print("✅ AI推薦 V4 已載入：AI推薦依群組/個人權限控管，#找�
 # =============================================================================
 # AI推薦 V4 End
 # =============================================================================
+
+# =============================================================================
+# 委託：屋主回報管理 Patch v20260624_OWNER_REPORT
+# - 委託詳細頁新增屋主回報管理
+# - 可手動新增回報紀錄
+# - Gemini 依委託資料、追蹤紀錄、備註、歷史回報生成屋主回報草稿
+# - 下一次回報日自動建立待辦事項
+# - 委託列表顯示上次回報 / 需回報狀態
+# =============================================================================
+
+OWNER_REPORT_COLLECTION = os.environ.get("OWNER_REPORT_COLLECTION", "seller_owner_reports")
+OWNER_REPORT_DRAFT_COLLECTION = os.environ.get("OWNER_REPORT_DRAFT_COLLECTION", "seller_owner_report_drafts")
+
+OWNER_REPORT_TYPE_OPTIONS = [
+    ("general", "一般進度回報"),
+    ("price_negotiation", "議價回報"),
+    ("market_feedback", "市場反應說明"),
+    ("showing_feedback", "帶看後回報"),
+    ("low_inquiry", "詢問量不足回報"),
+    ("contract_expiring", "委託到期前維繫"),
+]
+
+
+def _owner_report_today():
+    return now_taipei().strftime("%Y-%m-%d")
+
+
+def _owner_report_label(value):
+    mapping = dict(OWNER_REPORT_TYPE_OPTIONS)
+    return mapping.get(value or "", value or "一般回報")
+
+
+def _owner_report_safe_int(value, default=0):
+    try:
+        text = str(value or "").replace(",", "")
+        m = re.search(r"\d+", text)
+        return int(m.group(0)) if m else default
+    except Exception:
+        return default
+
+
+def _owner_report_doc_to_dict(doc):
+    data = doc.to_dict() or {}
+    data["id"] = doc.id
+    data["report_type_label"] = _owner_report_label(data.get("report_type"))
+    return data
+
+
+def _get_seller_or_redirect(seller_id):
+    snap = db.collection("sellers").document(seller_id).get()
+    if not snap.exists:
+        return None, redirect(url_for("sellers"))
+    seller = snap.to_dict() or {}
+    seller["id"] = snap.id
+    try:
+        if "backend_can_view_personal_record" in globals() and not backend_can_view_personal_record(seller):
+            flash("你沒有權限查看這筆個人委託", "danger")
+            return None, redirect(url_for("sellers"))
+    except Exception:
+        pass
+    return seller, None
+
+
+def fetch_seller_owner_reports(seller_id, limit=50):
+    reports = []
+    try:
+        docs = db.collection(OWNER_REPORT_COLLECTION).where("seller_id", "==", seller_id).stream()
+        reports = [_owner_report_doc_to_dict(d) for d in docs]
+    except Exception as e:
+        print("⚠️ 讀取屋主回報失敗：", e)
+        reports = []
+    reports.sort(key=lambda x: (x.get("report_date") or x.get("created_at") or ""), reverse=True)
+    return reports[:limit]
+
+
+def attach_owner_report_info_to_sellers(sellers_list):
+    reports_by_seller = {}
+    try:
+        for d in db.collection(OWNER_REPORT_COLLECTION).stream():
+            item = _owner_report_doc_to_dict(d)
+            sid = item.get("seller_id")
+            if sid:
+                reports_by_seller.setdefault(sid, []).append(item)
+    except Exception as e:
+        print("⚠️ 委託列表讀取屋主回報狀態失敗：", e)
+
+    today = _owner_report_today()
+    for s in sellers_list:
+        sid = s.get("id")
+        reports = reports_by_seller.get(sid, [])
+        reports.sort(key=lambda x: (x.get("report_date") or x.get("created_at") or ""), reverse=True)
+        last = reports[0] if reports else None
+        s["last_owner_report"] = last
+        if not last:
+            s["owner_report_status"] = "尚未回報"
+            s["owner_report_status_class"] = "secondary"
+            s["owner_report_due_text"] = "尚未設定"
+            continue
+        next_date = last.get("next_report_date") or ""
+        s["owner_report_due_text"] = next_date or "未設定"
+        if next_date and next_date <= today:
+            s["owner_report_status"] = "需回報"
+            s["owner_report_status_class"] = "danger"
+        elif (last.get("owner_response") or "").find("待回覆") >= 0:
+            s["owner_report_status"] = "屋主待回覆"
+            s["owner_report_status_class"] = "warning"
+        else:
+            s["owner_report_status"] = "已回報"
+            s["owner_report_status_class"] = "success"
+    return sellers_list
+
+
+def _owner_report_format_seller_basic(seller):
+    return "\n".join([
+        f"屋主/委託人：{seller.get('name','')}",
+        f"電話：{seller.get('phone','')}",
+        f"物件地址：{seller.get('address','')}",
+        f"產品類型：{seller.get('property_type','')}",
+        f"目前狀態：{seller.get('stage','')}",
+        f"開價/期望價：{seller.get('expected_price','')}",
+        f"底價：{seller.get('min_price','')}",
+        f"委託到期日：{seller.get('contract_end_date','')}",
+        f"出售/出租原因：{seller.get('reason','')}",
+        f"內部備註：{seller.get('note','')}",
+    ]).strip()
+
+
+def _fetch_seller_followups_for_report(seller_id, limit=20):
+    rows = []
+    try:
+        for d in db.collection("seller_followups").where("seller_id", "==", seller_id).stream():
+            item = d.to_dict() or {}
+            item["id"] = d.id
+            rows.append(item)
+    except Exception:
+        rows = []
+    rows.sort(key=lambda x: (x.get("contact_time") or x.get("created_at") or ""), reverse=True)
+    return rows[:limit]
+
+
+def _owner_report_gemini_json(prompt):
+    if "_gemini_generate_json" in globals():
+        return _gemini_generate_json(prompt)
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("尚未設定 GEMINI_API_KEY")
+    from google import genai
+    client = genai.Client(api_key=api_key)
+    res = client.models.generate_content(
+        model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        contents=prompt,
+    )
+    text = getattr(res, "text", "") or ""
+    return json.loads(re.search(r"\{.*\}", text, re.S).group(0))
+
+
+def generate_owner_report_draft_with_ai(seller, report_type="general", period_start="", period_end="", extra_note=""):
+    followups = _fetch_seller_followups_for_report(seller.get("id"), limit=25)
+    reports = fetch_seller_owner_reports(seller.get("id"), limit=5)
+    followup_text = []
+    for f in followups:
+        followup_text.append(
+            f"- {f.get('contact_time') or f.get('created_at') or ''}｜{f.get('channel') or ''}｜內容：{f.get('content') or ''}｜下一步：{f.get('next_action') or ''}"
+        )
+    report_text = []
+    for r in reports:
+        report_text.append(
+            f"- {r.get('report_date') or ''}｜{r.get('report_type_label') or ''}｜內容：{r.get('report_message') or r.get('progress_summary') or ''}｜屋主回應：{r.get('owner_response') or ''}"
+        )
+
+    prompt = f"""
+你是台中海線房仲的屋主回報助理。請根據委託資料、追蹤紀錄、歷史屋主回報，生成一份可以傳給屋主的回報草稿。
+
+請注意：
+1. 語氣要專業、口語、讓屋主覺得有在積極處理。
+2. 不要編造沒有資料支持的詢問量或帶看量。
+3. 如果資料不足，請用「目前紀錄顯示」或「目前回報重點」表達，不要硬說很多詢問。
+4. 如果回報目的是議價，要用客戶反應與市場回饋委婉建議，不要太強硬。
+5. 請只輸出 JSON，不要輸出其他文字。
+
+回報目的：{_owner_report_label(report_type)}
+回報區間：{period_start or '-'} ～ {period_end or _owner_report_today()}
+補充需求：{extra_note or '-'}
+
+委託資料：
+{_owner_report_format_seller_basic(seller)}
+
+近期追蹤紀錄：
+{chr(10).join(followup_text) if followup_text else '目前沒有追蹤紀錄'}
+
+歷史屋主回報：
+{chr(10).join(report_text) if report_text else '目前沒有歷史屋主回報'}
+
+請輸出格式：
+{{
+  "progress_summary": "本次進度摘要",
+  "customer_feedback": "客戶反應整理",
+  "owner_response": "如果沒有屋主回應就留空字串",
+  "next_action": "下一步建議",
+  "ai_suggestion": "給房仲看的策略建議，例如是否議價、是否補曝光、是否確認屋主想法",
+  "report_message": "可以直接傳給屋主的完整回報文字，繁體中文，口語但專業"
+}}
+""".strip()
+
+    try:
+        data = _owner_report_gemini_json(prompt) or {}
+    except Exception as e:
+        print("⚠️ Gemini 生成屋主回報失敗，改用規則草稿：", e)
+        data = {}
+
+    if not data:
+        recent = followups[0] if followups else {}
+        latest_content = recent.get("content") or seller.get("note") or "目前持續曝光與追蹤物件進度。"
+        data = {
+            "progress_summary": latest_content,
+            "customer_feedback": "目前客戶反應仍需持續彙整。",
+            "owner_response": "",
+            "next_action": "持續追蹤詢問與帶看狀況，並定期回報屋主。",
+            "ai_suggestion": "資料不足，建議先補充詢問量、帶看量與客戶反應，再進一步判斷是否需要議價。",
+            "report_message": f"您好，跟您回報一下目前物件的進度。\n\n目前我們這邊有持續追蹤與整理物件狀況，近期紀錄重點為：{latest_content}\n\n接下來我會持續觀察詢問與帶看反應，有新的客戶回饋或進一步進度，我會再跟您回報。",
+        }
+    for key in ("progress_summary", "customer_feedback", "owner_response", "next_action", "ai_suggestion", "report_message"):
+        data[key] = str(data.get(key) or "").strip()
+    return data
+
+
+def create_owner_report_todo(seller, report, report_id=""):
+    next_date = (report.get("next_report_date") or "").strip()
+    if not next_date:
+        return ""
+    try:
+        collection_name = LINE_TODO_COLLECTION if "LINE_TODO_COLLECTION" in globals() else "line_todos"
+    except Exception:
+        collection_name = "line_todos"
+    visibility = report.get("visibility") or seller.get("visibility") or "public"
+    owner_line_user_id = report.get("owner_line_user_id") or seller.get("owner_line_user_id") or ""
+    owner_line_name = report.get("owner_line_name") or seller.get("owner_line_name") or ""
+    data = {
+        "title": f"屋主回報：{seller.get('name') or '委託'}",
+        "content": f"物件：{seller.get('address') or '-'}\n下一步：{report.get('next_action') or '-'}",
+        "note": f"關聯委託：{seller.get('name') or ''}｜{seller.get('phone') or ''}",
+        "todo_date": next_date,
+        "status": "open",
+        "visibility": visibility if visibility in ("public", "personal") else "public",
+        "owner_line_user_id": owner_line_user_id if visibility == "personal" else "",
+        "owner_line_name": owner_line_name if visibility == "personal" else "",
+        "line_target_id": owner_line_user_id if visibility == "personal" else "",
+        "line_target_type": "user" if visibility == "personal" else "backend_shared",
+        "source": "屋主回報管理",
+        "related_type": "seller_owner_report",
+        "seller_id": seller.get("id"),
+        "seller_name": seller.get("name"),
+        "seller_phone": seller.get("phone"),
+        "owner_report_id": report_id,
+        "created_at": now_taipei().isoformat(),
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+    }
+    ref = db.collection(collection_name).document()
+    ref.set(data)
+    return ref.id
+
+
+def _owner_report_form_payload(seller, form):
+    report_date = (form.get("report_date") or _owner_report_today()).strip()
+    report = {
+        "seller_id": seller.get("id"),
+        "seller_name": seller.get("name") or "",
+        "seller_phone": seller.get("phone") or "",
+        "seller_address": seller.get("address") or "",
+        "report_date": report_date,
+        "report_period_start": (form.get("report_period_start") or "").strip(),
+        "report_period_end": (form.get("report_period_end") or "").strip(),
+        "report_type": (form.get("report_type") or "general").strip(),
+        "inquiry_count": _owner_report_safe_int(form.get("inquiry_count"), 0),
+        "showing_count": _owner_report_safe_int(form.get("showing_count"), 0),
+        "customer_feedback": (form.get("customer_feedback") or "").strip(),
+        "progress_summary": (form.get("progress_summary") or "").strip(),
+        "owner_response": (form.get("owner_response") or "").strip(),
+        "next_action": (form.get("next_action") or "").strip(),
+        "next_report_date": (form.get("next_report_date") or "").strip(),
+        "ai_suggestion": (form.get("ai_suggestion") or "").strip(),
+        "report_message": (form.get("report_message") or "").strip(),
+        "sent_to_owner": bool(form.get("sent_to_owner")),
+        "sent_at": now_taipei().isoformat() if form.get("sent_to_owner") else "",
+        "visibility": seller.get("visibility") or "public",
+        "owner_line_user_id": seller.get("owner_line_user_id") or "",
+        "owner_line_name": seller.get("owner_line_name") or "",
+        "created_at": now_taipei().isoformat(),
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+    }
+    return report
+
+
+@app.route("/sellers/<seller_id>/owner-report/new", methods=["POST"])
+@login_required
+def seller_owner_report_create(seller_id):
+    seller, resp = _get_seller_or_redirect(seller_id)
+    if resp:
+        return resp
+    report = _owner_report_form_payload(seller, request.form)
+    if not report.get("report_message") and not report.get("progress_summary") and not report.get("customer_feedback"):
+        flash("請輸入回報內容，或先用 AI 生成屋主回報草稿", "warning")
+        return redirect(url_for("seller_detail", seller_id=seller_id))
+    ref = db.collection(OWNER_REPORT_COLLECTION).document()
+    ref.set(report)
+    todo_id = create_owner_report_todo(seller, report, ref.id) if report.get("next_report_date") else ""
+    if todo_id:
+        ref.update({"next_report_todo_id": todo_id})
+    # 同步寫入一筆委託追蹤，讓整體紀錄串在一起。
+    try:
+        db.collection("seller_followups").add({
+            "seller_id": seller_id,
+            "contact_time": f"{report.get('report_date')} 09:00",
+            "channel": "屋主回報",
+            "content": report.get("report_message") or report.get("progress_summary") or "已完成屋主回報",
+            "next_action": report.get("next_action") or "",
+            "next_contact_date": report.get("next_report_date") or "",
+            "created_at": now_taipei().isoformat(),
+            "created_by_id": session.get("user_id"),
+            "created_by_name": session.get("user_name"),
+        })
+    except Exception as e:
+        print("⚠️ 屋主回報同步追蹤紀錄失敗：", e)
+    flash("已新增屋主回報" + ("，並建立下一次回報待辦" if todo_id else ""), "success")
+    return redirect(url_for("seller_detail", seller_id=seller_id))
+
+
+@app.route("/sellers/<seller_id>/owner-report/ai", methods=["POST"])
+@login_required
+def seller_owner_report_ai_generate(seller_id):
+    seller, resp = _get_seller_or_redirect(seller_id)
+    if resp:
+        return resp
+    report_type = (request.form.get("report_type") or "general").strip()
+    period_start = (request.form.get("report_period_start") or "").strip()
+    period_end = (request.form.get("report_period_end") or _owner_report_today()).strip()
+    extra_note = (request.form.get("extra_note") or "").strip()
+    draft = generate_owner_report_draft_with_ai(seller, report_type=report_type, period_start=period_start, period_end=period_end, extra_note=extra_note)
+    draft.update({
+        "seller_id": seller_id,
+        "report_type": report_type,
+        "report_period_start": period_start,
+        "report_period_end": period_end,
+        "report_date": _owner_report_today(),
+        "extra_note": extra_note,
+        "created_at": now_taipei().isoformat(),
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+    })
+    ref = db.collection(OWNER_REPORT_DRAFT_COLLECTION).document()
+    ref.set(draft)
+    flash("AI 已生成屋主回報草稿，請確認後儲存", "success")
+    return redirect(url_for("seller_detail", seller_id=seller_id, owner_report_draft_id=ref.id))
+
+
+@app.route("/sellers/<seller_id>/owner-report/<report_id>/delete", methods=["POST"])
+@login_required
+def seller_owner_report_delete(seller_id, report_id):
+    seller, resp = _get_seller_or_redirect(seller_id)
+    if resp:
+        return resp
+    ref = db.collection(OWNER_REPORT_COLLECTION).document(report_id)
+    snap = ref.get()
+    if snap.exists:
+        ref.delete()
+        flash("已刪除屋主回報", "info")
+    return redirect(url_for("seller_detail", seller_id=seller_id))
+
+
+def seller_detail_with_owner_reports(seller_id):
+    seller, resp = _get_seller_or_redirect(seller_id)
+    if resp:
+        flash("找不到這位委託或無權限查看", "danger")
+        return resp
+    followups_ref = db.collection("seller_followups").where("seller_id", "==", seller_id)
+    followups = [doc_to_dict(f) for f in followups_ref.stream()]
+    followups.sort(key=lambda x: x.get("contact_time", ""), reverse=True)
+    owner_reports = fetch_seller_owner_reports(seller_id, limit=30)
+    draft = {}
+    draft_id = (request.args.get("owner_report_draft_id") or "").strip()
+    if draft_id:
+        try:
+            ds = db.collection(OWNER_REPORT_DRAFT_COLLECTION).document(draft_id).get()
+            if ds.exists:
+                d = ds.to_dict() or {}
+                if d.get("seller_id") == seller_id:
+                    draft = d
+                    draft["id"] = draft_id
+        except Exception:
+            draft = {}
+    return render_template(
+        "seller_detail.html",
+        seller=seller,
+        followups=followups,
+        owner_reports=owner_reports,
+        ai_owner_report_draft=draft,
+        owner_report_type_options=OWNER_REPORT_TYPE_OPTIONS,
+        today_date=_owner_report_today(),
+    )
+
+
+def sellers_with_owner_reports():
+    q = request.args.get("q", "").strip()
+    level = request.args.get("level", "").strip()
+    stage = request.args.get("stage", "").strip()
+    source = request.args.get("source", "").strip()
+    label = request.args.get("label", "").strip()
+    sort_by = request.args.get("sort_by", "created_at_desc")
+
+    docs = db.collection("sellers").stream()
+    all_sellers = [doc_to_dict(d) for d in docs]
+    try:
+        visible_sellers = _backend_visible_items(all_sellers) if "_backend_visible_items" in globals() else all_sellers
+    except Exception:
+        visible_sellers = all_sellers
+
+    source_options = sorted({(s.get("source") or "").strip() for s in visible_sellers if (s.get("source") or "").strip()})
+    label_options = build_label_options(visible_sellers)
+    sellers_list = list(visible_sellers)
+
+    if q:
+        sellers_list = [s for s in sellers_list if q in (s.get("name") or "") or q in (s.get("phone") or "") or q in (s.get("address") or "")]
+    if level:
+        sellers_list = [s for s in sellers_list if s.get("level") == level]
+    if stage:
+        sellers_list = [s for s in sellers_list if (s.get("stage") or "") == stage]
+    if source:
+        sellers_list = [s for s in sellers_list if (s.get("source") or "") == source]
+    if label:
+        sellers_list = [s for s in sellers_list if label in ensure_list(s.get("labels"))]
+
+    if sort_by == "created_at_asc":
+        sellers_list.sort(key=lambda s: s.get("created_at") or "")
+    elif sort_by == "created_at_desc":
+        sellers_list.sort(key=lambda s: s.get("created_at") or "", reverse=True)
+    elif sort_by == "name_asc":
+        sellers_list.sort(key=lambda s: (s.get("name") or ""))
+    elif sort_by == "name_desc":
+        sellers_list.sort(key=lambda s: (s.get("name") or ""), reverse=True)
+
+    sellers_list = attach_latest_followup(sellers_list, "seller_followups", "seller_id")
+    sellers_list = attach_owner_report_info_to_sellers(sellers_list)
+    return render_template(
+        "sellers.html",
+        sellers=sellers_list,
+        q=q,
+        level=level,
+        stage=stage,
+        source=source,
+        source_options=source_options,
+        label=label,
+        label_options=label_options,
+        sort_by=sort_by,
+        seller_stage_options=SELLER_STAGE_OPTIONS,
+        total_count=len(visible_sellers),
+        filtered_count=len(sellers_list),
+    )
+
+try:
+    app.view_functions["seller_detail"] = login_required(seller_detail_with_owner_reports)
+    app.view_functions["sellers"] = login_required(sellers_with_owner_reports)
+    print("✅ 屋主回報管理已啟用：委託詳細 / AI生成回報 / 下次回報待辦 / 委託列表回報狀態")
+except Exception as e:
+    print("⚠️ 屋主回報管理套用失敗：", e)
+
+# =============================================================================
+# 委託：屋主回報管理 Patch End
+# =============================================================================
+
+
+if __name__ == "__main__":
+    print("✅ FULL_READY_20260621 已載入")
+    print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
+    print("✅ 可用 /debug/routes 檢查目前所有 route")
+    app.run(debug=True)
+

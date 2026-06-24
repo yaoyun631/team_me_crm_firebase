@@ -165,11 +165,13 @@
                 <div><span class="text-muted">來源：</span>{{ s.source or "-" }}</div>
                 <div><span class="text-muted">產品：</span>{{ s.property_type or "-" }}</div>
                 <div><span class="text-muted">委託到期：</span>{{ s.contract_end_date or "-" }}</div>
+                <div><span class="text-muted">屋主回報：</span>{% if s.last_owner_report %}{{ s.last_owner_report.report_date or '-' }}{% else %}尚未回報{% endif %}</div>
               </div>
               <div class="col-6">
                 <div><span class="text-muted">下一步：</span>{{ s.next_action or "-" }}</div>
                 <div><span class="text-muted">下次日期：</span>{{ s.next_action_date or s.next_contact_date or "-" }}</div>
                 <div><span class="text-muted">建立者：</span>{{ s.created_by_name or "-" }}</div>
+                <div><span class="text-muted">下次回報：</span>{{ s.owner_report_due_text or '-' }}</div>
               </div>
             </div>
 

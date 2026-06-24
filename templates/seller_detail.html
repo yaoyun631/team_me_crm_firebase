@@ -4,15 +4,6 @@
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h3 class="mb-0">賣方詳細資料</h3>
   <div>
-    
-    <a href="{{ url_for('calendar_new', related_type='seller', related_id=seller.id, title=(seller.name ~ ' 委託追蹤'), customer_name=seller.name, phone=seller.phone, location=seller.address, note=seller.note) }}" class="btn btn-outline-success me-2">加入行事曆</a>
-    <form method="post" action="{{ url_for('seller_send_to_line', seller_id=seller.id) }}" class="d-inline-flex align-items-center gap-1 me-2 flex-wrap">
-      {% set opts = line_delivery_options('seller') %}
-      <select name="line_destination" class="form-select form-select-sm" style="width:auto; min-width:180px;">
-        {% for opt in opts %}<option value="{{ opt.value }}">{{ opt.label }}</option>{% endfor %}
-      </select>
-      <button type="submit" class="btn btn-outline-info">傳LINE</button>
-    </form>
     <a href="{{ url_for('seller_edit', seller_id=seller.id) }}" class="btn btn-warning me-2">編輯資料</a>
     <a href="{{ url_for('sellers') }}" class="btn btn-secondary">返回列表</a>
   </div>
@@ -34,15 +25,6 @@
         <span class="badge bg-primary ms-2">等級 {{ seller.level }}</span>
       {% endif %}
     </h5>
-    <div class="mb-3">
-      <span class="badge {% if seller.visibility == 'personal' %}bg-warning text-dark{% else %}bg-success{% endif %}">
-        LINE顯示：{{ '個人資料' if seller.visibility == 'personal' else '公開資料' }}
-      </span>
-      {% if seller.visibility == 'personal' %}
-        <span class="badge bg-light text-dark ms-1">{{ seller.owner_line_name or seller.owner_user_name or '未綁定個人LINE' }}</span>
-      {% endif %}
-    </div>
-
 
     {# 有圖片就顯示一行文字，點擊後展開大圖輪播 #}
     {% if photos %}
@@ -115,10 +97,173 @@
   </div>
 </div>
 
+
+{# ===== 屋主回報管理 ===== #}
+<div class="card mb-4 border-warning" id="ownerReports">
+  <div class="card-header d-flex justify-content-between align-items-center bg-warning-subtle">
+    <div>
+      <strong>屋主回報管理</strong>
+      <div class="small text-muted">記錄回報日期、詢問量、帶看量、客戶反應、屋主回應與下一次回報提醒。</div>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="row g-4">
+      <div class="col-lg-5">
+        <h5 class="mb-3">AI 生成屋主回報</h5>
+        <form method="post" action="{{ url_for('seller_owner_report_ai_generate', seller_id=seller.id) }}" class="border rounded p-3 bg-light mb-3">
+          <div class="row g-2">
+            <div class="col-md-12">
+              <label class="form-label">回報目的</label>
+              <select name="report_type" class="form-select">
+                {% for value, label in owner_report_type_options or [] %}
+                  <option value="{{ value }}" {% if ai_owner_report_draft and ai_owner_report_draft.report_type == value %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">回報區間起</label>
+              <input type="date" name="report_period_start" class="form-control" value="{{ ai_owner_report_draft.report_period_start if ai_owner_report_draft else '' }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">回報區間迄</label>
+              <input type="date" name="report_period_end" class="form-control" value="{{ ai_owner_report_draft.report_period_end if ai_owner_report_draft else today_date }}">
+            </div>
+            <div class="col-12">
+              <label class="form-label">這次希望 AI 著重什麼？</label>
+              <textarea name="extra_note" class="form-control" rows="3" placeholder="例：這次要委婉議價、整理目前帶看進度、說明詢問量不足、委託快到期維繫屋主…">{{ ai_owner_report_draft.extra_note if ai_owner_report_draft else '' }}</textarea>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-outline-warning w-100 mt-3">AI 生成屋主回報草稿</button>
+        </form>
+
+        <h5 class="mb-3">新增屋主回報</h5>
+        <form method="post" action="{{ url_for('seller_owner_report_create', seller_id=seller.id) }}" class="border rounded p-3">
+          <div class="row g-2">
+            <div class="col-md-6">
+              <label class="form-label">回報日期</label>
+              <input type="date" name="report_date" class="form-control" value="{{ ai_owner_report_draft.report_date if ai_owner_report_draft else today_date }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">回報目的</label>
+              <select name="report_type" class="form-select">
+                {% for value, label in owner_report_type_options or [] %}
+                  <option value="{{ value }}" {% if ai_owner_report_draft and ai_owner_report_draft.report_type == value %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">回報區間起</label>
+              <input type="date" name="report_period_start" class="form-control" value="{{ ai_owner_report_draft.report_period_start if ai_owner_report_draft else '' }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">回報區間迄</label>
+              <input type="date" name="report_period_end" class="form-control" value="{{ ai_owner_report_draft.report_period_end if ai_owner_report_draft else today_date }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">詢問量</label>
+              <input type="number" name="inquiry_count" class="form-control" min="0" value="0">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">帶看量</label>
+              <input type="number" name="showing_count" class="form-control" min="0" value="0">
+            </div>
+            <div class="col-12">
+              <label class="form-label">目前進度摘要</label>
+              <textarea name="progress_summary" class="form-control" rows="3" placeholder="例如：已曝光、詢問狀況、帶看進度、目前洽談狀況…">{{ ai_owner_report_draft.progress_summary if ai_owner_report_draft else '' }}</textarea>
+            </div>
+            <div class="col-12">
+              <label class="form-label">客戶反應</label>
+              <textarea name="customer_feedback" class="form-control" rows="3" placeholder="例如：覺得價格偏高、屋況需整理、地點可接受、格局喜歡…">{{ ai_owner_report_draft.customer_feedback if ai_owner_report_draft else '' }}</textarea>
+            </div>
+            <div class="col-12">
+              <label class="form-label">屋主回應</label>
+              <textarea name="owner_response" class="form-control" rows="2" placeholder="例如：願意降價、想再觀望、待家人討論…">{{ ai_owner_report_draft.owner_response if ai_owner_report_draft else '' }}</textarea>
+            </div>
+            <div class="col-12">
+              <label class="form-label">下一步</label>
+              <textarea name="next_action" class="form-control" rows="2" placeholder="例如：建議議價、補廣告、安排下次回報、追蹤有興趣客戶…">{{ ai_owner_report_draft.next_action if ai_owner_report_draft else '' }}</textarea>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">下一次回報日</label>
+              <input type="date" name="next_report_date" class="form-control">
+            </div>
+            <div class="col-md-6 d-flex align-items-end">
+              <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" name="sent_to_owner" value="1" id="sentToOwnerCheck">
+                <label class="form-check-label" for="sentToOwnerCheck">已傳給屋主</label>
+              </div>
+            </div>
+            <div class="col-12">
+              <label class="form-label">AI 建議 / 策略備註</label>
+              <textarea name="ai_suggestion" class="form-control" rows="3" placeholder="給內部看的策略建議">{{ ai_owner_report_draft.ai_suggestion if ai_owner_report_draft else '' }}</textarea>
+            </div>
+            <div class="col-12">
+              <label class="form-label">要傳給屋主的回報內容</label>
+              <textarea name="report_message" id="ownerReportMessage" class="form-control" rows="7" placeholder="這裡可以放 AI 生成後要傳給屋主的完整文字，也可以自己輸入。">{{ ai_owner_report_draft.report_message if ai_owner_report_draft else '' }}</textarea>
+              <button type="button" class="btn btn-sm btn-outline-secondary mt-2" onclick="copyOwnerReportMessage()">複製回報內容</button>
+            </div>
+          </div>
+          <button type="submit" class="btn btn-warning w-100 mt-3">儲存屋主回報</button>
+        </form>
+      </div>
+
+      <div class="col-lg-7">
+        <h5 class="mb-3">歷史屋主回報</h5>
+        {% if owner_reports %}
+          <div class="list-group owner-report-list">
+            {% for r in owner_reports %}
+              <div class="list-group-item">
+                <div class="d-flex justify-content-between align-items-start gap-2">
+                  <div>
+                    <strong>{{ r.report_date or '-' }}</strong>
+                    <span class="badge bg-warning text-dark ms-2">{{ r.report_type_label or '屋主回報' }}</span>
+                    {% if r.sent_to_owner %}<span class="badge bg-success ms-1">已傳屋主</span>{% endif %}
+                  </div>
+                  <form method="post" action="{{ url_for('seller_owner_report_delete', seller_id=seller.id, report_id=r.id) }}" onsubmit="return confirm('確定刪除這筆屋主回報嗎？');">
+                    <button class="btn btn-sm btn-outline-danger" type="submit">刪除</button>
+                  </form>
+                </div>
+                <div class="small text-muted mt-1">
+                  回報區間：{{ r.report_period_start or '-' }} ～ {{ r.report_period_end or '-' }}｜詢問 {{ r.inquiry_count or 0 }} 組｜帶看 {{ r.showing_count or 0 }} 組
+                </div>
+                {% if r.progress_summary %}<div class="mt-2"><strong>進度：</strong>{{ r.progress_summary }}</div>{% endif %}
+                {% if r.customer_feedback %}<div class="mt-1"><strong>客戶反應：</strong>{{ r.customer_feedback }}</div>{% endif %}
+                {% if r.owner_response %}<div class="mt-1"><strong>屋主回應：</strong>{{ r.owner_response }}</div>{% endif %}
+                {% if r.next_action %}<div class="mt-1"><strong>下一步：</strong>{{ r.next_action }}</div>{% endif %}
+                {% if r.next_report_date %}<div class="mt-1 text-danger"><strong>下一次回報：</strong>{{ r.next_report_date }}</div>{% endif %}
+                {% if r.ai_suggestion %}
+                  <details class="mt-2"><summary>AI 建議</summary><div class="mt-1 text-muted">{{ r.ai_suggestion }}</div></details>
+                {% endif %}
+                {% if r.report_message %}
+                  <details class="mt-2"><summary>屋主回報內容</summary><div class="mt-1" style="white-space:pre-wrap;">{{ r.report_message }}</div></details>
+                {% endif %}
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="text-muted">尚無屋主回報紀錄。可以先用 AI 生成草稿，確認後儲存。</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function copyOwnerReportMessage() {
+  const el = document.getElementById('ownerReportMessage');
+  if (!el) return;
+  el.select();
+  el.setSelectionRange(0, 99999);
+  document.execCommand('copy');
+  alert('已複製屋主回報內容');
+}
+</script>
+
+
 <div class="row">
   <div class="col-md-6 mb-4">
     <h4 class="mb-3">新增追蹤紀錄</h4>
-    <form id="followupForm" method="post" action="{{ url_for('add_seller_followup', seller_id=seller.id) }}">
+    <form method="post" action="{{ url_for('add_seller_followup', seller_id=seller.id) }}">
       <div class="mb-3">
         <label class="form-label">聯絡時間（不填則用現在）</label>
         <input type="datetime-local" name="contact_time" class="form-control">
@@ -126,13 +271,13 @@
 
       <div class="mb-3">
         <label class="form-label">聯絡方式</label>
-        <input id="followupChannel" type="text" name="channel" class="form-control"
+        <input type="text" name="channel" class="form-control"
                placeholder="電話 / LINE / 簡訊 / 現場…">
       </div>
 
       <div class="mb-3">
         <label class="form-label">聯絡內容紀錄</label>
-        <textarea id="followupContent" name="content" class="form-control" rows="3"
+        <textarea name="content" class="form-control" rows="3"
                   placeholder="聊了什麼？業主反應如何？"></textarea>
       </div>
 
@@ -172,10 +317,6 @@
                    class="btn btn-sm btn-outline-secondary me-1">
                   編輯
                 </a>
-                <button type="button"
-                        class="btn btn-sm btn-outline-primary me-1 js-reply-followup"
-                        data-channel="{{ f.channel or 'LINE' }}"
-                        data-reply="回覆 {{ f.contact_time or '' }} 追蹤：">回覆追蹤</button>
                 <form method="post"
                       action="{{ url_for('seller_followup_delete', seller_id=seller.id, followup_id=f.id) }}"
                       style="display:inline;"
@@ -246,38 +387,6 @@
 </div>
 {% endif %}
 
-
-
-<script>
-document.addEventListener('DOMContentLoaded', function () {
-  const buttons = document.querySelectorAll('.js-reply-followup');
-  const content = document.getElementById('followupContent');
-  const channel = document.getElementById('followupChannel');
-  const form = document.getElementById('followupForm');
-
-  buttons.forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      if (!content || !form) return;
-      const prefix = btn.dataset.reply || '回覆追蹤：';
-      const channelValue = btn.dataset.channel || 'LINE';
-      if (channel && !channel.value) {
-        channel.value = channelValue;
-      }
-      if (!content.value.trim()) {
-        content.value = prefix + '\n';
-      } else {
-        content.value = content.value.trim() + '\n\n' + prefix + '\n';
-      }
-      form.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      setTimeout(function () {
-        content.focus();
-        content.selectionStart = content.selectionEnd = content.value.length;
-      }, 350);
-    });
-  });
-});
-</script>
-
 {% endblock %}
 {% block scripts %}
 <script>
@@ -329,36 +438,4 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 });
 </script>
-
-
-<script>
-document.addEventListener('DOMContentLoaded', function () {
-  const buttons = document.querySelectorAll('.js-reply-followup');
-  const content = document.getElementById('followupContent');
-  const channel = document.getElementById('followupChannel');
-  const form = document.getElementById('followupForm');
-
-  buttons.forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      if (!content || !form) return;
-      const prefix = btn.dataset.reply || '回覆追蹤：';
-      const channelValue = btn.dataset.channel || 'LINE';
-      if (channel && !channel.value) {
-        channel.value = channelValue;
-      }
-      if (!content.value.trim()) {
-        content.value = prefix + '\n';
-      } else {
-        content.value = content.value.trim() + '\n\n' + prefix + '\n';
-      }
-      form.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      setTimeout(function () {
-        content.focus();
-        content.selectionStart = content.selectionEnd = content.value.length;
-      }, 350);
-    });
-  });
-});
-</script>
-
 {% endblock %}
