@@ -19910,6 +19910,992 @@ print("✅ 後台個人資料隔離已啟用：登入者只能看到公開資料
 # 後台個人資料隔離 Patch End
 # =============================================================================
 
+
+# =============================================================================
+# Gemini AI 物件資料：LINE 上傳 CSV → Firebase 替換資料 → 客需 AI 推薦物件
+# Patch v20260624A
+# 功能：
+# 1. LINE 指令 #更新出售物件 / #更新出租物件，下一則傳 CSV 檔案即可匯入 Firebase。
+# 2. 匯入時先解析成功，才刪除 Firestore 舊資料；出售 sale / 出租 rent 分開替換。
+# 3. 原始 CSV 存 Firebase Storage，解析後資料存 Firestore properties。
+# 4. 後台 /property-datasets 查看匯入狀態。
+# 5. 客需詳細頁可用 /buyers/<buyer_id>/ai-recommend 透過 Gemini 推薦物件。
+# =============================================================================
+
+PROPERTY_COLLECTION = "properties"
+PROPERTY_IMPORT_LOG_COLLECTION = "property_import_logs"
+PROPERTY_IMPORT_SESSION_COLLECTION = "property_import_sessions"
+PROPERTY_UPLOAD_STORAGE_PREFIX = "property_uploads"
+
+PROPERTY_IMPORT_COMMANDS = {
+    "#更新出售物件": "sale",
+    "＃更新出售物件": "sale",
+    "#更新售屋物件": "sale",
+    "＃更新售屋物件": "sale",
+    "#更新買賣物件": "sale",
+    "＃更新買賣物件": "sale",
+    "#更新出租物件": "rent",
+    "＃更新出租物件": "rent",
+    "#更新租屋物件": "rent",
+    "＃更新租屋物件": "rent",
+}
+
+PROPERTY_DEAL_TYPE_LABELS = {
+    "sale": "出售物件",
+    "rent": "出租物件",
+}
+
+
+def _safe_float(value):
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def _safe_int(value):
+    num = _safe_float(value)
+    if num is None:
+        return None
+    try:
+        return int(num)
+    except Exception:
+        return None
+
+
+def _rent_to_int(value):
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return None
+    num = _safe_float(text)
+    if num is None:
+        return None
+    if "萬" in text and num < 1000:
+        num = num * 10000
+    return int(round(num))
+
+
+def _first_nonempty(row, *keys):
+    for key in keys:
+        val = row.get(key, "")
+        if val is not None and str(val).strip() != "":
+            return str(val).strip()
+    return ""
+
+
+def _property_build_tags(data):
+    text = " ".join([
+        data.get("title", ""),
+        data.get("area", ""),
+        data.get("address", ""),
+        data.get("property_type", ""),
+        data.get("description", ""),
+        data.get("community", ""),
+        data.get("parking", ""),
+    ])
+    tags = []
+    keywords = [
+        "透天", "別墅", "大樓", "華廈", "公寓", "土地", "農地", "農舍", "店面", "廠房",
+        "平車", "機上", "機下", "雙車", "車庫", "停車", "可寵", "租補", "入戶籍",
+        "孝親", "電梯", "邊間", "角間", "前院", "後院", "大地坪", "屋況佳", "商圈",
+        "學校", "三井", "清水", "梧棲", "沙鹿", "龍井", "大甲", "外埔", "大肚",
+    ]
+    for kw in keywords:
+        if kw in text and kw not in tags:
+            tags.append(kw)
+    return tags
+
+
+def normalize_property_row(row: dict, deal_type: str, dataset_id: str = "", source_file_name: str = ""):
+    """將愛屋 CSV 的出售 / 出租欄位統一成 Firestore properties 可搜尋格式。"""
+    deal_type = "rent" if deal_type == "rent" else "sale"
+
+    title = _first_nonempty(row, "rakuya_物件名稱", "raw_標題", "物件名稱", "標題", "title")
+    area = _first_nonempty(row, "rakuya_行政區", "行政區", "area")
+    city = _first_nonempty(row, "rakuya_縣市", "縣市", "city")
+    address = _first_nonempty(row, "rakuya_地址全文", "raw_完整地址", "地址", "address")
+    property_type = _first_nonempty(row, "rakuya_現況類型", "raw_類型現況", "現況類型", "產品類型", "property_type")
+    property_form = _first_nonempty(row, "rakuya_現況型式", "rakuya_房屋分類", "raw_型式類別_卡片")
+    community = _first_nonempty(row, "rakuya_社區名稱", "raw_社區", "社區")
+    description = _first_nonempty(row, "rakuya_特色描述", "raw_環境特色", "特色描述", "description")
+    url = _first_nonempty(row, "rakuya_刊登來源網址", "raw_型錄網址", "rakuya_post_url", "網址", "url")
+
+    price_wan = None
+    rent_price = None
+    if deal_type == "sale":
+        price_wan = _safe_float(_first_nonempty(row, "rakuya_總價_萬", "raw_委託總價", "總價_萬", "總價"))
+    else:
+        rent_price = _rent_to_int(_first_nonempty(row, "rakuya_租金_元", "raw_租金", "raw_月租金_卡片", "租金"))
+
+    rooms = _safe_int(_first_nonempty(row, "rakuya_房", "房"))
+    halls = _safe_int(_first_nonempty(row, "rakuya_廳", "廳"))
+    baths = _safe_int(_first_nonempty(row, "rakuya_衛", "衛"))
+    age = _safe_float(_first_nonempty(row, "rakuya_屋齡", "raw_屋齡", "屋齡"))
+    building_area = _safe_float(_first_nonempty(row, "rakuya_建物登記", "rakuya_權狀面積", "raw_登記坪數", "raw_建物面積", "建物面積"))
+    land_area = _safe_float(_first_nonempty(row, "rakuya_土地登記", "raw_土地登記", "土地坪數"))
+    floor = _first_nonempty(row, "rakuya_出售樓層", "rakuya_出租樓層", "rakuya_樓", "樓層")
+    total_floor = _first_nonempty(row, "rakuya_總樓層", "總樓層")
+    school = _first_nonempty(row, "rakuya_鄰近學校", "raw_鄰近學校")
+    parking = ""
+    all_for_parking = f"{title} {property_type} {description} {_first_nonempty(row, 'raw_類別謄本用途')} {_first_nonempty(row, 'raw_格局_卡片')}"
+    if any(k in all_for_parking for k in ["平車", "機上", "機下", "車位", "車庫", "停車", "雙車"]):
+        parking = "有"
+    if "平車" in all_for_parking:
+        parking = "平車"
+    if "雙車" in all_for_parking:
+        parking = "雙車"
+
+    data = {
+        "dataset_id": dataset_id,
+        "deal_type": deal_type,
+        "title": title,
+        "city": city,
+        "area": area,
+        "address": address,
+        "community": community,
+        "price_wan": price_wan,
+        "rent_price": rent_price,
+        "property_type": property_type,
+        "property_form": property_form,
+        "rooms": rooms,
+        "halls": halls,
+        "baths": baths,
+        "age": age,
+        "building_area": building_area,
+        "land_area": land_area,
+        "floor": floor,
+        "total_floor": total_floor,
+        "parking": parking,
+        "school": school,
+        "description": description,
+        "url": url,
+        "source_file_name": source_file_name,
+        "active": True,
+        "raw_no": _first_nonempty(row, "raw_物件編號"),
+    }
+    data["tags"] = _property_build_tags(data)
+    data["searchable_text"] = " ".join(str(v or "") for v in [
+        title, city, area, address, community, property_type, property_form,
+        parking, school, description, " ".join(data["tags"]), url,
+    ])[:4500]
+    return data
+
+
+def read_csv_bytes_to_rows(file_bytes: bytes):
+    """嘗試用常見編碼讀 CSV，回傳 list[dict]。"""
+    if not file_bytes:
+        raise ValueError("檔案是空的")
+
+    last_error = None
+    for enc in ("utf-8-sig", "utf-8", "cp950", "big5"):
+        try:
+            text = file_bytes.decode(enc)
+            reader = csv.DictReader(StringIO(text))
+            rows = []
+            for row in reader:
+                if not row:
+                    continue
+                clean = {str(k or "").strip(): ("" if v is None else str(v).strip()) for k, v in row.items()}
+                if any(str(v).strip() for v in clean.values()):
+                    rows.append(clean)
+            if rows:
+                return rows
+        except Exception as e:
+            last_error = e
+            continue
+    raise ValueError(f"CSV 解析失敗，請確認檔案格式或編碼。最後錯誤：{last_error}")
+
+
+def property_source_is_allowed(event):
+    """限制只有已設定群組或已綁定個人可更新物件資料。"""
+    try:
+        kind, target_id = line_event_source_kind_and_id(event)
+        if kind in ("group", "room"):
+            return bool(find_line_group_by_target_id(target_id))
+        if kind == "user":
+            return bool(find_line_personal_user_by_user_id(target_id))
+    except Exception:
+        pass
+    return False
+
+
+def property_source_key(event):
+    kind, target_id = line_event_source_kind_and_id(event)
+    return f"{kind}:{target_id}"
+
+
+def start_property_import_session(event, deal_type: str):
+    if deal_type not in ("sale", "rent"):
+        raise ValueError("deal_type 必須是 sale 或 rent")
+    kind, target_id = line_event_source_kind_and_id(event)
+    source_key = property_source_key(event)
+    db.collection(PROPERTY_IMPORT_SESSION_COLLECTION).document(source_key).set({
+        "deal_type": deal_type,
+        "source_kind": kind,
+        "target_id": target_id,
+        "source_key": source_key,
+        "created_at": now_taipei().isoformat(),
+        "created_by_line_user_id": ((event.get("source") or {}).get("userId") or ""),
+        "status": "waiting_file",
+    }, merge=True)
+
+
+def get_property_import_session(event):
+    source_key = property_source_key(event)
+    doc = db.collection(PROPERTY_IMPORT_SESSION_COLLECTION).document(source_key).get()
+    if doc.exists:
+        data = doc.to_dict() or {}
+        data["id"] = source_key
+        return data
+    return None
+
+
+def clear_property_import_session(event):
+    try:
+        db.collection(PROPERTY_IMPORT_SESSION_COLLECTION).document(property_source_key(event)).delete()
+    except Exception:
+        pass
+
+
+def download_line_message_content(message_id: str) -> bytes:
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        raise RuntimeError("LINE_CHANNEL_ACCESS_TOKEN 未設定")
+    import requests
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    res = requests.get(url, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}, timeout=60)
+    if res.status_code != 200:
+        raise RuntimeError(f"下載 LINE 檔案失敗：HTTP {res.status_code} {res.text[:200]}")
+    return res.content
+
+
+def upload_property_csv_to_storage(file_bytes: bytes, deal_type: str, file_name: str) -> str:
+    safe_name = secure_filename(file_name or "properties.csv") or "properties.csv"
+    if not safe_name.lower().endswith(".csv"):
+        safe_name += ".csv"
+    stamp = now_taipei().strftime("%Y%m%d_%H%M%S")
+    blob_path = f"{PROPERTY_UPLOAD_STORAGE_PREFIX}/{deal_type}/{stamp}_{safe_name}"
+    bucket = storage.bucket()
+    blob = bucket.blob(blob_path)
+    blob.upload_from_string(file_bytes, content_type="text/csv")
+    return blob_path
+
+
+def delete_properties_by_deal_type(deal_type: str) -> int:
+    docs = db.collection(PROPERTY_COLLECTION).where("deal_type", "==", deal_type).stream()
+    batch = db.batch()
+    count = 0
+    deleted = 0
+    for doc in docs:
+        batch.delete(doc.reference)
+        count += 1
+        deleted += 1
+        if count >= 450:
+            batch.commit()
+            batch = db.batch()
+            count = 0
+    if count:
+        batch.commit()
+    return deleted
+
+
+def insert_properties(rows: list, deal_type: str, dataset_id: str, source_file_name: str, storage_path: str) -> int:
+    imported_at = now_taipei().isoformat()
+    batch = db.batch()
+    count = 0
+    total = 0
+    for row in rows:
+        prop = normalize_property_row(row, deal_type, dataset_id=dataset_id, source_file_name=source_file_name)
+        if not prop.get("title") and not prop.get("address"):
+            continue
+        prop.update({
+            "dataset_id": dataset_id,
+            "storage_path": storage_path,
+            "imported_at": imported_at,
+            "created_at": imported_at,
+        })
+        doc_ref = db.collection(PROPERTY_COLLECTION).document()
+        batch.set(doc_ref, prop)
+        count += 1
+        total += 1
+        if count >= 450:
+            batch.commit()
+            batch = db.batch()
+            count = 0
+    if count:
+        batch.commit()
+    return total
+
+
+def replace_properties_from_csv_bytes(file_bytes: bytes, deal_type: str, file_name: str, uploaded_by_name: str = "LINE", uploaded_by_line_user_id: str = ""):
+    deal_type = "rent" if deal_type == "rent" else "sale"
+    file_name = file_name or f"properties_{deal_type}.csv"
+
+    raw_rows = read_csv_bytes_to_rows(file_bytes)
+    if not raw_rows:
+        raise ValueError("CSV 沒有解析到任何資料，已取消更新，舊資料保留。")
+
+    normalized_preview = [normalize_property_row(r, deal_type, source_file_name=file_name) for r in raw_rows[:20]]
+    if not any(x.get("title") or x.get("address") for x in normalized_preview):
+        raise ValueError("CSV 欄位無法辨識成物件資料，已取消更新，舊資料保留。")
+
+    dataset_ref = db.collection(PROPERTY_IMPORT_LOG_COLLECTION).document()
+    dataset_id = dataset_ref.id
+    storage_path = upload_property_csv_to_storage(file_bytes, deal_type, file_name)
+
+    deleted_count = delete_properties_by_deal_type(deal_type)
+    inserted_count = insert_properties(raw_rows, deal_type, dataset_id, file_name, storage_path)
+
+    log_data = {
+        "deal_type": deal_type,
+        "deal_type_label": PROPERTY_DEAL_TYPE_LABELS.get(deal_type, deal_type),
+        "file_name": file_name,
+        "storage_path": storage_path,
+        "raw_count": len(raw_rows),
+        "deleted_count": deleted_count,
+        "inserted_count": inserted_count,
+        "status": "success",
+        "uploaded_by_name": uploaded_by_name,
+        "uploaded_by_line_user_id": uploaded_by_line_user_id,
+        "created_at": now_taipei().isoformat(),
+    }
+    dataset_ref.set(log_data)
+    return log_data
+
+
+def process_line_property_import_text(event):
+    msg = event.get("message") or {}
+    if msg.get("type") != "text":
+        return {"handled": False}
+    text = (msg.get("text") or "").strip().splitlines()[0].strip()
+    deal_type = PROPERTY_IMPORT_COMMANDS.get(text)
+    if not deal_type:
+        return {"handled": False}
+
+    if not property_source_is_allowed(event):
+        return {"handled": True, "ok": False, "reply_text": "未授權：請先在設定中心加入此群組，或完成個人 LINE 綁定後，才能更新物件資料。"}
+
+    start_property_import_session(event, deal_type)
+    label = PROPERTY_DEAL_TYPE_LABELS.get(deal_type, deal_type)
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": f"已進入「{label}」更新模式。\n請直接上傳最新 CSV 檔案。\n提醒：系統會先解析成功，才會刪除舊的{label}資料。",
+    }
+
+
+def process_line_property_import_file(event):
+    msg = event.get("message") or {}
+    if msg.get("type") not in ("file", "document"):
+        return {"handled": False}
+
+    session_data = get_property_import_session(event)
+    if not session_data or session_data.get("status") != "waiting_file":
+        return {"handled": False}
+
+    if not property_source_is_allowed(event):
+        clear_property_import_session(event)
+        return {"handled": True, "ok": False, "reply_text": "未授權：此來源不能更新物件資料。"}
+
+    deal_type = session_data.get("deal_type") or "sale"
+    file_name = msg.get("fileName") or msg.get("filename") or f"properties_{deal_type}.csv"
+    if not str(file_name).lower().endswith(".csv"):
+        return {"handled": True, "ok": False, "reply_text": "請上傳 CSV 檔案。這次沒有更新資料，舊資料仍保留。"}
+
+    try:
+        file_bytes = download_line_message_content(msg.get("id"))
+        sender = get_line_sender_display_name(event) or "LINE"
+        uploaded_by_line_user_id = ((event.get("source") or {}).get("userId") or "")
+        log_data = replace_properties_from_csv_bytes(
+            file_bytes=file_bytes,
+            deal_type=deal_type,
+            file_name=file_name,
+            uploaded_by_name=sender,
+            uploaded_by_line_user_id=uploaded_by_line_user_id,
+        )
+        clear_property_import_session(event)
+        label = PROPERTY_DEAL_TYPE_LABELS.get(deal_type, deal_type)
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": (
+                f"✅ 已更新{label}\n"
+                f"檔名：{log_data.get('file_name')}\n"
+                f"刪除舊資料：{log_data.get('deleted_count')} 筆\n"
+                f"匯入新資料：{log_data.get('inserted_count')} 筆\n"
+                f"原始解析：{log_data.get('raw_count')} 筆"
+            ),
+        }
+    except Exception as e:
+        print("❌ LINE 物件 CSV 匯入失敗：", e)
+        return {"handled": True, "ok": False, "reply_text": f"❌ 物件資料更新失敗：{e}\n舊資料已保留，沒有被刪除。"}
+
+
+def fetch_active_properties(deal_type: str, limit: int = 1500):
+    deal_type = "rent" if deal_type == "rent" else "sale"
+    docs = db.collection(PROPERTY_COLLECTION).where("deal_type", "==", deal_type).limit(limit).stream()
+    rows = []
+    for d in docs:
+        item = d.to_dict() or {}
+        item["id"] = d.id
+        rows.append(item)
+    return rows
+
+
+def property_latest_import_logs():
+    logs = []
+    try:
+        docs = db.collection(PROPERTY_IMPORT_LOG_COLLECTION).order_by("created_at", direction=firestore.Query.DESCENDING).limit(20).stream()
+        logs = [doc_to_dict(d) for d in docs]
+    except Exception:
+        docs = db.collection(PROPERTY_IMPORT_LOG_COLLECTION).limit(20).stream()
+        logs = [doc_to_dict(d) for d in docs]
+        logs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return logs
+
+
+@app.route("/property-datasets")
+@login_required
+def property_datasets():
+    sale_count = len(fetch_active_properties("sale", limit=5000))
+    rent_count = len(fetch_active_properties("rent", limit=5000))
+    logs = property_latest_import_logs()
+    return render_template_string(PROPERTY_DATASETS_TEMPLATE, sale_count=sale_count, rent_count=rent_count, logs=logs)
+
+
+PROPERTY_DATASETS_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-1">物件資料管理</h3>
+    <div class="text-muted small">物件資料由 LINE 上傳 CSV 後自動存入 Firebase，不需要重新部署。</div>
+  </div>
+  <a href="{{ url_for('buyers') }}" class="btn btn-outline-secondary btn-sm">回客需</a>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-6">
+    <div class="card border-0 shadow-sm">
+      <div class="card-body">
+        <div class="text-muted small">目前啟用</div>
+        <h4 class="mb-0">出售物件 {{ sale_count }} 筆</h4>
+        <div class="small text-muted mt-2">LINE 指令：#更新出售物件 → 上傳 CSV</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card border-0 shadow-sm">
+      <div class="card-body">
+        <div class="text-muted small">目前啟用</div>
+        <h4 class="mb-0">出租物件 {{ rent_count }} 筆</h4>
+        <div class="small text-muted mt-2">LINE 指令：#更新出租物件 → 上傳 CSV</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card border-0 shadow-sm">
+  <div class="card-header bg-white fw-bold">最近匯入紀錄</div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>時間</th>
+          <th>類型</th>
+          <th>檔名</th>
+          <th>刪除舊資料</th>
+          <th>匯入新資料</th>
+          <th>上傳者</th>
+          <th>狀態</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in logs %}
+        <tr>
+          <td class="small">{{ log.created_at or '-' }}</td>
+          <td>{{ log.deal_type_label or log.deal_type }}</td>
+          <td class="small">{{ log.file_name or '-' }}</td>
+          <td>{{ log.deleted_count or 0 }}</td>
+          <td>{{ log.inserted_count or 0 }}</td>
+          <td>{{ log.uploaded_by_name or '-' }}</td>
+          <td><span class="badge bg-success">{{ log.status or 'success' }}</span></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-center text-muted py-4">尚無匯入紀錄</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+"""
+
+
+def get_gemini_client():
+    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("尚未設定 GEMINI_API_KEY。請在本機或 Render 的環境變數加入 GEMINI_API_KEY。")
+    try:
+        from google import genai
+    except Exception as e:
+        raise RuntimeError("尚未安裝 google-genai，請在 requirements.txt 加入 google-genai 並重新部署。") from e
+    return genai.Client(api_key=api_key)
+
+
+def gemini_model_name():
+    return (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+
+
+def safe_json_loads_from_ai(text):
+    text = (text or "").strip()
+    if not text:
+        return {}
+    text = re.sub(r"^```json\s*", "", text)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+    return {}
+
+
+def buyer_raw_need_text(buyer: dict):
+    return "\n".join([
+        f"姓名：{buyer.get('name','')}",
+        f"需求類型：{buyer.get('intent_type','')}",
+        f"預算買：{buyer.get('budget_min','')} ~ {buyer.get('budget_max','')} 萬",
+        f"租金：{buyer.get('rent_min','')} ~ {buyer.get('rent_max','')}",
+        f"區域：{buyer.get('preferred_areas','')}",
+        f"產品類型：{buyer.get('property_type','')}",
+        f"房數：{buyer.get('room_range','')}",
+        f"車位：{buyer.get('car_need','')}",
+        f"家庭/生活型態：{buyer.get('family_info','')}",
+        f"必要條件：{buyer.get('requirement_must','')}",
+        f"加分條件：{buyer.get('requirement_nice','')}",
+        f"其他背景：{buyer.get('other_background','')}",
+        f"備註：{buyer.get('note','')}",
+    ])
+
+
+def parse_buyer_need_with_gemini(buyer: dict):
+    client = get_gemini_client()
+    prompt = f"""
+你是台中海線房仲 CRM 的客需解析助手。
+請把以下口語客需整理成 JSON，只能輸出 JSON，不要輸出其他文字。
+
+客需資料：
+{buyer_raw_need_text(buyer)}
+
+請輸出格式：
+{{
+  "intent_type": "buy 或 rent",
+  "budget_max_buy_wan": 數字或 null,
+  "rent_max": 數字或 null,
+  "areas": ["清水區", "梧棲區", "沙鹿區", "龍井區", "大甲區"],
+  "property_types": ["透天", "別墅", "華廈", "電梯大樓", "公寓", "土地", "農舍", "店面", "廠房"],
+  "room_min": 數字或 null,
+  "room_max": 數字或 null,
+  "need_parking": true 或 false 或 null,
+  "age_max": 數字或 null,
+  "must_have": ["必要條件"],
+  "nice_to_have": ["加分條件"],
+  "exclude": ["不要條件"],
+  "search_keywords": ["用來搜尋物件描述的關鍵字"],
+  "summary": "一句話整理客戶需求"
+}}
+""".strip()
+    response = client.models.generate_content(model=gemini_model_name(), contents=prompt)
+    parsed = safe_json_loads_from_ai(getattr(response, "text", ""))
+    if not parsed:
+        raise RuntimeError("Gemini 沒有回傳可解析的 JSON")
+    return parsed
+
+
+def _list_contains_match(values, text):
+    text = str(text or "")
+    for v in values or []:
+        v = str(v or "").strip()
+        if not v:
+            continue
+        short = v.replace("台中市", "")
+        if short in text or v in text:
+            return True
+    return False
+
+
+def hard_filter_firestore_properties(properties: list, parsed_need: dict, deal_type: str, limit: int = 30):
+    areas = parsed_need.get("areas") or []
+    property_types = parsed_need.get("property_types") or []
+    budget_max = parsed_need.get("budget_max_buy_wan")
+    rent_max = parsed_need.get("rent_max")
+    room_min = parsed_need.get("room_min")
+    age_max = parsed_need.get("age_max")
+    need_parking = parsed_need.get("need_parking")
+    keywords = parsed_need.get("search_keywords") or []
+    must_have = parsed_need.get("must_have") or []
+    nice_to_have = parsed_need.get("nice_to_have") or []
+    exclude = parsed_need.get("exclude") or []
+
+    scored = []
+    for p in properties:
+        full_text = " ".join(str(p.get(k) or "") for k in ["title", "area", "address", "property_type", "property_form", "parking", "description", "searchable_text"])
+        score = 0
+        reasons = []
+
+        if deal_type == "sale" and budget_max:
+            price = p.get("price_wan")
+            if price is None:
+                score += 3
+            elif float(price) <= float(budget_max):
+                score += 25
+                reasons.append("價格符合")
+            else:
+                continue
+        if deal_type == "rent" and rent_max:
+            rent = p.get("rent_price")
+            if rent is None:
+                score += 3
+            elif float(rent) <= float(rent_max):
+                score += 25
+                reasons.append("租金符合")
+            else:
+                continue
+
+        if areas:
+            if _list_contains_match(areas, f"{p.get('area','')} {p.get('address','')}"):
+                score += 20
+                reasons.append("區域符合")
+            else:
+                continue
+
+        if property_types:
+            if _list_contains_match(property_types, full_text):
+                score += 20
+                reasons.append("產品類型符合")
+            else:
+                score += 5
+
+        if room_min:
+            rooms = p.get("rooms")
+            if rooms is not None and float(rooms) >= float(room_min):
+                score += 8
+                reasons.append("房數符合")
+
+        if age_max:
+            age = p.get("age")
+            if age is not None and float(age) <= float(age_max):
+                score += 10
+                reasons.append("屋齡符合")
+            elif age is not None:
+                score -= 6
+
+        if need_parking is True:
+            if any(k in full_text for k in ["車位", "平車", "雙車", "停車", "車庫"]):
+                score += 10
+                reasons.append("車位/停車條件接近")
+            else:
+                score -= 5
+
+        matched_kw = []
+        for kw in list(keywords) + list(must_have) + list(nice_to_have):
+            kw = str(kw or "").strip()
+            if kw and kw in full_text:
+                matched_kw.append(kw)
+        if matched_kw:
+            score += min(15, len(set(matched_kw)) * 3)
+            reasons.append("關鍵字符合：" + "、".join(list(dict.fromkeys(matched_kw))[:5]))
+
+        excluded = [str(x) for x in exclude if str(x or "").strip() and str(x) in full_text]
+        if excluded:
+            score -= 15
+            reasons.append("可能踩到排除條件：" + "、".join(excluded[:3]))
+
+        p2 = dict(p)
+        p2["rule_score"] = score
+        p2["basic_reasons"] = reasons
+        scored.append(p2)
+
+    scored.sort(key=lambda x: x.get("rule_score") or 0, reverse=True)
+    return scored[:limit]
+
+
+def rank_properties_with_gemini(parsed_need: dict, candidates: list, top_n: int = 8):
+    if not candidates:
+        return []
+    client = get_gemini_client()
+    compact = []
+    for i, p in enumerate(candidates, 1):
+        compact.append({
+            "idx": i,
+            "id": p.get("id"),
+            "title": p.get("title"),
+            "area": p.get("area"),
+            "address": p.get("address"),
+            "property_type": p.get("property_type"),
+            "price_wan": p.get("price_wan"),
+            "rent_price": p.get("rent_price"),
+            "rooms": p.get("rooms"),
+            "age": p.get("age"),
+            "parking": p.get("parking"),
+            "description": (p.get("description") or "")[:450],
+            "url": p.get("url"),
+            "rule_score": p.get("rule_score"),
+            "basic_reasons": p.get("basic_reasons"),
+        })
+    prompt = f"""
+你是台中海線房仲物件推薦助手。
+請依照客需條件，從候選物件挑出最適合的前 {top_n} 筆。
+只能輸出 JSON，不要輸出其他文字。
+
+客需條件：
+{json.dumps(parsed_need, ensure_ascii=False, indent=2)}
+
+候選物件：
+{json.dumps(compact, ensure_ascii=False, indent=2)}
+
+輸出格式：
+{{
+  "recommendations": [
+    {{
+      "idx": 候選物件idx,
+      "ai_score": 0到100的整數,
+      "fit_level": "很適合 / 可介紹 / 勉強可看 / 不建議",
+      "reason": "推薦原因，房仲可理解",
+      "risk": "可能不符合的地方或要現場確認的地方",
+      "talking_point": "可以怎麼跟客戶介紹"
+    }}
+  ]
+}}
+""".strip()
+    response = client.models.generate_content(model=gemini_model_name(), contents=prompt)
+    data = safe_json_loads_from_ai(getattr(response, "text", ""))
+    recs = data.get("recommendations") or []
+    by_idx = {i: p for i, p in enumerate(candidates, 1)}
+    out = []
+    for rec in recs:
+        try:
+            idx = int(rec.get("idx"))
+        except Exception:
+            continue
+        base = by_idx.get(idx)
+        if not base:
+            continue
+        merged = dict(base)
+        merged.update({
+            "ai_score": rec.get("ai_score"),
+            "fit_level": rec.get("fit_level"),
+            "reason": rec.get("reason"),
+            "risk": rec.get("risk"),
+            "talking_point": rec.get("talking_point"),
+        })
+        out.append(merged)
+    out.sort(key=lambda x: x.get("ai_score") or 0, reverse=True)
+    return out[:top_n]
+
+
+def recommend_properties_for_buyer_from_firestore(buyer: dict):
+    parsed = parse_buyer_need_with_gemini(buyer)
+    intent = (parsed.get("intent_type") or buyer.get("intent_type") or "buy").strip()
+    deal_type = "rent" if intent == "rent" else "sale"
+    props = fetch_active_properties(deal_type, limit=2500)
+    candidates = hard_filter_firestore_properties(props, parsed, deal_type=deal_type, limit=30)
+    ranked = rank_properties_with_gemini(parsed, candidates, top_n=8)
+    return {"parsed_need": parsed, "deal_type": deal_type, "property_count": len(props), "candidate_count": len(candidates), "recommendations": ranked}
+
+
+@app.route("/buyers/<buyer_id>/ai-recommend")
+@login_required
+def buyer_ai_recommend(buyer_id):
+    doc = db.collection("buyers").document(buyer_id).get()
+    if not doc.exists:
+        flash("找不到這位客需", "danger")
+        return redirect(url_for("buyers"))
+    buyer = doc_to_dict(doc)
+
+    try:
+        if "can_view_record" in globals() and not can_view_record(buyer):
+            flash("你沒有權限查看這筆個人客需", "danger")
+            return redirect(url_for("buyers"))
+    except Exception:
+        pass
+
+    try:
+        result = recommend_properties_for_buyer_from_firestore(buyer)
+    except Exception as e:
+        flash(f"AI 推薦失敗：{e}", "danger")
+        return redirect(url_for("buyer_detail", buyer_id=buyer_id))
+
+    return render_template_string(
+        BUYER_AI_RECOMMEND_TEMPLATE,
+        buyer=buyer,
+        parsed_need=result.get("parsed_need"),
+        recommendations=result.get("recommendations") or [],
+        deal_type=result.get("deal_type"),
+        property_count=result.get("property_count"),
+        candidate_count=result.get("candidate_count"),
+    )
+
+
+BUYER_AI_RECOMMEND_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-1">AI推薦物件</h3>
+    <div class="text-muted small">客戶：{{ buyer.name or '-' }}｜電話：{{ buyer.phone or '-' }}</div>
+  </div>
+  <div>
+    <a href="{{ url_for('buyer_detail', buyer_id=buyer.id) }}" class="btn btn-outline-secondary btn-sm">回客需詳細</a>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-4"><div class="card border-0 shadow-sm"><div class="card-body"><div class="text-muted small">使用資料</div><h5 class="mb-0">{{ '出租物件' if deal_type == 'rent' else '出售物件' }}</h5></div></div></div>
+  <div class="col-md-4"><div class="card border-0 shadow-sm"><div class="card-body"><div class="text-muted small">Firebase 物件筆數</div><h5 class="mb-0">{{ property_count }} 筆</h5></div></div></div>
+  <div class="col-md-4"><div class="card border-0 shadow-sm"><div class="card-body"><div class="text-muted small">規則粗篩候選</div><h5 class="mb-0">{{ candidate_count }} 筆</h5></div></div></div>
+</div>
+
+<div class="card border-0 shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold">AI解析客需</div>
+  <div class="card-body"><pre class="mb-0" style="white-space: pre-wrap; font-size: 13px;">{{ parsed_need | tojson(indent=2, ensure_ascii=False) }}</pre></div>
+</div>
+
+<div class="card border-0 shadow-sm">
+  <div class="card-header bg-white fw-bold">推薦物件</div>
+  <div class="card-body">
+    {% if recommendations %}
+      {% for item in recommendations %}
+        <div class="border rounded p-3 mb-3 bg-white">
+          <div class="d-flex justify-content-between align-items-start gap-3 mb-2">
+            <div>
+              <h5 class="mb-1">{{ loop.index }}. {{ item.title or '未命名物件' }}</h5>
+              <div class="text-muted small">
+                {{ item.area or '-' }}｜{{ item.property_type or '-' }}
+                {% if item.price_wan %}｜{{ item.price_wan }} 萬{% endif %}
+                {% if item.rent_price %}｜租金 {{ item.rent_price }} 元{% endif %}
+                {% if item.rooms %}｜{{ item.rooms }} 房{% endif %}
+                {% if item.age %}｜屋齡 {{ item.age }} 年{% endif %}
+                {% if item.parking %}｜{{ item.parking }}{% endif %}
+              </div>
+              <div class="small text-muted mt-1">{{ item.address or '-' }}</div>
+            </div>
+            <span class="badge bg-success fs-6">{{ item.ai_score or item.rule_score or 0 }} 分</span>
+          </div>
+          <div class="mb-2"><strong>適合度：</strong>{{ item.fit_level or '-' }}</div>
+          <div class="mb-2"><strong>推薦原因：</strong>{{ item.reason or '—' }}</div>
+          <div class="mb-2 text-danger"><strong>注意事項：</strong>{{ item.risk or '—' }}</div>
+          <div class="mb-2"><strong>介紹話術：</strong>{{ item.talking_point or '—' }}</div>
+          {% if item.basic_reasons %}<div class="small text-muted mb-2">規則命中：{{ item.basic_reasons | join('、') }}</div>{% endif %}
+          {% if item.url %}<a href="{{ item.url }}" target="_blank" class="btn btn-sm btn-outline-primary">查看物件</a>{% endif %}
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="text-muted">目前沒有找到推薦物件。請先確認 Firebase 已匯入物件資料，或放寬客需條件。</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+"""
+
+try:
+    _line_webhook_before_property_import = app.view_functions.get("line_webhook")
+
+    def line_webhook_with_property_import():
+        raw_body = request.get_data(cache=False, as_text=False)
+        signature = request.headers.get("x-line-signature", "")
+        if not verify_line_signature(raw_body, signature):
+            return "Invalid signature", 400
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except Exception as e:
+            print("⚠️ LINE webhook JSON 解析失敗：", e)
+            return "Bad Request", 400
+
+        all_handled_by_property = True
+        has_property_event = False
+        for event in payload.get("events", []):
+            reply_token = event.get("replyToken")
+            try:
+                result = {"handled": False}
+                msg_type = ((event.get("message") or {}).get("type") or "")
+                if msg_type == "text":
+                    result = process_line_property_import_text(event)
+                elif msg_type in ("file", "document"):
+                    result = process_line_property_import_file(event)
+
+                if result.get("handled"):
+                    has_property_event = True
+                    if reply_token and result.get("reply_text"):
+                        reply_line_text(reply_token, result.get("reply_text"))
+                else:
+                    all_handled_by_property = False
+            except Exception as e:
+                print("⚠️ 處理 LINE 物件匯入事件失敗：", e)
+                has_property_event = True
+                if reply_token:
+                    reply_line_text(reply_token, f"物件匯入處理失敗：{e}")
+
+        if has_property_event and all_handled_by_property:
+            return "OK", 200
+
+        for event in payload.get("events", []):
+            try:
+                msg = event.get("message") or {}
+                if msg.get("type") in ("text", "file", "document"):
+                    if msg.get("type") == "text":
+                        first = (msg.get("text") or "").strip().splitlines()[0].strip()
+                        if first in PROPERTY_IMPORT_COMMANDS:
+                            continue
+                    if msg.get("type") in ("file", "document") and get_property_import_session(event):
+                        continue
+                reply_token = event.get("replyToken")
+                if (event.get("message") or {}).get("type") == "text":
+                    _txt = (event.get("message") or {}).get("text", "")
+                    try:
+                        if detect_line_command_type(_txt) == "system_group_id":
+                            if reply_token:
+                                reply_line_text(reply_token, _line_source_id_reply_text(event) if "_line_source_id_reply_text" in globals() else f"ID：{line_event_source_kind_and_id(event)[1]}")
+                            continue
+                    except Exception:
+                        pass
+                allowed, reason_or_cmd, source_cfg = line_access_gate(event)
+                if not allowed:
+                    if reply_token:
+                        reply_line_text(reply_token, reason_or_cmd)
+                    continue
+                result = process_line_postback_event(event) if event.get("type") == "postback" else process_line_message_event(event)
+                if not result or not result.get("handled") or not reply_token:
+                    continue
+                if result.get("reply_messages"):
+                    reply_line_messages(reply_token, result.get("reply_messages") or [])
+                elif result.get("reply_flex"):
+                    reply_line_flex(reply_token, result.get("reply_text", "CRM 卡片"), result.get("reply_flex"), quick_reply_items=result.get("reply_quick_reply"))
+                elif result.get("reply_text"):
+                    reply_line_text(reply_token, result.get("reply_text"))
+            except Exception as e:
+                print("⚠️ 一般 LINE event fallback 處理失敗：", e)
+        return "OK", 200
+
+    app.view_functions["line_webhook"] = line_webhook_with_property_import
+    print("✅ LINE 物件 CSV 匯入 + Firebase properties + Gemini AI推薦 已啟用")
+except Exception as e:
+    print("⚠️ LINE 物件 CSV 匯入 patch 套用失敗：", e)
+
+# =============================================================================
+# Gemini AI 物件資料 Patch End
+# =============================================================================
 if __name__ == "__main__":
     print("✅ FULL_READY_20260621 已載入")
     print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
