@@ -21528,3 +21528,320 @@ print("✅ AI推薦 V3 已載入：風險有內容才顯示、保留介紹話術
 # =============================================================================
 # AI推薦 V3 Patch End
 # =============================================================================
+
+
+# =============================================================================
+# AI推薦 V4：群組/個人權限 + 物件搜尋明確區分買賣/租賃
+# - 設定中心的群組 / 個人「可使用指令」新增 ai_recommend
+# - #推薦物件、#找物件、#搜尋物件、推薦物件 postback 都改走 ai_recommend 權限
+# - 未授權的群組/個人不能使用 AI推薦與條件找物件
+# - #找物件 必須能判斷買賣或租賃，避免混用出售/出租物件庫
+# =============================================================================
+
+AI_RECOMMEND_COMMAND_KEY = "ai_recommend"
+
+try:
+    # 讓設定中心的群組 / 個人可勾選 AI推薦權限。
+    if "LINE_COMMAND_TYPE_OPTIONS" in globals():
+        if not any(k == AI_RECOMMEND_COMMAND_KEY for k, _ in LINE_COMMAND_TYPE_OPTIONS):
+            LINE_COMMAND_TYPE_OPTIONS.append((
+                AI_RECOMMEND_COMMAND_KEY,
+                "AI推薦 / 找物件指令：#推薦物件、#找物件、#搜尋物件、#AI找物件"
+            ))
+    print("✅ AI推薦 V4：設定中心已加入群組/個人 AI推薦權限選項")
+except Exception as e:
+    print("⚠️ AI推薦 V4 加入權限選項失敗：", e)
+
+
+def _line_source_ai_recommend_allowed(event):
+    """檢查目前 LINE 來源是否有 AI推薦/找物件權限。"""
+    try:
+        kind, target_id = line_event_source_kind_and_id(event)
+    except Exception:
+        kind, target_id = "unknown", ""
+
+    cfg = None
+    label = ""
+    if kind in ("group", "room"):
+        try:
+            cfg = find_line_group_by_target_id(target_id)
+        except Exception:
+            cfg = None
+        label = "此群組"
+    elif kind == "user":
+        try:
+            cfg = find_line_personal_user_by_user_id(target_id)
+        except Exception:
+            cfg = None
+        label = "此個人帳號"
+    else:
+        label = "此 LINE 來源"
+
+    if not cfg:
+        return False, f"未授權：{label}尚未在後台設定中心綁定，無法使用 AI推薦 / 找物件。"
+
+    allowed = set(cfg.get("command_types") or [])
+    if "all" in allowed or AI_RECOMMEND_COMMAND_KEY in allowed:
+        return True, ""
+
+    return False, f"未授權：{label}尚未開放 AI推薦 / 找物件權限，請到設定中心勾選「AI推薦 / 找物件指令」。"
+
+
+try:
+    _detect_line_command_type_before_ai_v4 = detect_line_command_type
+
+    def detect_line_command_type(text: str, event=None) -> str:
+        first = (text or "").strip().splitlines()[0].strip().replace(" ", "") if (text or "").strip() else ""
+        first_no_hash = first[1:] if first.startswith("#") else first
+        if first_no_hash in (
+            "推薦物件", "AI推薦物件", "物件推薦",
+            "找物件", "搜尋物件", "AI找物件", "查物件", "找公司物件"
+        ):
+            return AI_RECOMMEND_COMMAND_KEY
+        return _detect_line_command_type_before_ai_v4(text, event=event)
+
+    print("✅ AI推薦 V4：LINE 文字指令已改走 ai_recommend 權限")
+except Exception as e:
+    print("⚠️ AI推薦 V4 文字權限 patch 失敗：", e)
+
+
+try:
+    _detect_line_postback_command_type_before_ai_v4 = detect_line_postback_command_type
+
+    def detect_line_postback_command_type(event) -> str:
+        try:
+            data = ((event or {}).get("postback") or {}).get("data", "") or ""
+            if "action=ai_recommend_properties" in data or "property_talking_point" in data:
+                return AI_RECOMMEND_COMMAND_KEY
+        except Exception:
+            pass
+        return _detect_line_postback_command_type_before_ai_v4(event)
+
+    print("✅ AI推薦 V4：推薦物件 postback 已改走 ai_recommend 權限")
+except Exception as e:
+    print("⚠️ AI推薦 V4 postback 權限 patch 失敗：", e)
+
+
+def _detect_property_search_deal_type(text: str, fields: dict = None):
+    """回傳 buy / rent / 空字串。租賃關鍵字優先，避免「月租1.8萬」被誤判買賣。"""
+    fields = fields or {}
+    values_text = " ".join(str(v or "") for v in fields.values())
+    source_text = f"{text or ''} {values_text}".strip().lower()
+    source_text_no_space = source_text.replace(" ", "")
+
+    # 指定欄位優先。
+    explicit = (
+        fields.get("intent_type_raw") or fields.get("deal_type_raw") or
+        fields.get("intent_type") or fields.get("deal_type") or fields.get("需求類型") or ""
+    )
+    explicit = str(explicit).strip().lower()
+
+    rent_words = ["租賃", "租屋", "出租", "承租", "租金", "月租", "租"]
+    buy_words = ["買賣", "買屋", "買房", "購屋", "出售", "售屋", "總價", "買"]
+
+    if any(w in explicit for w in rent_words):
+        return "rent"
+    if any(w in explicit for w in buy_words):
+        return "buy"
+
+    # 全文判斷：租賃優先。
+    if any(w in source_text_no_space for w in rent_words):
+        return "rent"
+    if any(w in source_text_no_space for w in buy_words):
+        return "buy"
+
+    # 有明確「萬」通常是買賣，但租賃文字已在上面優先排除。
+    if re.search(r"\d+(?:\.\d+)?\s*萬", source_text):
+        return "buy"
+
+    return ""
+
+
+def _parse_ai_free_property_search_text(text: str):
+    """解析 #找物件；V4 起必須能判斷買賣或租賃。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    first = lines[0].strip()
+    first_no_space = first.replace(" ", "")
+    valid = ("#找物件", "#搜尋物件", "#AI找物件", "#查物件", "#找公司物件")
+    if not any(first_no_space.startswith(v) for v in valid):
+        return None
+
+    inline = first
+    for v in valid:
+        if inline.replace(" ", "").startswith(v):
+            inline = re.sub(r"^\s*" + re.escape(v) + r"\s*", "", inline, flags=re.I)
+            break
+
+    fields = {}
+    free_parts = []
+    if inline.strip():
+        free_parts.append(inline.strip())
+
+    for line in lines[1:]:
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", line)
+        if m:
+            key = normalize_line_key(m.group(1)) if "normalize_line_key" in globals() else m.group(1).strip()
+            fields[key] = (m.group(2) or "").strip()
+        else:
+            free_parts.append(line)
+
+    all_text = "\n".join(free_parts + [f"{k}: {v}" for k, v in fields.items() if v]).strip()
+    if not all_text:
+        all_text = "請依一般客需條件推薦物件"
+
+    deal_type = _detect_property_search_deal_type(all_text, fields)
+    if not deal_type:
+        return {
+            "error": (
+                "請先指定要找「買賣」或「租賃」物件，避免系統混用出售/出租資料。\n\n"
+                "範例一：#找物件 租賃 清水 18000內 2房 平車\n"
+                "範例二：#找物件 買賣 梧棲 1500萬內 透天 3房\n\n"
+                "也可以用多行：\n"
+                "#找物件\n需求類型: 租賃\n預算: 18000\n區域: 清水\n產品類型: 大樓\n房數: 2房"
+            )
+        }
+
+    budget = fields.get("budget") or fields.get("price") or fields.get("預算") or ""
+    rent_max = fields.get("rent_max") or fields.get("租金") or ""
+    if deal_type == "rent" and not rent_max:
+        rent_max = budget
+
+    buyer = {
+        "id": f"free_search_{deal_type}_" + hashlib.sha1((deal_type + "\n" + all_text).encode("utf-8")).hexdigest()[:16],
+        "name": "租賃條件搜尋" if deal_type == "rent" else "買賣條件搜尋",
+        "phone": "",
+        "intent_type": "rent" if deal_type == "rent" else "buy",
+        "budget_max": "" if deal_type == "rent" else budget,
+        "rent_max": rent_max if deal_type == "rent" else "",
+        "preferred_areas": fields.get("preferred_areas") or fields.get("區域") or "",
+        "property_type": fields.get("property_type") or fields.get("產品類型") or fields.get("類型") or "",
+        "room_range": fields.get("room_range") or fields.get("房數") or "",
+        "car_need": fields.get("car_need") or fields.get("車位") or "",
+        "requirement_must": fields.get("必要條件") or fields.get("must_have") or "",
+        "requirement_nice": fields.get("加分條件") or fields.get("nice_to_have") or "",
+        "note": all_text,
+        "source": "LINE條件搜尋",
+        "visibility": "public",
+    }
+    top_n = parse_int_limit(fields.get("limit") or fields.get("筆數") or 5, default=5, max_value=10) if "parse_int_limit" in globals() else 5
+    return buyer, all_text, top_n
+
+
+try:
+    _process_line_recommend_properties_event_before_ai_v4 = process_line_recommend_properties_event
+
+    def process_line_recommend_properties_event(event):
+        msg = (event or {}).get("message") or {}
+        text = (msg.get("text") or "").strip()
+        first = text.splitlines()[0].strip().replace(" ", "") if text else ""
+        if first not in ("#推薦物件", "#AI推薦物件", "#物件推薦"):
+            return {"handled": False}
+        ok, reason = _line_source_ai_recommend_allowed(event)
+        if not ok:
+            return {"handled": True, "ok": False, "reply_text": reason}
+        return _process_line_recommend_properties_event_before_ai_v4(event)
+
+    print("✅ AI推薦 V4：#推薦物件 已套用群組/個人權限")
+except Exception as e:
+    print("⚠️ AI推薦 V4 #推薦物件 權限 patch 失敗：", e)
+
+
+try:
+    _process_line_free_property_search_event_before_ai_v4 = process_line_free_property_search_event
+except Exception:
+    _process_line_free_property_search_event_before_ai_v4 = None
+
+
+def process_line_free_property_search_event(event):
+    msg = (event or {}).get("message") or {}
+    if msg.get("type") != "text":
+        return {"handled": False}
+
+    parsed = _parse_ai_free_property_search_text(msg.get("text") or "")
+    if not parsed:
+        return {"handled": False}
+
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return {"handled": True, "ok": False, "reply_text": parsed.get("error")}
+
+    ok, reason = _line_source_ai_recommend_allowed(event)
+    if not ok:
+        return {"handled": True, "ok": False, "reply_text": reason}
+
+    if not _ai_free_search_feature_enabled():
+        return {"handled": True, "ok": False, "reply_text": "AI條件找物件功能目前尚未啟用，請到設定中心開啟。"}
+
+    buyer, extra_text, top_n = parsed
+    cached = _get_ai_recommend_cache(buyer, top_n=top_n, extra_text=extra_text) if "_get_ai_recommend_cache" in globals() else None
+    if cached:
+        result = {"parsed_need": cached.get("parsed_need") or {}, "recommendations": cached.get("recommendations") or [], "cache_hit": True}
+        flex = build_property_recommend_flex(buyer, result.get("recommendations") or [], parsed_need=result.get("parsed_need") or {})
+        return {"handled": True, "ok": True, "reply_text": "條件搜尋推薦物件", "reply_flex": flex, "parsed_tag": "找物件"}
+
+    target_id = _line_event_target_id(event) if "_line_event_target_id" in globals() else ""
+    if AI_RECOMMEND_BACKGROUND_ENABLED and "_start_ai_recommend_background_job" in globals():
+        started = _start_ai_recommend_background_job(buyer, top_n=top_n, extra_text=extra_text, target_id=target_id)
+        if started:
+            return {"handled": True, "ok": True, "reply_text": "已收到，正在依照你輸入的買賣/租賃條件 AI 搜尋公司物件。完成後會自動把推薦卡片傳回來。", "parsed_tag": "找物件"}
+
+    try:
+        result = recommend_properties_for_buyer_data(buyer, top_n=top_n, extra_text=extra_text, force_refresh=False)
+        flex = build_property_recommend_flex(buyer, result.get("recommendations") or [], parsed_need=result.get("parsed_need") or {})
+        return {"handled": True, "ok": True, "reply_text": "條件搜尋推薦物件", "reply_flex": flex, "parsed_tag": "找物件"}
+    except Exception as e:
+        return {"handled": True, "ok": False, "reply_text": f"AI找物件失敗：{e}"}
+
+
+try:
+    # 再包一次 process_line_message_event，確保 V4 的解析與權限最後生效。
+    _process_line_message_event_before_ai_v4 = process_line_message_event
+
+    def process_line_message_event(event):
+        msg = (event or {}).get("message") or {}
+        if msg.get("type") == "text":
+            text = (msg.get("text") or "").strip()
+            first = text.splitlines()[0].strip().replace(" ", "") if text else ""
+            if first.startswith(("#推薦物件", "#AI推薦物件", "#物件推薦")):
+                rec_result = process_line_recommend_properties_event(event)
+                if rec_result.get("handled"):
+                    return rec_result
+            free_result = process_line_free_property_search_event(event)
+            if free_result.get("handled"):
+                return free_result
+        return _process_line_message_event_before_ai_v4(event)
+
+    print("✅ AI推薦 V4：LINE 訊息處理已套用最後版權限與買賣/租賃判斷")
+except Exception as e:
+    print("⚠️ AI推薦 V4 訊息處理 patch 失敗：", e)
+
+
+try:
+    _process_line_postback_event_before_ai_v4 = process_line_postback_event
+
+    def process_line_postback_event(event):
+        try:
+            data = ((event or {}).get("postback") or {}).get("data", "") or ""
+            if "action=ai_recommend_properties" in data:
+                ok, reason = _line_source_ai_recommend_allowed(event)
+                if not ok:
+                    return {"handled": True, "ok": False, "reply_text": reason}
+        except Exception:
+            pass
+        return _process_line_postback_event_before_ai_v4(event)
+
+    print("✅ AI推薦 V4：推薦物件卡片按鈕已套用群組/個人權限")
+except Exception as e:
+    print("⚠️ AI推薦 V4 postback 處理 patch 失敗：", e)
+
+
+print("✅ AI推薦 V4 已載入：AI推薦依群組/個人權限控管，#找物件 需明確指定買賣或租賃")
+# =============================================================================
+# AI推薦 V4 End
+# =============================================================================
