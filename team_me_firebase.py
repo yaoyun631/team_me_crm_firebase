@@ -22417,3 +22417,72 @@ if __name__ == "__main__":
     print("✅ 可用 /debug/routes 檢查目前所有 route")
     app.run(debug=True)
 
+
+
+# =============================================================================
+# LINE URI 長度修正 Patch
+# - LINE Flex URI action 的 uri 最長 1000 字元。
+# - 原本「加入行事曆」把 note / location 等長內容塞進 query string，
+#   委託或客需備註很長時會導致傳送群組失敗：size must be between 0 and 1000。
+# - 這裡覆寫 _record_calendar_url：只帶必要參數，長文字截短，避免超過 LINE 限制。
+# =============================================================================
+
+def _crm_short_text_for_uri(value, max_len=80):
+    value = str(value or '').replace('\r', ' ').replace('\n', ' ').strip()
+    value = re.sub(r'\s+', ' ', value)
+    return value[:max_len]
+
+
+def _record_calendar_url(record_type: str, record_id: str, data: dict):
+    """產生 LINE Flex 可用的短網址，避免 URI 超過 1000 字元。"""
+    record_type = (record_type or '').strip()
+    record_id = (record_id or '').strip()
+    data = data or {}
+
+    name = data.get('name') or data.get('customer_name') or ''
+    phone = data.get('phone') or ''
+
+    if record_type == 'buyer':
+        title = f"{name} 客需追蹤".strip() or '客需追蹤'
+        category = '回電'
+        location = data.get('preferred_areas') or ''
+    elif record_type == 'seller':
+        title = f"{name} 委託追蹤".strip() or '委託追蹤'
+        category = '回電'
+        location = data.get('address') or ''
+    elif record_type == 'development':
+        title = f"{name or data.get('address') or '開發'} 開發追蹤".strip()
+        category = '開發'
+        location = data.get('address') or data.get('registered_address') or ''
+    else:
+        title = 'CRM 追蹤'
+        category = '回電'
+        location = ''
+
+    # note 容易非常長，是造成 LINE 傳送失敗的主因。
+    # 行事曆表單可用 related_type / related_id 回到原資料查看完整內容，因此這裡不塞完整 note。
+    short_note = f"來源：{record_type}｜ID：{record_id}"
+
+    params = {
+        'related_type': record_type,
+        'related_id': record_id,
+        'title': _crm_short_text_for_uri(title, 50),
+        'category': category,
+        'customer_name': _crm_short_text_for_uri(name, 30),
+        'phone': re.sub(r'[^0-9+]', '', str(phone or ''))[:20],
+        'location': _crm_short_text_for_uri(location, 60),
+        'note': _crm_short_text_for_uri(short_note, 80),
+        'visibility': data.get('visibility') or 'public',
+        'owner_line_user_id': _crm_short_text_for_uri(data.get('owner_line_user_id') or '', 80),
+    }
+    url = _crm_public_url_for('/calendar/new', **{k: v for k, v in params.items() if v})
+
+    # 最後防呆：若 APP_BASE_URL 很長或特殊資料導致仍超過，降級到最短網址。
+    if len(url) > 950:
+        url = _crm_public_url_for('/calendar/new', related_type=record_type, related_id=record_id)
+    return url
+
+print('✅ LINE URI 長度修正已載入：加入行事曆按鈕不再塞入超長備註')
+# =============================================================================
+# LINE URI 長度修正 Patch End
+# =============================================================================
