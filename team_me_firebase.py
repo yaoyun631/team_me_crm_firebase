@@ -22486,3 +22486,636 @@ print('✅ LINE URI 長度修正已載入：加入行事曆按鈕不再塞入超
 # =============================================================================
 # LINE URI 長度修正 Patch End
 # =============================================================================
+
+# =============================================================================
+# 委託：案件輸入表 + AI 強銷文案 Patch v20260624_CASE_FORM_AI
+# - 委託詳細頁可進入「案件表 / AI強銷」
+# - 可填屋主資料、坪數資料、帶看方式、備註與原始群組文案
+# - Gemini 生成：強銷標題、五點特色、公司群組文案、刊登描述
+# - 一鍵產生 A4 可列印 PDF 案件輸入表
+# - LINE 指令：#補委託資料 / #生成強銷 / #生成案件表
+# =============================================================================
+
+CASE_DETAIL_FIELD_KEYS = [
+    "property_title", "community_name", "case_address", "case_price", "layout",
+    "total_ping", "main_ping", "attached_ping", "public_ping", "land_ping", "parking_ping",
+    "floor", "floor_total", "building_age", "facing", "showing_method", "case_note",
+    "life_note", "property_highlight_note", "target_customer_note", "raw_group_text", "source_url",
+    "ai_sales_title", "ai_selling_points", "ai_group_copy", "ai_listing_description", "ai_feature_note",
+]
+
+CASE_BASIC_LABELS = {
+    "property_title": "物件標題",
+    "community_name": "社區名稱",
+    "case_address": "完整地址",
+    "case_price": "開價/售價",
+    "layout": "格局",
+    "total_ping": "總建坪",
+    "main_ping": "主建坪",
+    "attached_ping": "附屬坪",
+    "public_ping": "公設坪",
+    "land_ping": "地坪",
+    "parking_ping": "車位坪",
+    "floor": "所在樓層",
+    "floor_total": "樓高/總樓層",
+    "building_age": "屋齡",
+    "facing": "朝向/座向",
+    "showing_method": "帶看方式",
+    "case_note": "備註",
+    "life_note": "生活機能補充",
+    "property_highlight_note": "物件亮點補充",
+    "target_customer_note": "適合客群",
+    "source_url": "參考網址",
+}
+
+
+def _case_clean_text(value, max_len=None):
+    text = str(value or "").replace("\r", "").strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    if max_len and len(text) > max_len:
+        return text[:max_len - 1] + "…"
+    return text
+
+
+def _case_normalize_fullwidth(text):
+    text = str(text or "")
+    table = str.maketrans("０１２３４５６７８９：，．／－（）", "0123456789:,./-()")
+    return text.translate(table)
+
+
+def _case_first_match(text, patterns, default=""):
+    text = _case_normalize_fullwidth(text)
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I | re.M)
+        if m:
+            val = (m.group(1) or "").strip()
+            val = re.split(r"\n|_{3,}|-{3,}|—{3,}", val)[0].strip()
+            return val
+    return default
+
+
+def _case_parse_raw_listing_text(raw_text: str):
+    """從公司群組貼文 / 補充資料中先用規則拆欄位，AI 生成前可先儲存。"""
+    raw = str(raw_text or "").strip()
+    text = _case_normalize_fullwidth(raw)
+    data = {"raw_group_text": raw}
+    data["case_address"] = _case_first_match(text, [r"(?:地址|物件地址)\s*[:：]\s*(.+)"])
+    data["case_price"] = _case_first_match(text, [r"(?:開價|售價|總價|價格)\s*[:：]\s*(.+)"])
+    data["layout"] = _case_first_match(text, [r"(?:格局|房廳衛)\s*[:：]\s*(.+)"])
+    data["total_ping"] = _case_first_match(text, [r"(?:總建坪|總坪|建坪|建物面積)\s*[:：]\s*(.+)"])
+    data["main_ping"] = _case_first_match(text, [r"(?:主建坪|主建物|主建)\s*[:：]\s*(.+)"])
+    data["attached_ping"] = _case_first_match(text, [r"(?:附屬坪|附屬)\s*[:：]\s*(.*)"])
+    data["public_ping"] = _case_first_match(text, [r"(?:公設坪|公設)\s*[:：]\s*(.*)"])
+    data["land_ping"] = _case_first_match(text, [r"(?:土地坪|地坪|土地面積)\s*[:：]\s*(.+)"])
+    data["parking_ping"] = _case_first_match(text, [r"(?:車位坪|車位)\s*[:：]\s*(.+)"])
+    data["floor_total"] = _case_first_match(text, [r"(?:樓高|總樓層)\s*[:：]\s*(.+)"])
+    data["floor"] = _case_first_match(text, [r"(?:樓層|所在樓層)\s*[:：]\s*(.+)"])
+    data["building_age"] = _case_first_match(text, [r"(?:屋齡)\s*[:：]\s*(.+)"])
+    data["facing"] = _case_first_match(text, [r"(?:朝向|座向)\s*[:：]\s*(.*)"])
+    data["showing_method"] = _case_first_match(text, [r"(?:帶看方式|看屋方式)\s*[:：]\s*(.+)"])
+    data["case_note"] = _case_first_match(text, [r"(?:備註|特色備註)\s*[:：]\s*(.*)"])
+    url_match = re.search(r"https?://[^\s]+", raw)
+    if url_match:
+        data["source_url"] = url_match.group(0).strip()
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    candidates = []
+    for ln in lines[:8]:
+        if re.search(r"[:：]", ln):
+            continue
+        if re.fullmatch(r"[_\-—=\s]+", ln):
+            continue
+        if re.search(r"新接|再麻煩|學長|學姐|謝謝|其餘資料後補", ln):
+            continue
+        candidates.append(ln)
+    if candidates:
+        data["property_title"] = candidates[0][:80]
+
+    bullet_lines = []
+    for ln in lines:
+        if re.match(r"^\d+[\.、．)]", _case_normalize_fullwidth(ln)):
+            bullet_lines.append(re.sub(r"^\d+[\.、．)]\s*", "", ln).strip())
+    if bullet_lines:
+        data["property_highlight_note"] = "\n".join(bullet_lines[:8])
+
+    return {k: v for k, v in data.items() if str(v or "").strip()}
+
+
+def _case_merge_seller_and_case_data(seller: dict, incoming=None):
+    incoming = incoming or {}
+    data = {}
+    data["property_title"] = seller.get("property_title") or seller.get("ai_sales_title") or ""
+    data["community_name"] = seller.get("community_name") or ""
+    data["case_address"] = seller.get("case_address") or seller.get("address") or ""
+    data["case_price"] = seller.get("case_price") or seller.get("expected_price") or ""
+    data["layout"] = seller.get("layout") or ""
+    data["total_ping"] = seller.get("total_ping") or seller.get("building_area") or ""
+    data["main_ping"] = seller.get("main_ping") or ""
+    data["attached_ping"] = seller.get("attached_ping") or ""
+    data["public_ping"] = seller.get("public_ping") or ""
+    data["land_ping"] = seller.get("land_ping") or ""
+    data["parking_ping"] = seller.get("parking_ping") or ""
+    data["floor"] = seller.get("floor") or ""
+    data["floor_total"] = seller.get("floor_total") or seller.get("total_floors") or ""
+    data["building_age"] = seller.get("building_age") or seller.get("age") or ""
+    data["facing"] = seller.get("facing") or ""
+    data["showing_method"] = seller.get("showing_method") or ""
+    data["case_note"] = seller.get("case_note") or seller.get("note") or ""
+    data["life_note"] = seller.get("life_note") or ""
+    data["property_highlight_note"] = seller.get("property_highlight_note") or ""
+    data["target_customer_note"] = seller.get("target_customer_note") or ""
+    data["raw_group_text"] = seller.get("raw_group_text") or ""
+    data["source_url"] = seller.get("source_url") or ""
+    data["ai_sales_title"] = seller.get("ai_sales_title") or ""
+    data["ai_selling_points"] = seller.get("ai_selling_points") or []
+    data["ai_group_copy"] = seller.get("ai_group_copy") or ""
+    data["ai_listing_description"] = seller.get("ai_listing_description") or ""
+    data["ai_feature_note"] = seller.get("ai_feature_note") or ""
+    for k, v in (incoming or {}).items():
+        if k in CASE_DETAIL_FIELD_KEYS and str(v or "").strip():
+            data[k] = v
+    return data
+
+
+def _case_seller_payload_from_form(form):
+    payload = {}
+    for key in CASE_DETAIL_FIELD_KEYS:
+        if key == "ai_selling_points":
+            continue
+        val = form.get(key, "") if hasattr(form, "get") else ""
+        if val is not None:
+            payload[key] = _case_clean_text(val)
+    return payload
+
+
+def _case_format_seller_context(seller: dict, case_data: dict):
+    lines = []
+    base = {
+        "屋主姓名": seller.get("name"),
+        "電話": seller.get("phone"),
+        "委託類型": seller.get("deal_type"),
+        "產品類型": seller.get("property_type"),
+        "開價": seller.get("expected_price"),
+        "底價": seller.get("min_price"),
+        "委託到期日": seller.get("contract_end_date"),
+        "內部備註": seller.get("note"),
+    }
+    for label, value in base.items():
+        if value:
+            lines.append(f"{label}：{value}")
+    for key, label in CASE_BASIC_LABELS.items():
+        value = case_data.get(key)
+        if value:
+            lines.append(f"{label}：{value}")
+    if case_data.get("raw_group_text"):
+        lines.append("原始群組資料：")
+        lines.append(_case_clean_text(case_data.get("raw_group_text"), 2500))
+    return "\n".join(lines)
+
+
+def _case_ai_generate_sales_copy(seller: dict, case_data: dict):
+    context = _case_format_seller_context(seller, case_data)
+    prompt = f"""
+你是台中海線房仲的委託物件強銷文案助手。
+請根據資料產生 JSON，不要輸出 JSON 以外的文字。
+
+物件資料：
+{context}
+
+請輸出格式：
+{{
+  "ai_sales_title": "最多 24 字的強銷標題",
+  "ai_selling_points": ["五點特色，每點 18 到 45 字，共 5 點"],
+  "ai_group_copy": "公司 LINE 群組可直接貼上的完整文案，包含標題、基本資料、五大強銷亮點與帶看方式",
+  "ai_listing_description": "可放到樂屋/591的較完整描述，約 120-220 字",
+  "ai_feature_note": "案件輸入表特色備註，約 50-100 字"
+}}
+
+生成規則：
+1. 五點特色必須至少涵蓋：生活機能、物件本身亮點、物件優勢判斷、適合客群、成交切入點。
+2. 不要把總坪、主建、地坪、附屬坪數當成五點特色的主要賣點；坪數只放在基本資料區。
+3. 不要亂編未提供或未查證的地標、學校、商圈。如果資料只有地址，請用保守說法如「在地生活圈」「主要道路動線」「日常生活需求」。
+4. 語氣要像房仲公司群組可直接轉傳，清楚、有賣點、不浮誇。
+5. 若屋齡較高，不要用負面字眼；可說「適合依買方喜好重新整理」。
+6. 如果帶看方式有提供，群組文案要保留。
+""".strip()
+    try:
+        if "_gemini_generate_json" not in globals():
+            raise RuntimeError("Gemini helper 不存在")
+        data = _gemini_generate_json(prompt)
+        if not isinstance(data, dict):
+            raise RuntimeError("Gemini 回傳格式不是 JSON object")
+        points = data.get("ai_selling_points") or data.get("selling_points") or []
+        if isinstance(points, str):
+            points = [p.strip() for p in re.split(r"\n+", points) if p.strip()]
+        points = [str(p).strip() for p in points if str(p).strip()][:5]
+        if len(points) < 5:
+            raise RuntimeError("Gemini 回傳特色不足 5 點")
+        data["ai_selling_points"] = points
+        data["ai_sales_title"] = _case_clean_text(data.get("ai_sales_title") or data.get("title") or "", 40)
+        data["ai_group_copy"] = _case_clean_text(data.get("ai_group_copy") or "", 4000)
+        data["ai_listing_description"] = _case_clean_text(data.get("ai_listing_description") or "", 800)
+        data["ai_feature_note"] = _case_clean_text(data.get("ai_feature_note") or "", 300)
+        return data
+    except Exception as e:
+        print("⚠️ Gemini 生成強銷文案失敗，改用規則版：", e)
+        return _case_rule_generate_sales_copy(seller, case_data)
+
+
+def _case_extract_district(address):
+    m = re.search(r"([\u4e00-\u9fff]{2,4}區)", str(address or ""))
+    return m.group(1) if m else "在地"
+
+
+def _case_rule_generate_sales_copy(seller: dict, case_data: dict):
+    address = case_data.get("case_address") or seller.get("address") or ""
+    district = _case_extract_district(address)
+    ptype = seller.get("property_type") or case_data.get("property_type") or "物件"
+    price = case_data.get("case_price") or seller.get("expected_price") or ""
+    layout = case_data.get("layout") or "多房格局"
+    showing = case_data.get("showing_method") or "請提前預約"
+    note = case_data.get("property_highlight_note") or case_data.get("case_note") or seller.get("note") or ""
+
+    title_core = case_data.get("property_title") or f"{district}｜低總價{layout}{ptype}"
+    title = _case_clean_text(title_core, 30) or f"{district}優質委託物件"
+    points = [
+        f"位於{district}生活圈，適合想找在地生活機能與通勤動線的買方。",
+        f"{layout}空間好運用，適合家庭成員多、需要書房或工作室的客群。",
+        f"{ptype}使用彈性高，生活規劃自由度比一般大樓更有空間。",
+        f"{price}的總價帶好切入，適合首購、換屋或在地自住客評估。" if price else "總價帶具討論空間，適合有明確自住需求的客戶評估。",
+        "屋況可依買方喜好重新整理，適合想打造自己風格住家的客戶。",
+    ]
+    if "全新" in note or "新" in note:
+        points[4] = "屋況條件佳，買方後續整理成本較低，入住規劃更省心。"
+    if "朝南" in note or "朝南" in str(case_data.get("facing")):
+        points[1] = "朝南條件加分，採光與居住舒適度更容易吸引自住型買方。"
+    if "學" in note or "國小" in note or "國中" in note:
+        points[0] = "鄰近學區與在地生活圈，對有小孩接送需求的家庭更有吸引力。"
+
+    basic_lines = [
+        title, "",
+        f"地址：{address or '-'}",
+        "——————————————",
+        f"開價：{price or seller.get('expected_price') or '-'}",
+        f"格局：{layout or '-'}",
+        f"總建坪：{case_data.get('total_ping') or '-'}",
+        f"主建坪：{case_data.get('main_ping') or '-'}",
+        f"附屬：{case_data.get('attached_ping') or '-'}",
+        f"地坪：{case_data.get('land_ping') or '-'}",
+        f"樓高：{case_data.get('floor_total') or '-'}",
+        f"屋齡：{case_data.get('building_age') or '-'}",
+        f"朝向：{case_data.get('facing') or '-'}",
+        f"帶看方式：{showing or '-'}",
+        "——————————————",
+        "五大強銷亮點：",
+    ]
+    for i, p in enumerate(points, 1):
+        basic_lines.append(f"{i}. {p}")
+    basic_lines.extend(["", f"帶看方式：{showing or '請提前預約'}", "再麻煩學長姐多多介紹，謝謝！"])
+    return {
+        "ai_sales_title": title,
+        "ai_selling_points": points,
+        "ai_group_copy": "\n".join(basic_lines),
+        "ai_listing_description": " ".join(points),
+        "ai_feature_note": "；".join(points[:3]),
+    }
+
+
+def _case_apply_ai_to_seller(seller_id: str, case_payload: dict, ai_payload: dict = None):
+    updates = dict(case_payload or {})
+    ai_payload = ai_payload or {}
+    for k in ["ai_sales_title", "ai_group_copy", "ai_listing_description", "ai_feature_note"]:
+        if k in ai_payload:
+            updates[k] = ai_payload.get(k)
+    if ai_payload.get("ai_selling_points"):
+        updates["ai_selling_points"] = ai_payload.get("ai_selling_points")[:5]
+    updates["case_form_updated_at"] = now_taipei().isoformat()
+    updates["updated_at"] = now_taipei().isoformat()
+    updates["updated_by_id"] = session.get("user_id") or "line_bot"
+    updates["updated_by_name"] = session.get("user_name") or "LINE Bot"
+    db.collection("sellers").document(seller_id).set(updates, merge=True)
+    return updates
+
+
+def _case_missing_fields(case_data: dict):
+    required = ["case_address", "case_price", "layout", "total_ping", "main_ping", "land_ping", "floor_total", "building_age", "showing_method"]
+    return [CASE_BASIC_LABELS.get(k, k) for k in required if not str(case_data.get(k) or "").strip()]
+
+
+CASE_TOOLS_HTML = r'''
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h3 class="mb-1">案件輸入表 / AI強銷文案</h3>
+    <div class="text-muted small">委託：{{ seller.name or '-' }}｜{{ seller.phone or '-' }}</div>
+  </div>
+  <div>
+    <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載案件輸入表 PDF</a>
+    <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
+  </div>
+</div>
+
+{% if missing_fields %}
+<div class="alert alert-warning small">
+  <strong>資料尚可補強：</strong>{{ missing_fields|join('、') }}。沒有資料的欄位 PDF 會先留白或顯示待確認。
+</div>
+{% endif %}
+
+<div class="row g-4">
+  <div class="col-lg-7">
+    <form method="post" class="card">
+      <div class="card-header fw-bold">案件資料</div>
+      <div class="card-body">
+        <div class="mb-3">
+          <label class="form-label">貼上公司群組原始文案 / 補充資料</label>
+          <textarea name="raw_group_text" class="form-control" rows="8" placeholder="可直接貼公司群組整段物件資料，系統會先自動拆欄位，再交給 AI 生成標題與五點強銷。">{{ case_data.raw_group_text or '' }}</textarea>
+          <div class="form-text">送出時會自動解析：地址、售價、格局、坪數、屋齡、帶看方式、網址與條列特色。</div>
+        </div>
+
+        <div class="row g-2">
+          {% for key, label in field_labels.items() %}
+            {% if key not in ['life_note','property_highlight_note','target_customer_note','source_url'] %}
+              <div class="col-md-6">
+                <label class="form-label">{{ label }}</label>
+                <input type="text" name="{{ key }}" class="form-control" value="{{ case_data.get(key, '') }}">
+              </div>
+            {% endif %}
+          {% endfor %}
+        </div>
+
+        <hr>
+        <div class="row g-2">
+          <div class="col-md-4">
+            <label class="form-label">生活機能補充</label>
+            <textarea name="life_note" class="form-control" rows="4" placeholder="例：中山路生活圈、近市場、近學校、近主要道路">{{ case_data.life_note or '' }}</textarea>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">物件亮點補充</label>
+            <textarea name="property_highlight_note" class="form-control" rows="4" placeholder="例：朝南、間間套房、全新、屋主自住、可整理">{{ case_data.property_highlight_note or '' }}</textarea>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">適合客群</label>
+            <textarea name="target_customer_note" class="form-control" rows="4" placeholder="例：在地換屋、大家庭、首購、自住整理型客戶">{{ case_data.target_customer_note or '' }}</textarea>
+          </div>
+          <div class="col-12">
+            <label class="form-label">參考網址</label>
+            <input type="text" name="source_url" class="form-control" value="{{ case_data.source_url or '' }}">
+          </div>
+        </div>
+      </div>
+      <div class="card-footer d-flex gap-2 flex-wrap">
+        <button class="btn btn-primary" name="action" value="generate_ai" type="submit">AI整理並生成強銷文案</button>
+        <button class="btn btn-outline-secondary" name="action" value="save_only" type="submit">只儲存資料</button>
+        <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載案件輸入表 PDF</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="col-lg-5">
+    <div class="card mb-3">
+      <div class="card-header fw-bold">AI 強銷標題與五點特色</div>
+      <div class="card-body">
+        <label class="form-label">強銷標題</label>
+        <input class="form-control mb-3" readonly value="{{ case_data.ai_sales_title or '' }}">
+        <label class="form-label">五點特色</label>
+        {% if case_data.ai_selling_points %}
+          <ol class="mb-0">
+            {% for p in case_data.ai_selling_points %}
+              <li class="mb-2">{{ p }}</li>
+            {% endfor %}
+          </ol>
+        {% else %}
+          <div class="text-muted">尚未生成。左側填資料後按「AI整理並生成強銷文案」。</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header fw-bold">公司群組文案</div>
+      <div class="card-body">
+        <textarea id="aiGroupCopy" class="form-control" rows="16" readonly>{{ case_data.ai_group_copy or '' }}</textarea>
+        <button class="btn btn-sm btn-outline-secondary mt-2" onclick="navigator.clipboard.writeText(document.getElementById('aiGroupCopy').value); alert('已複製群組文案');">複製群組文案</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header fw-bold">案件輸入表特色備註</div>
+      <div class="card-body">
+        <textarea class="form-control" rows="5" readonly>{{ case_data.ai_feature_note or '' }}</textarea>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+'''
+
+
+@app.route("/sellers/<seller_id>/case-tools", methods=["GET", "POST"])
+@login_required
+def seller_case_tools(seller_id):
+    doc_ref = db.collection("sellers").document(seller_id)
+    snap = doc_ref.get()
+    if not snap.exists:
+        flash("找不到這筆委託", "danger")
+        return redirect(url_for("sellers"))
+    seller = doc_to_dict(snap)
+    if request.method == "POST":
+        form_payload = _case_seller_payload_from_form(request.form)
+        raw_text = form_payload.get("raw_group_text") or ""
+        parsed_payload = _case_parse_raw_listing_text(raw_text) if raw_text else {}
+        merged_payload = dict(parsed_payload)
+        for k, v in form_payload.items():
+            if str(v or "").strip():
+                merged_payload[k] = v
+        case_data = _case_merge_seller_and_case_data(seller, merged_payload)
+        action = request.form.get("action", "save_only")
+        if action == "generate_ai":
+            ai_payload = _case_ai_generate_sales_copy(seller, case_data)
+            _case_apply_ai_to_seller(seller_id, case_data, ai_payload)
+            flash("已整理案件資料，並生成 AI 強銷文案", "success")
+        else:
+            _case_apply_ai_to_seller(seller_id, case_data, {})
+            flash("已儲存案件資料", "success")
+        return redirect(url_for("seller_case_tools", seller_id=seller_id))
+    case_data = _case_merge_seller_and_case_data(seller)
+    missing_fields = _case_missing_fields(case_data)
+    return render_template_string(CASE_TOOLS_HTML, seller=seller, case_data=case_data, field_labels=CASE_BASIC_LABELS, missing_fields=missing_fields)
+
+
+def _case_pdf_value(case_data, key, default=""):
+    value = case_data.get(key)
+    if isinstance(value, list):
+        return "、".join(map(str, value))
+    return str(value or default or "")
+
+
+def _case_generate_pdf_bytes(seller: dict, case_data: dict):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        from reportlab.pdfbase import pdfmetrics
+    except Exception as e:
+        raise RuntimeError("缺少 reportlab，請先安裝：pip install reportlab") from e
+    buffer = BytesIO()
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=10*mm, leftMargin=10*mm, topMargin=10*mm, bottomMargin=10*mm)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="CJKTitle", parent=styles["Title"], fontName="STSong-Light", fontSize=18, leading=22, alignment=1))
+    styles.add(ParagraphStyle(name="CJK", parent=styles["Normal"], fontName="STSong-Light", fontSize=9, leading=13))
+    styles.add(ParagraphStyle(name="CJKSmall", parent=styles["Normal"], fontName="STSong-Light", fontSize=8, leading=11))
+    def P(text, small=False):
+        return Paragraph(str(text or "").replace("\n", "<br/>"), styles["CJKSmall" if small else "CJK"])
+    story = [Paragraph("太平洋房屋 幸福房仲團隊 - 案件輸入表", styles["CJKTitle"]), Spacer(1, 5*mm)]
+    top_rows = [
+        [P("委託類別"), P("☑ 出售  □ 出租" if (seller.get("deal_type") or "sale") != "rent" else "□ 出售  ☑ 出租"), P("案件編號"), P(seller.get("id") or "")],
+        [P("屋主姓名"), P(seller.get("name") or ""), P("電話"), P(seller.get("phone") or "")],
+        [P("委託到期日"), P(seller.get("contract_end_date") or ""), P("帶看方式"), P(_case_pdf_value(case_data, "showing_method"))],
+    ]
+    table_style = TableStyle([("FONTNAME", (0,0), (-1,-1), "STSong-Light"), ("FONTSIZE", (0,0), (-1,-1), 9), ("GRID", (0,0), (-1,-1), 0.4, colors.black), ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("BACKGROUND", (0,0), (0,-1), colors.whitesmoke), ("BACKGROUND", (2,0), (2,-1), colors.whitesmoke)])
+    t = Table(top_rows, colWidths=[28*mm, 67*mm, 28*mm, 67*mm]); t.setStyle(table_style); story.append(t); story.append(Spacer(1,4*mm))
+    basic_rows = [
+        [P("物件名稱"), P(_case_pdf_value(case_data, "property_title") or _case_pdf_value(case_data, "ai_sales_title")), P("社區名稱"), P(_case_pdf_value(case_data, "community_name"))],
+        [P("物件地址"), P(_case_pdf_value(case_data, "case_address") or seller.get("address") or ""), P("產品類型"), P(seller.get("property_type") or "")],
+        [P("開價/售價"), P(_case_pdf_value(case_data, "case_price") or seller.get("expected_price") or ""), P("底價"), P(seller.get("min_price") or "")],
+        [P("格局"), P(_case_pdf_value(case_data, "layout")), P("樓層 / 樓高"), P(f"{_case_pdf_value(case_data, 'floor') or '-'} / {_case_pdf_value(case_data, 'floor_total') or '-'}")],
+        [P("總建坪"), P(_case_pdf_value(case_data, "total_ping")), P("主建坪"), P(_case_pdf_value(case_data, "main_ping"))],
+        [P("附屬坪"), P(_case_pdf_value(case_data, "attached_ping")), P("公設坪"), P(_case_pdf_value(case_data, "public_ping"))],
+        [P("地坪"), P(_case_pdf_value(case_data, "land_ping")), P("車位坪"), P(_case_pdf_value(case_data, "parking_ping"))],
+        [P("屋齡"), P(_case_pdf_value(case_data, "building_age")), P("朝向"), P(_case_pdf_value(case_data, "facing"))],
+    ]
+    t = Table(basic_rows, colWidths=[28*mm, 67*mm, 28*mm, 67*mm]); t.setStyle(table_style); story.append(Paragraph("1. 基本資料", styles["CJK"])); story.append(t); story.append(Spacer(1,4*mm))
+    points = case_data.get("ai_selling_points") or []
+    points_text = "<br/>".join([f"{i}. {p}" for i, p in enumerate(points[:5], 1)]) if points else (_case_pdf_value(case_data, "ai_feature_note") or _case_pdf_value(case_data, "case_note"))
+    desc_rows = [[P("特色備註"), P(points_text or "")], [P("生活機能補充"), P(_case_pdf_value(case_data, "life_note"))], [P("物件亮點補充"), P(_case_pdf_value(case_data, "property_highlight_note"))], [P("適合客群"), P(_case_pdf_value(case_data, "target_customer_note"))], [P("產權特別注意事項"), P("")], [P("合約日 / 租約日"), P("合約日：______年____月____日  至  ______年____月____日")]]
+    t = Table(desc_rows, colWidths=[38*mm, 152*mm]); t.setStyle(TableStyle([("FONTNAME", (0,0), (-1,-1), "STSong-Light"), ("FONTSIZE", (0,0), (-1,-1), 9), ("GRID", (0,0), (-1,-1), 0.4, colors.black), ("VALIGN", (0,0), (-1,-1), "TOP"), ("BACKGROUND", (0,0), (0,-1), colors.whitesmoke)])); story.append(Paragraph("2. 學區 / 環境 / 特色備註", styles["CJK"])); story.append(t); story.append(Spacer(1,3*mm)); story.append(Paragraph("PS. 未提供或待確認資料請列印後手寫補上。AI 生成內容仍建議人工確認。", styles["CJKSmall"]))
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
+@app.route("/sellers/<seller_id>/case-form.pdf")
+@login_required
+def seller_case_form_pdf(seller_id):
+    snap = db.collection("sellers").document(seller_id).get()
+    if not snap.exists:
+        flash("找不到這筆委託", "danger")
+        return redirect(url_for("sellers"))
+    seller = doc_to_dict(snap)
+    case_data = _case_merge_seller_and_case_data(seller)
+    try:
+        buf = _case_generate_pdf_bytes(seller, case_data)
+    except Exception as e:
+        flash(f"產生 PDF 失敗：{e}", "danger")
+        return redirect(url_for("seller_case_tools", seller_id=seller_id))
+    filename = f"案件輸入表_{seller.get('name') or seller_id}.pdf"
+    return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=filename)
+
+
+def _case_find_seller_for_line(fields, raw_text=""):
+    record_id = fields.get("record_id") or fields.get("seller_id") or fields.get("委託ID") or ""
+    phone = fields.get("phone") or fields.get("電話") or ""
+    name = fields.get("name") or fields.get("姓名") or ""
+    if record_id:
+        doc = db.collection("sellers").document(str(record_id).strip()).get()
+        if doc.exists:
+            return doc
+    if phone:
+        doc = find_customer_record("seller", phone=phone)
+        if doc:
+            return doc
+    if name:
+        doc = find_customer_record("seller", name=name)
+        if doc:
+            return doc
+    parsed = _case_parse_raw_listing_text(raw_text or "")
+    addr = parsed.get("case_address") or ""
+    if addr:
+        key = re.sub(r"\s+", "", addr)[-12:]
+        if key:
+            for d in db.collection("sellers").stream():
+                data = d.to_dict() or {}
+                saddr = re.sub(r"\s+", "", (data.get("address") or data.get("case_address") or ""))
+                if key and key in saddr:
+                    return d
+    return None
+
+
+def _case_parse_simple_fields_from_text(text):
+    fields = {}
+    for line in str(text or "").splitlines():
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", line.strip())
+        if not m:
+            continue
+        key = normalize_line_key(m.group(1)) if "normalize_line_key" in globals() else m.group(1).strip()
+        val = m.group(2).strip()
+        fields[key] = val
+        fields[m.group(1).strip()] = val
+    return fields
+
+
+def _case_process_line_commands(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+    text = (message.get("text") or "").strip()
+    if not text.startswith(("#補委託資料", "#生成強銷", "#生成群組文案", "#生成案件表")):
+        return {"handled": False}
+    fields = _case_parse_simple_fields_from_text(text)
+    raw_text = re.sub(r"^#(補委託資料|生成強銷|生成群組文案|生成案件表).*\n?", "", text, count=1).strip()
+    seller_doc = _case_find_seller_for_line(fields, raw_text)
+    if text.startswith("#生成強銷") or text.startswith("#生成群組文案"):
+        parsed_payload = _case_parse_raw_listing_text(raw_text)
+        if seller_doc:
+            seller = doc_to_dict(seller_doc)
+            case_data = _case_merge_seller_and_case_data(seller, parsed_payload)
+            ai_payload = _case_ai_generate_sales_copy(seller, case_data)
+            _case_apply_ai_to_seller(seller_doc.id, case_data, ai_payload)
+            return {"handled": True, "ok": True, "reply_text": (ai_payload.get("ai_group_copy") or "已生成強銷文案。")[:4500], "target_type": "seller", "target_id": seller_doc.id, "customer_name": seller.get("name", ""), "phone": seller.get("phone", ""), "parsed_tag": "生成強銷"}
+        pseudo_seller = {"name": fields.get("name", ""), "phone": fields.get("phone", ""), "property_type": fields.get("property_type", "")}
+        case_data = _case_merge_seller_and_case_data(pseudo_seller, parsed_payload)
+        ai_payload = _case_ai_generate_sales_copy(pseudo_seller, case_data)
+        return {"handled": True, "ok": True, "reply_text": (ai_payload.get("ai_group_copy") or "已生成強銷文案。")[:4500], "parsed_tag": "生成強銷"}
+    if text.startswith("#生成案件表"):
+        if not seller_doc:
+            return {"handled": True, "ok": False, "reply_text": "請提供電話或委託ID，才能產生案件輸入表。"}
+        seller = doc_to_dict(seller_doc)
+        try:
+            url = _crm_public_url_for(f"/sellers/{seller_doc.id}/case-form.pdf") if "_crm_public_url_for" in globals() else url_for("seller_case_form_pdf", seller_id=seller_doc.id, _external=True)
+        except Exception:
+            url = f"/sellers/{seller_doc.id}/case-form.pdf"
+        return {"handled": True, "ok": True, "reply_text": f"案件輸入表下載連結：\n{url}\n若尚未登入後台，請先登入後再下載。", "target_type": "seller", "target_id": seller_doc.id, "customer_name": seller.get("name", ""), "phone": seller.get("phone", ""), "parsed_tag": "生成案件表"}
+    if not seller_doc:
+        return {"handled": True, "ok": False, "reply_text": "未找到唯一委託，請補：電話: 或 委託ID:，再貼上物件資料。"}
+    seller = doc_to_dict(seller_doc)
+    parsed_payload = _case_parse_raw_listing_text(raw_text)
+    case_data = _case_merge_seller_and_case_data(seller, parsed_payload)
+    ai_payload = _case_ai_generate_sales_copy(seller, case_data)
+    _case_apply_ai_to_seller(seller_doc.id, case_data, ai_payload)
+    return {"handled": True, "ok": True, "reply_text": ("已補委託資料並生成強銷文案：\n\n" + (ai_payload.get("ai_group_copy") or ""))[:4500], "target_type": "seller", "target_id": seller_doc.id, "customer_name": seller.get("name", ""), "phone": seller.get("phone", ""), "parsed_tag": "補委託資料"}
+
+
+try:
+    _process_line_message_event_before_case_form_ai = process_line_message_event
+    def process_line_message_event(event):
+        result = _case_process_line_commands(event)
+        if result.get("handled"):
+            return result
+        return _process_line_message_event_before_case_form_ai(event)
+    print("✅ 委託案件輸入表/AI強銷：LINE 指令已啟用 #補委託資料 / #生成強銷 / #生成案件表")
+except Exception as e:
+    print("⚠️ 委託案件輸入表/AI強銷 LINE 指令掛入失敗：", e)
+
+try:
+    app.jinja_env.globals["seller_case_tools_enabled"] = True
+except Exception:
+    pass
+
+print("✅ 委託案件輸入表 / AI 強銷文案已啟用：/sellers/<id>/case-tools")
+# =============================================================================
+# 委託：案件輸入表 + AI 強銷文案 Patch End
+# =============================================================================
