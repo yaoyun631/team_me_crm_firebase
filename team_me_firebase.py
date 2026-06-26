@@ -23058,6 +23058,154 @@ def _case_parse_simple_fields_from_text(text):
     return fields
 
 
+def _case_guess_property_type_from_case_text(case_data, fields=None):
+    """依案名 / 原文 / 地址簡單推測產品類型，避免 #新增委託 模板完全空白。"""
+    fields = fields or {}
+    existing = fields.get("property_type") or fields.get("產品類型") or ""
+    if str(existing or "").strip():
+        return str(existing).strip()
+    blob = " ".join([
+        str(case_data.get("property_title") or ""),
+        str(case_data.get("raw_group_text") or ""),
+        str(case_data.get("case_note") or ""),
+        str(case_data.get("property_highlight_note") or ""),
+    ])
+    mapping = [
+        ("別墅", ["別墅", "美墅", "墅"]),
+        ("透天", ["透天", "透店", "店住"]),
+        ("電梯大樓", ["大樓", "三房平車", "兩房平車", "社區", "高樓"]),
+        ("華廈", ["華廈"]),
+        ("土地", ["土地", "建地", "農地"]),
+        ("店面", ["店面", "店鋪"]),
+        ("廠房", ["廠房", "工業"]),
+        ("公寓", ["公寓"]),
+    ]
+    for label, keys in mapping:
+        if any(k in blob for k in keys):
+            return label
+    return ""
+
+
+def _case_short_line_text(value, max_len=80):
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len-1] + "…"
+
+
+def _case_build_new_seller_fill_text(fields=None, case_data=None):
+    """LINE 卡片的「新增委託」按鈕使用：打開鍵盤並預填 #新增委託 模板。"""
+    fields = fields or {}
+    case_data = case_data or {}
+    address = case_data.get("case_address") or fields.get("address") or fields.get("地址") or ""
+    price = case_data.get("case_price") or fields.get("price") or fields.get("開價") or ""
+    ptype = _case_guess_property_type_from_case_text(case_data, fields)
+    title = case_data.get("property_title") or case_data.get("ai_sales_title") or ""
+    # fillInText 不要太長，避免 LINE postback action 超過限制。
+    lines = [
+        "#新增委託",
+        "姓名:",
+        "電話:",
+        "客戶來源:",
+        "委託類型: 賣",
+        f"地址:{_case_short_line_text(address, 60)}" if address else "地址:",
+        f"產品類型:{_case_short_line_text(ptype, 20)}" if ptype else "產品類型:",
+        f"開價:{_case_short_line_text(price, 24)}" if price else "開價:",
+        "底價:",
+        "委託到期日:",
+        f"備註:{_case_short_line_text(title, 45)}" if title else "備註:",
+    ]
+    fill = "\n".join(lines)
+    return fill[:300]
+
+
+def _case_build_missing_seller_flex(ai_payload=None, case_data=None, fields=None):
+    """已生成 AI 文案但找不到委託資料時，回一張卡片讓使用者一鍵開啟 #新增委託 模板。"""
+    ai_payload = ai_payload or {}
+    case_data = case_data or {}
+    fields = fields or {}
+    title = ai_payload.get("ai_sales_title") or case_data.get("property_title") or "AI強銷文案已生成"
+    address = case_data.get("case_address") or "未填地址"
+    price = case_data.get("case_price") or "未填開價"
+    fill_text = _case_build_new_seller_fill_text(fields, {**case_data, **{"ai_sales_title": ai_payload.get("ai_sales_title", "")}})
+    return {
+        "type": "bubble",
+        "size": "mega",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": "AI文案已生成", "size": "xs", "color": "#C9874A", "weight": "bold"},
+                {"type": "text", "text": _case_short_line_text(title, 52), "size": "lg", "weight": "bold", "wrap": True, "color": "#222222"},
+                {"type": "separator", "margin": "md"},
+                {"type": "box", "layout": "baseline", "spacing": "sm", "margin": "md", "contents": [
+                    {"type": "text", "text": "狀態", "size": "sm", "color": "#999999", "flex": 2},
+                    {"type": "text", "text": "尚未找到對應委託資料", "size": "sm", "color": "#B00020", "wrap": True, "flex": 5},
+                ]},
+                {"type": "box", "layout": "baseline", "spacing": "sm", "contents": [
+                    {"type": "text", "text": "地址", "size": "sm", "color": "#999999", "flex": 2},
+                    {"type": "text", "text": _case_short_line_text(address, 90), "size": "sm", "color": "#333333", "wrap": True, "flex": 5},
+                ]},
+                {"type": "box", "layout": "baseline", "spacing": "sm", "contents": [
+                    {"type": "text", "text": "開價", "size": "sm", "color": "#999999", "flex": 2},
+                    {"type": "text", "text": _case_short_line_text(price, 50), "size": "sm", "color": "#333333", "wrap": True, "flex": 5},
+                ]},
+                {"type": "text", "text": "請先新增委託人資料，之後這份強銷文案與案件資料才會寫入後台。", "size": "sm", "color": "#555555", "wrap": True, "margin": "md"},
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "height": "sm",
+                    "color": "#C9874A",
+                    "action": {
+                        "type": "postback",
+                        "label": "新增委託",
+                        "data": "action=new_seller_from_ai_copy",
+                        "inputOption": "openKeyboard",
+                        "fillInText": fill_text,
+                    },
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "postback",
+                        "label": "補委託資料模板",
+                        "data": "action=case_fill_seller_detail",
+                        "inputOption": "openKeyboard",
+                        "fillInText": "#補委託資料\n電話:\n\n請貼上物件完整資料",
+                    },
+                },
+            ],
+        },
+        "styles": {"footer": {"separator": True}},
+    }
+
+
+def _case_reply_ai_copy_with_new_seller_card(ai_payload, case_data, fields=None):
+    """LINE 回覆：第一則給 AI 文案，第二則給新增委託卡片。"""
+    copy_text = (ai_payload or {}).get("ai_group_copy") or "已生成強銷文案。"
+    flex = _case_build_missing_seller_flex(ai_payload, case_data, fields)
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_messages": [
+            {"type": "text", "text": _case_clean_text(copy_text, 4500)},
+            {"type": "flex", "altText": "AI文案已生成，請新增委託資料", "contents": flex},
+        ],
+        "reply_text": _case_clean_text(copy_text, 4500),
+        "parsed_tag": "生成強銷",
+    }
+
+
 def _case_process_line_commands(event):
     message = event.get("message") or {}
     if message.get("type") != "text":
@@ -23079,7 +23227,8 @@ def _case_process_line_commands(event):
         pseudo_seller = {"name": fields.get("name", ""), "phone": fields.get("phone", ""), "property_type": fields.get("property_type", "")}
         case_data = _case_merge_seller_and_case_data(pseudo_seller, parsed_payload)
         ai_payload = _case_ai_generate_sales_copy(pseudo_seller, case_data)
-        return {"handled": True, "ok": True, "reply_text": (ai_payload.get("ai_group_copy") or "已生成強銷文案。")[:4500], "parsed_tag": "生成強銷"}
+        # 找不到對應委託時，仍先生成文案，並回一張「新增委託」卡片讓使用者直接 key in 屋主資料。
+        return _case_reply_ai_copy_with_new_seller_card(ai_payload, case_data, fields)
     if text.startswith("#生成案件表"):
         if not seller_doc:
             return {"handled": True, "ok": False, "reply_text": "請提供電話或委託ID，才能產生案件輸入表。"}
@@ -23090,7 +23239,14 @@ def _case_process_line_commands(event):
             url = f"/sellers/{seller_doc.id}/case-form.pdf"
         return {"handled": True, "ok": True, "reply_text": f"案件輸入表下載連結：\n{url}\n若尚未登入後台，請先登入後再下載。", "target_type": "seller", "target_id": seller_doc.id, "customer_name": seller.get("name", ""), "phone": seller.get("phone", ""), "parsed_tag": "生成案件表"}
     if not seller_doc:
-        return {"handled": True, "ok": False, "reply_text": "未找到唯一委託，請補：電話: 或 委託ID:，再貼上物件資料。"}
+        parsed_payload = _case_parse_raw_listing_text(raw_text)
+        pseudo_seller = {"name": fields.get("name", ""), "phone": fields.get("phone", ""), "property_type": fields.get("property_type", "")}
+        case_data = _case_merge_seller_and_case_data(pseudo_seller, parsed_payload)
+        ai_payload = _case_ai_generate_sales_copy(pseudo_seller, case_data)
+        # 補資料時若尚未建立委託，先生成文案，再提供新增委託模板。
+        result = _case_reply_ai_copy_with_new_seller_card(ai_payload, case_data, fields)
+        result["parsed_tag"] = "補委託資料"
+        return result
     seller = doc_to_dict(seller_doc)
     parsed_payload = _case_parse_raw_listing_text(raw_text)
     case_data = _case_merge_seller_and_case_data(seller, parsed_payload)
@@ -23106,7 +23262,7 @@ try:
         if result.get("handled"):
             return result
         return _process_line_message_event_before_case_form_ai(event)
-    print("✅ 委託案件輸入表/AI強銷：LINE 指令已啟用 #補委託資料 / #生成強銷 / #生成案件表")
+    print("✅ 委託案件輸入表/AI強銷：LINE 指令已啟用 #補委託資料 / #生成強銷 / #生成案件表（找不到委託時會顯示新增委託卡片）")
 except Exception as e:
     print("⚠️ 委託案件輸入表/AI強銷 LINE 指令掛入失敗：", e)
 
