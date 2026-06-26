@@ -23275,3 +23275,124 @@ print("✅ 委託案件輸入表 / AI 強銷文案已啟用：/sellers/<id>/case
 # =============================================================================
 # 委託：案件輸入表 + AI 強銷文案 Patch End
 # =============================================================================
+
+
+# =============================================================================
+# CASE_FORM_AI V3：修正 LINE 群組「#生成強銷 / #補委託資料 / #生成案件表」被權限閘門判定 unknown
+# 原因：line_access_gate 會先呼叫 detect_line_command_type；如果指令未被辨識，還沒進入
+# _case_process_line_commands 就會回覆「這個群組沒有可辨識的指令」。
+# 這裡把案件表 / AI 強銷指令歸類為 seller 指令，沿用委託權限即可。
+# =============================================================================
+try:
+    CASE_FORM_AI_LINE_COMMANDS = (
+        "補委託資料", "生成強銷", "生成群組文案", "生成案件表",
+        "AI強銷", "AI文案", "案件表", "產生案件表"
+    )
+
+    _detect_line_command_type_before_case_form_ai_v3 = detect_line_command_type
+
+    def detect_line_command_type(text: str, event=None) -> str:
+        raw = (text or "").strip().replace("＃", "#")
+        if raw:
+            first = raw.splitlines()[0].strip().replace(" ", "")
+            first_no_hash = first[1:] if first.startswith("#") else first
+            if first_no_hash in CASE_FORM_AI_LINE_COMMANDS:
+                return "seller"
+        return _detect_line_command_type_before_case_form_ai_v3(text, event=event)
+
+    # 設定中心顯示文字同步補上，實際權限仍走 seller。
+    try:
+        if "LINE_COMMAND_TYPE_OPTIONS" in globals():
+            for i, (key, label) in enumerate(LINE_COMMAND_TYPE_OPTIONS):
+                if key == "seller" and "#生成強銷" not in label:
+                    LINE_COMMAND_TYPE_OPTIONS[i] = (
+                        key,
+                        label + "、#補委託資料、#生成強銷、#生成群組文案、#生成案件表"
+                    )
+                    break
+    except Exception:
+        pass
+
+    print("✅ CASE_FORM_AI V3：LINE 權限閘門已辨識 #生成強銷 / #補委託資料 / #生成案件表")
+except Exception as e:
+    print("⚠️ CASE_FORM_AI V3 指令辨識修正失敗：", e)
+
+
+# =============================================================================
+# CASE_FORM_AI V4：設定中心新增「AI文案 / 案件表」獨立權限勾選
+# - V3 先把 #生成強銷 歸到 seller 指令；但設定頁看起來沒有獨立勾選項目
+# - V4 新增 case_ai 指令類型，讓群組 / 個人權限可單獨勾選
+# - 同時保留相容：如果舊資料已勾 seller，也仍可使用 case_ai，避免突然失效
+# =============================================================================
+try:
+    CASE_FORM_AI_COMMAND_TYPE = "case_ai"
+    CASE_FORM_AI_LINE_COMMANDS = (
+        "補委託資料", "生成強銷", "生成群組文案", "生成案件表",
+        "AI強銷", "AI文案", "案件表", "產生案件表", "物件文案", "強銷文案"
+    )
+
+    # 1) 設定中心可使用指令：新增獨立勾選項目
+    try:
+        if "LINE_COMMAND_TYPE_OPTIONS" in globals():
+            # 先把 V3 加在 seller label 後面的長文字清乾淨，避免重複顯示
+            cleaned = []
+            for key, label in LINE_COMMAND_TYPE_OPTIONS:
+                if key == "seller":
+                    label = label.replace("、#補委託資料、#生成強銷、#生成群組文案、#生成案件表", "")
+                if key != CASE_FORM_AI_COMMAND_TYPE:
+                    cleaned.append((key, label))
+            # 放在 seller 後面比較直覺
+            inserted = False
+            new_options = []
+            for key, label in cleaned:
+                new_options.append((key, label))
+                if key == "seller":
+                    new_options.append((CASE_FORM_AI_COMMAND_TYPE, "AI文案 / 案件表：#補委託資料、#生成強銷、#生成群組文案、#生成案件表"))
+                    inserted = True
+            if not inserted:
+                new_options.append((CASE_FORM_AI_COMMAND_TYPE, "AI文案 / 案件表：#補委託資料、#生成強銷、#生成群組文案、#生成案件表"))
+            LINE_COMMAND_TYPE_OPTIONS[:] = new_options
+    except Exception as e:
+        print("⚠️ CASE_FORM_AI V4 設定中心指令選項更新失敗：", e)
+
+    # 2) 指令辨識：#生成強銷 等歸類為 case_ai，不再混在 seller
+    _detect_line_command_type_before_case_form_ai_v4 = detect_line_command_type
+    def detect_line_command_type(text: str, event=None) -> str:
+        raw = (text or "").strip().replace("＃", "#")
+        if raw:
+            first = raw.splitlines()[0].strip().replace(" ", "")
+            first_no_hash = first[1:] if first.startswith("#") else first
+            if first_no_hash in CASE_FORM_AI_LINE_COMMANDS:
+                return CASE_FORM_AI_COMMAND_TYPE
+        return _detect_line_command_type_before_case_form_ai_v4(text, event=event)
+
+    # 3) 指令權限相容：有勾 case_ai 可用；舊版只勾 seller 也可用
+    _line_group_allows_command_before_case_form_ai_v4 = line_group_allows_command
+    def line_group_allows_command(group, command_type: str) -> bool:
+        if command_type == CASE_FORM_AI_COMMAND_TYPE:
+            allowed = set((group or {}).get("command_types") or [])
+            return "all" in allowed or CASE_FORM_AI_COMMAND_TYPE in allowed or "seller" in allowed
+        return _line_group_allows_command_before_case_form_ai_v4(group, command_type)
+
+    _line_personal_user_allows_command_before_case_form_ai_v4 = line_personal_user_allows_command
+    def line_personal_user_allows_command(user, command_type: str) -> bool:
+        if command_type == CASE_FORM_AI_COMMAND_TYPE:
+            allowed = set((user or {}).get("command_types") or [])
+            return "all" in allowed or CASE_FORM_AI_COMMAND_TYPE in allowed or "seller" in allowed
+        return _line_personal_user_allows_command_before_case_form_ai_v4(user, command_type)
+
+    # 4) 可查詢資料也要看 seller 權限，避免能生成委託文案但不能看委託資料
+    _line_access_gate_before_case_form_ai_v4 = line_access_gate
+    def line_access_gate(event):
+        allowed, reason_or_cmd, source_cfg = _line_access_gate_before_case_form_ai_v4(event)
+        if not allowed:
+            return allowed, reason_or_cmd, source_cfg
+        if reason_or_cmd == CASE_FORM_AI_COMMAND_TYPE and source_cfg:
+            view_types = set(source_cfg.get("view_types") or [])
+            if "all" not in view_types and "seller" not in view_types:
+                return False, "此來源已開放 AI文案 / 案件表指令，但未開放查看『委託』資料，請到設定中心勾選可查詢資料：委託。", source_cfg
+        return allowed, reason_or_cmd, source_cfg
+
+    print("✅ CASE_FORM_AI V4：設定中心已新增 AI文案 / 案件表獨立權限勾選 case_ai")
+except Exception as e:
+    print("⚠️ CASE_FORM_AI V4 權限勾選修正失敗：", e)
