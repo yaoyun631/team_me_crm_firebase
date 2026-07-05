@@ -25592,7 +25592,6 @@ def automation_command_settings():
 
 
 # 設定中心首頁側欄插入「指令列表」入口；並加一張快速入口卡。
-_COMMAND_SETTINGS_NAV_LINK = '<a class="list-group-item list-group-item-action" href="{{ url_for(\\'automation_command_settings\\') }}">指令列表</a>'
 _COMMAND_SETTINGS_CARD = """
         <div id="commands" class="setting-card p-4 mb-4">
           <div class="d-flex justify-content-between align-items-center">
