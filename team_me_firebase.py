@@ -23924,3 +23924,263 @@ print("✅ LINE CSV 物件庫更新 Patch 20260705 已啟用")
 # =============================================================================
 # LINE CSV 物件庫更新 Patch End
 # =============================================================================
+
+
+# =============================================================================
+# LINE 愛屋後台自動更新 CSV Patch 20260705
+# 目的：LINE 輸入「更新csv檔案 / 更新出售csv檔案 / 更新出租csv檔案」後，
+#      自動登入愛屋後台，進入出售/出租物件列表，執行既有 JS 匯出 CSV，
+#      再匯入 Firestore properties，最後推播 LINE 更新摘要。
+# 注意：帳密請放 Render 環境變數，不要寫死在程式裡：
+#      AIWU_HOUSE_ID、AIWU_MEMBER_ID、AIWU_MEMBER_PW
+# 依賴：pip install playwright && playwright install chromium
+# =============================================================================
+
+AIWU_LOGIN_URL = "https://es.houseol.com.tw/login.aspx"
+AIWU_SALE_OBJECT_URL = "https://es.houseol.com.tw/index.aspx?module=SellHouse&file=Object"
+AIWU_RENT_OBJECT_URL = "https://es.houseol.com.tw/index.aspx?module=RentHouse&file=Object"
+
+AIWU_SALE_EXPORT_JS = '(async function rescanAiwuAndExportFreshCsvLite() {\n  function cleanText(text) {\n    return String(text || "")\n      .replace(/\\u00A0/g, " ")\n      .replace(/\\u3000/g, " ")\n      .replace(/\\s+/g, " ")\n      .trim();\n  }\n\n  function cleanMultilineText(text) {\n    return String(text || "")\n      .replace(/\\u00A0/g, " ")\n      .replace(/\\u3000/g, " ")\n      .replace(/\\r\\n/g, "\\n")\n      .replace(/\\r/g, "\\n")\n      .split("\\n")\n      .map(line => line.replace(/[ \\t]+/g, " ").trim())\n      .filter((line, idx, arr) => !(line === "" && arr[idx - 1] === ""))\n      .join("\\n")\n      .trim();\n  }\n\n  function normalizeLabel(text) {\n    return String(text || "")\n      .replace(/[\\u00A0\\u3000\\s\\u2000-\\u200B]+/g, "")\n      .replace(/[：:]/g, "")\n      .trim();\n  }\n\n  function csvEscape(value) {\n    return `"${String(value ?? "").replace(/"/g, \'""\')}"`;\n  }\n\n  function normalizeUrl(url) {\n    if (!url) return "";\n    if (url.startsWith("//")) return location.protocol + url;\n    if (url.startsWith("/")) return location.origin + url;\n    return url;\n  }\n\n  function numberOnly(text) {\n    const m = String(text || "").replace(/,/g, "").match(/-?\\d+(?:\\.\\d+)?/);\n    return m ? m[0] : "";\n  }\n\n  function toHalfWidth(text) {\n    return String(text || "").replace(/[！-～]/g, s =>\n      String.fromCharCode(s.charCodeAt(0) - 0xFEE0)\n    );\n  }\n\n  function shouldSkipTitle(title) {\n    const t = cleanText(title);\n    return t.includes("上網");\n  }\n\n  function parseAddress(fullAddress) {\n    const addr = cleanText(fullAddress);\n    const result = {\n      full: addr,\n      city: "",\n      district: "",\n      road: "",\n      lane: "",\n      alley: "",\n      no: "",\n      floor: ""\n    };\n\n    if (!addr) return result;\n\n    const cityMatch = addr.match(/^(.*?[市縣])/);\n    if (cityMatch) result.city = cityMatch[1];\n\n    const afterCity = addr.replace(result.city, "");\n    const districtMatch = afterCity.match(/^(.*?[區鄉鎮市])/);\n    if (districtMatch) result.district = districtMatch[1];\n\n    const rest = afterCity.replace(result.district, "");\n\n    const laneMatch = rest.match(/([0-9０-９\\-]+)\\s*巷/);\n    const alleyMatch = rest.match(/([0-9０-９\\-]+)\\s*弄/);\n    const noMatch = rest.match(/([0-9０-９\\-]+)\\s*號/);\n    const floorMatch = rest.match(/([0-9０-９\\-]+)\\s*樓/);\n\n    if (laneMatch) result.lane = laneMatch[1];\n    if (alleyMatch) result.alley = alleyMatch[1];\n    if (noMatch) result.no = noMatch[1];\n    if (floorMatch) result.floor = floorMatch[1];\n\n    let road = rest;\n    road = road.replace(/([0-9０-９\\-]+)\\s*巷.*$/, "");\n    road = road.replace(/([0-9０-９\\-]+)\\s*弄.*$/, "");\n    road = road.replace(/([0-9０-９\\-]+)\\s*號.*$/, "");\n    road = road.replace(/([0-9０-９\\-]+)\\s*樓.*$/, "");\n    result.road = cleanText(road);\n\n    return result;\n  }\n\n  function normalizeFloorToken(token) {\n    let s = toHalfWidth(cleanText(token))\n      .replace(/\\s+/g, "")\n      .replace(/^第/, "")\n      .replace(/[樓層ＦFf]/g, "");\n\n    s = s.replace(/^\\+/, "");\n\n    const basement = s.match(/^(?:地下|B)(\\d+)$/i);\n    if (basement) return `B${basement[1]}`;\n\n    const num = s.match(/-?\\d+/);\n    if (num) return num[0];\n\n    return s;\n  }\n\n  function parseFloorInfo(text) {\n    let cleaned = toHalfWidth(cleanText(text))\n      .replace(/\\s+/g, "")\n      .replace(/／/g, "/")\n      .replace(/[－—–~～﹣]/g, "/");\n\n    if (!cleaned) {\n      return {\n        saleFloor: "",\n        totalFloor: ""\n      };\n    }\n\n    if (cleaned.includes("/")) {\n      const parts = cleaned.split("/").map(x => x.trim()).filter(Boolean);\n      return {\n        saleFloor: normalizeFloorToken(parts[0] || ""),\n        totalFloor: normalizeFloorToken(parts[1] || "")\n      };\n    }\n\n    const tokens = cleaned.match(/(?:地下\\d+|B\\d+|\\d+)[樓層FfＦ]?/gi) || [];\n    if (tokens.length >= 2) {\n      return {\n        saleFloor: normalizeFloorToken(tokens[0]),\n        totalFloor: normalizeFloorToken(tokens[1])\n      };\n    }\n\n    return {\n      saleFloor: normalizeFloorToken(cleaned),\n      totalFloor: ""\n    };\n  }\n\n  function normalizeCountToken(token) {\n    let s = toHalfWidth(cleanText(token))\n      .replace(/\\s+/g, "")\n      .replace(/[房廳厅衛卫浴室陽阳台廚厨]/g, "");\n\n    if (!s) return "";\n\n    const m = s.match(/\\d+(?:\\.\\d+)?/);\n    if (!m) return "";\n\n    const n = Number(m[0]);\n    if (Number.isFinite(n)) return String(n);\n\n    return m[0];\n  }\n\n  function formatFloorDisplay(floorInfo) {\n    const saleFloor = cleanText(floorInfo?.saleFloor || "");\n    const totalFloor = cleanText(floorInfo?.totalFloor || "");\n\n    // CSV 裡不要再輸出 6/10，Excel 會自動判斷成日期 6月10日\n    if (saleFloor && totalFloor) return `${saleFloor}樓/${totalFloor}樓`;\n    if (saleFloor) return `${saleFloor}樓`;\n    if (totalFloor) return `總樓高${totalFloor}樓`;\n    return "";\n  }\n\n  function parseRoomInfo(text) {\n    const cleaned = toHalfWidth(cleanText(text))\n      .replace(/\\s+/g, "")\n      .replace(/／/g, "/");\n\n    let parts = [];\n\n    if (cleaned.includes("/")) {\n      parts = cleaned.split("/");\n    } else {\n      const m = cleaned.match(/(\\d+(?:\\.\\d+)?)房(?:(\\d+(?:\\.\\d+)?)廳)?(?:(\\d+(?:\\.\\d+)?)[衛浴])?(?:(\\d+(?:\\.\\d+)?)室)?(?:(\\d+(?:\\.\\d+)?)陽台)?(?:(\\d+(?:\\.\\d+)?)廚)?/);\n      if (m) {\n        parts = [m[1], m[2], m[3], m[4], m[5], m[6]];\n      }\n    }\n\n    const info = {\n      room: normalizeCountToken(parts[0] || ""),\n      living: normalizeCountToken(parts[1] || ""),\n      bath: normalizeCountToken(parts[2] || ""),\n      room2: normalizeCountToken(parts[3] || ""),\n      balcony: normalizeCountToken(parts[4] || ""),\n      kitchen: normalizeCountToken(parts[5] || "")\n    };\n\n    return info;\n  }\n\n  function formatRoomDisplay(roomInfo) {\n    const room = cleanText(roomInfo?.room || "");\n    const living = cleanText(roomInfo?.living || "");\n    const bath = cleanText(roomInfo?.bath || "");\n    const room2 = cleanText(roomInfo?.room2 || "");\n    const balcony = cleanText(roomInfo?.balcony || "");\n    const kitchen = cleanText(roomInfo?.kitchen || "");\n\n    // CSV 裡不要再輸出 03/2/2，Excel 會自動判斷成 2003/2/2\n    const parts = [];\n    if (room !== "") parts.push(`${room}房`);\n    if (living !== "") parts.push(`${living}廳`);\n    if (bath !== "") parts.push(`${bath}衛`);\n\n    if (room2 !== "" && room2 !== "0") parts.push(`${room2}室`);\n    if (balcony !== "" && balcony !== "0") parts.push(`${balcony}陽台`);\n    if (kitchen !== "" && kitchen !== "0") parts.push(`${kitchen}廚房`);\n\n    return parts.join("");\n  }\n\n  function guessHouseCategory(title, ageText) {\n    const t = cleanText(title);\n    const age = parseFloat(numberOnly(ageText));\n\n    if (/法拍/.test(t)) return "法拍屋";\n    if (/預售/.test(t)) return "預售屋";\n    if (!Number.isNaN(age)) {\n      if (age <= 3) return "新屋";\n      return "中古屋";\n    }\n    return "";\n  }\n\n  function guessLegalUse(categoryText, typeText, useZoneText, title) {\n    const all = `${categoryText} ${typeText} ${useZoneText} ${title}`.trim();\n\n    if (/住家用/.test(all)) return "住家用";\n    if (/住商用/.test(all)) return "住商用";\n    if (/住工用/.test(all)) return "住工用";\n    if (/集合住宅/.test(all)) return "集合住宅";\n    if (/國民住宅/.test(all)) return "國民住宅";\n    if (/工商用/.test(all)) return "工商用";\n    if (/商業用|店面|商辦|辦公/.test(all)) return "商業用";\n    if (/工業用|廠房|工廠/.test(all)) return "工業用";\n    if (/農業用|農地|農舍/.test(all)) return "農業用";\n    if (/店鋪/.test(all)) return "店鋪";\n    if (/廠房/.test(all)) return "廠房";\n    if (/農舍/.test(all)) return "農舍";\n    if (/一般零售業/.test(all)) return "一般零售業";\n    if (/一般事務所/.test(all)) return "一般事務所";\n    return "";\n  }\n\n  function guessUsecode(typeText, categoryText, title) {\n    const all = `${typeText} ${categoryText} ${title}`.trim();\n\n    if (/土地|建地|農地|林地|用地/.test(all)) return "土地";\n    if (/廠房|工廠/.test(all)) return "廠房";\n    if (/車位/.test(all)) return "車位";\n    if (/住辦/.test(all)) return "住辦";\n    if (/商用|店面|商辦|辦公/.test(all)) return "商用";\n    return "住宅";\n  }\n\n  function guessTypecode(typeText, categoryText) {\n    const first = cleanText((typeText || "").split("/")[0] || "");\n    const second = cleanText((categoryText || "").split("/")[0] || "");\n    return first || second || "";\n  }\n\n  function parseCatalogFieldMap(doc) {\n    const map = {};\n\n    doc.querySelectorAll(".t-tr").forEach(tr => {\n      const ths = Array.from(tr.querySelectorAll(".t-th"));\n      const tds = Array.from(tr.querySelectorAll(".t-td"));\n      const count = Math.min(ths.length, tds.length);\n\n      for (let i = 0; i < count; i++) {\n        const label = normalizeLabel(ths[i]?.textContent || "");\n        const value = cleanText(\n          tds[i]?.querySelector("p")?.textContent ||\n          tds[i]?.textContent ||\n          ""\n        );\n        if (label) map[label] = value;\n      }\n    });\n\n    return map;\n  }\n\n  async function autoLoadAll(interval = 1200) {\n    return new Promise(resolve => {\n      const timer = setInterval(() => {\n        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });\n        const btn = document.querySelector("a.load_more");\n        if (btn) {\n          btn.click();\n        } else {\n          clearInterval(timer);\n          setTimeout(resolve, 2000);\n        }\n      }, interval);\n    });\n  }\n\n  async function fetchCatalogData(catalogUrl, fallbackInfo = {}) {\n    try {\n      const res = await fetch(catalogUrl, { credentials: "include" });\n      const html = await res.text();\n      const doc = new DOMParser().parseFromString(html, "text/html");\n\n      const fieldMap = parseCatalogFieldMap(doc);\n\n      const title =\n        cleanText(doc.querySelector("header .title h3")?.textContent || "") ||\n        fallbackInfo.title ||\n        "";\n\n      const fullAddress =\n        cleanText(doc.querySelector("#showaddr")?.getAttribute("alt") || "") ||\n        cleanText(doc.querySelector("#addr")?.textContent || "") ||\n        fallbackInfo.fullAddress ||\n        "";\n\n      const featureText =\n        cleanMultilineText(doc.querySelector("#GoodSpan")?.innerText || "") ||\n        cleanMultilineText(doc.querySelector("#GoodDiv")?.innerText || "") ||\n        cleanMultilineText(doc.querySelector("#GoodSpan")?.textContent || "") ||\n        cleanMultilineText(doc.querySelector("#GoodDiv")?.textContent || "") ||\n        "";\n\n      return {\n        title,\n        fullAddress,\n        fieldMap,\n        featureText\n      };\n    } catch (err) {\n      console.warn("型錄抓取失敗：", catalogUrl, err);\n      return {\n        title: fallbackInfo.title || "",\n        fullAddress: fallbackInfo.fullAddress || "",\n        fieldMap: {},\n        featureText: ""\n      };\n    }\n  }\n\n  await autoLoadAll();\n\n  const cards = Array.from(document.querySelectorAll(".wrapper.clickli"));\n  const seen = new Set();\n  const rows = [];\n\n  console.log(`共找到 ${cards.length} 張卡片，開始重新掃描型錄...`);\n\n  for (let idx = 0; idx < cards.length; idx++) {\n    const card = cards[idx];\n\n    const hid = cleanText(\n      card.querySelector(\'input[type="checkbox"][data-hid]\')?.dataset?.hid || ""\n    );\n\n    const numberText = cleanText(\n      card.querySelector(".number")?.childNodes[0]?.textContent || ""\n    );\n\n    const objectNoMatch = numberText.match(/NO\\.?\\s*([A-Z0-9]+)/i);\n    const objectNo = objectNoMatch ? cleanText(objectNoMatch[1]) : "";\n    if (!objectNo) continue;\n\n    const uniqueKey = `${hid}_${objectNo}`;\n    if (seen.has(uniqueKey)) continue;\n    seen.add(uniqueKey);\n\n    const listTitle = cleanText(card.querySelector(".title a.li_name")?.textContent || "");\n\n    if (shouldSkipTitle(listTitle)) {\n      console.log(`略過(列表標題含上網)：${objectNo} ${listTitle}`);\n      continue;\n    }\n\n    const addressEl = card.querySelector(".address");\n    let listFullAddress = "";\n    let catalogUrl = "";\n\n    if (addressEl) {\n      const clone = addressEl.cloneNode(true);\n      const dlUrl = clone.querySelector(".dl_url");\n      if (dlUrl) dlUrl.remove();\n      listFullAddress = cleanText(clone.textContent || "");\n\n      const catalogLink = addressEl.querySelector(\'.dl_url a[href*="Ecatalog.aspx"]\');\n      if (catalogLink) {\n        catalogUrl = normalizeUrl(catalogLink.getAttribute("href") || catalogLink.href || "");\n      }\n    }\n\n    console.log(`(${idx + 1}/${cards.length}) 重新掃描 ${objectNo} ${listTitle}`);\n\n    const catalog = await fetchCatalogData(catalogUrl, {\n      title: listTitle,\n      fullAddress: listFullAddress\n    });\n\n    const finalTitle = cleanText(catalog.title || listTitle || "");\n\n    if (shouldSkipTitle(finalTitle)) {\n      console.log(`略過(型錄標題含上網)：${objectNo} ${finalTitle}`);\n      continue;\n    }\n\n    const fieldMap = catalog.fieldMap || {};\n    const fullAddress = catalog.fullAddress || listFullAddress || "";\n    const addr = parseAddress(fullAddress);\n    const floorInfo = parseFloorInfo(fieldMap["樓別/樓高"] || "");\n    const roomInfo = parseRoomInfo(fieldMap["房/廳/衛"] || "");\n    const categoryText = fieldMap["類別/謄本用途"] || "";\n    const typeText = fieldMap["類型/現況"] || "";\n    const houseAgeText = fieldMap["屋齡"] || "";\n\n    const row = {\n      upload_to_rakuya: "",\n      upload_status: "",\n      upload_priority: "",\n      upload_batch: "",\n      upload_note: "",\n      rakuya_post_url: "",\n      last_error: "",\n      uploaded_at: "",\n\n      raw_分店代碼: hid,\n      raw_物件編號: objectNo,\n      raw_標題: finalTitle,\n      raw_完整地址: fullAddress,\n      raw_型錄網址: catalogUrl,\n\n      raw_委託總價: fieldMap["委託總價"] || "",\n      raw_每坪單價: fieldMap["每坪單價"] || "",\n      raw_登記坪數: fieldMap["登記坪數"] || "",\n      raw_建物面積: fieldMap["建物面積"] || "",\n      raw_主建物坪: fieldMap["主建物坪"] || "",\n      raw_附屬建物: fieldMap["附屬建物"] || "",\n      raw_公設建坪: fieldMap["公設建坪"] || "",\n      raw_土地登記: fieldMap["土地登記"] || "",\n      raw_總基地坪: fieldMap["總基地坪"] || "",\n      raw_使用分區: fieldMap["使用分區"] || "",\n      raw_樓別樓高: formatFloorDisplay(floorInfo),\n      raw_房廳衛: formatRoomDisplay(roomInfo),\n      raw_類別謄本用途: categoryText,\n      raw_類型現況: typeText,\n      raw_社區: fieldMap["社區"] || "",\n      raw_管理費: fieldMap["管理費|車位管理費"] || fieldMap["管理費車位管理費"] || "",\n      raw_物件座向: fieldMap["物件座向"] || "",\n      raw_面臨路寬: fieldMap["面臨路寬"] || "",\n      raw_竣工日期: fieldMap["竣工日期"] || "",\n      raw_屋齡: houseAgeText,\n      raw_建物外觀: fieldMap["建物外觀"] || "",\n      raw_建物結構: fieldMap["建物結構"] || "",\n      raw_鄰近學校: fieldMap["鄰近學校"] || "",\n      raw_環境特色: catalog.featureText || "",\n\n      rakuya_物件名稱: finalTitle.slice(0, 25),\n      rakuya_法定用途: guessLegalUse(categoryText, typeText, fieldMap["使用分區"] || "", finalTitle),\n      rakuya_現況型式: guessUsecode(typeText, categoryText, finalTitle),\n      rakuya_現況類型: guessTypecode(typeText, categoryText),\n      rakuya_房屋分類: guessHouseCategory(finalTitle, houseAgeText),\n\n      rakuya_縣市: addr.city,\n      rakuya_行政區: addr.district,\n      rakuya_路段: addr.road,\n      rakuya_巷: addr.lane,\n      rakuya_弄: addr.alley,\n      rakuya_號: addr.no,\n      rakuya_樓: addr.floor,\n      rakuya_地址全文: fullAddress,\n\n      rakuya_社區名稱: fieldMap["社區"] || "",\n      rakuya_總價_萬: numberOnly(fieldMap["委託總價"] || ""),\n      rakuya_單價_萬每坪: numberOnly(fieldMap["每坪單價"] || ""),\n      rakuya_建物登記: numberOnly(fieldMap["登記坪數"] || fieldMap["建物面積"] || ""),\n      rakuya_主建物: numberOnly(fieldMap["主建物坪"] || ""),\n      rakuya_附屬建物: numberOnly(fieldMap["附屬建物"] || ""),\n      rakuya_公設建坪: numberOnly(fieldMap["公設建坪"] || ""),\n      rakuya_土地登記: numberOnly(fieldMap["土地登記"] || ""),\n      rakuya_總基地坪: numberOnly(fieldMap["總基地坪"] || ""),\n\n      rakuya_出售樓層: floorInfo.saleFloor,\n      rakuya_總樓層: floorInfo.totalFloor,\n\n      rakuya_房: roomInfo.room,\n      rakuya_廳: roomInfo.living,\n      rakuya_衛: roomInfo.bath,\n      rakuya_室: roomInfo.room2,\n      rakuya_陽台: roomInfo.balcony,\n      rakuya_廚房: roomInfo.kitchen,\n\n      rakuya_屋齡: numberOnly(houseAgeText),\n      rakuya_竣工日期: fieldMap["竣工日期"] || "",\n      rakuya_管理費: fieldMap["管理費|車位管理費"] || fieldMap["管理費車位管理費"] || "",\n      rakuya_朝向: fieldMap["物件座向"] || "",\n      rakuya_面前道路: fieldMap["面臨路寬"] || "",\n      rakuya_建物外觀: fieldMap["建物外觀"] || "",\n      rakuya_建物結構: fieldMap["建物結構"] || "",\n      rakuya_鄰近學校: fieldMap["鄰近學校"] || "",\n      rakuya_特色描述: catalog.featureText || "",\n      rakuya_刊登來源網址: catalogUrl\n    };\n\n    rows.push(row);\n  }\n\n  if (!rows.length) {\n    console.log("⚠️ 沒抓到資料");\n    return;\n  }\n\n  const headers = [\n    "upload_to_rakuya",\n    "upload_status",\n    "upload_priority",\n    "upload_batch",\n    "upload_note",\n    "rakuya_post_url",\n    "last_error",\n    "uploaded_at",\n\n    "raw_分店代碼",\n    "raw_物件編號",\n    "raw_標題",\n    "raw_完整地址",\n    "raw_型錄網址",\n\n    "raw_委託總價",\n    "raw_每坪單價",\n    "raw_登記坪數",\n    "raw_建物面積",\n    "raw_主建物坪",\n    "raw_附屬建物",\n    "raw_公設建坪",\n    "raw_土地登記",\n    "raw_總基地坪",\n    "raw_使用分區",\n    "raw_樓別樓高",\n    "raw_房廳衛",\n    "raw_類別謄本用途",\n    "raw_類型現況",\n    "raw_社區",\n    "raw_管理費",\n    "raw_物件座向",\n    "raw_面臨路寬",\n    "raw_竣工日期",\n    "raw_屋齡",\n    "raw_建物外觀",\n    "raw_建物結構",\n    "raw_鄰近學校",\n    "raw_環境特色",\n\n    "rakuya_物件名稱",\n    "rakuya_法定用途",\n    "rakuya_現況型式",\n    "rakuya_現況類型",\n    "rakuya_房屋分類",\n    "rakuya_縣市",\n    "rakuya_行政區",\n    "rakuya_路段",\n    "rakuya_巷",\n    "rakuya_弄",\n    "rakuya_號",\n    "rakuya_樓",\n    "rakuya_地址全文",\n    "rakuya_社區名稱",\n    "rakuya_總價_萬",\n    "rakuya_單價_萬每坪",\n    "rakuya_建物登記",\n    "rakuya_主建物",\n    "rakuya_附屬建物",\n    "rakuya_公設建坪",\n    "rakuya_土地登記",\n    "rakuya_總基地坪",\n    "rakuya_出售樓層",\n    "rakuya_總樓層",\n    "rakuya_房",\n    "rakuya_廳",\n    "rakuya_衛",\n    "rakuya_室",\n    "rakuya_陽台",\n    "rakuya_廚房",\n    "rakuya_屋齡",\n    "rakuya_竣工日期",\n    "rakuya_管理費",\n    "rakuya_朝向",\n    "rakuya_面前道路",\n    "rakuya_建物外觀",\n    "rakuya_建物結構",\n    "rakuya_鄰近學校",\n    "rakuya_特色描述",\n    "rakuya_刊登來源網址"\n  ];\n\n  const csvLines = [\n    headers.map(csvEscape).join(","),\n    ...rows.map(row => headers.map(h => csvEscape(row[h] || "")).join(","))\n  ];\n\n  const csvContent = "\\uFEFF" + csvLines.join("\\n");\n  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });\n  const url = URL.createObjectURL(blob);\n\n  const now = new Date();\n  const yyyy = now.getFullYear();\n  const mm = String(now.getMonth() + 1).padStart(2, "0");\n  const dd = String(now.getDate()).padStart(2, "0");\n  const hh = String(now.getHours()).padStart(2, "0");\n  const mi = String(now.getMinutes()).padStart(2, "0");\n\n  const a = document.createElement("a");\n  a.href = url;\n  a.download = `愛屋_售_${yyyy}${mm}${dd}_${hh}${mi}.csv`;\n  document.body.appendChild(a);\n  a.click();\n  document.body.removeChild(a);\n  URL.revokeObjectURL(url);\n\n  console.log(`✅ 已輸出 ${rows.length} 筆精簡 CSV`);\n  console.table(rows);\n})();'
+AIWU_RENT_EXPORT_JS = '(async function exportRentalCsvFromCardAndCatalog_v2() {\n  function cleanText(text) {\n    return String(text || "")\n      .replace(/\\u00A0/g, " ")\n      .replace(/\\u3000/g, " ")\n      .replace(/\\s+/g, " ")\n      .trim();\n  }\n\n  function normalizeLabel(text) {\n    return String(text || "")\n      .replace(/[\\u00A0\\u3000\\s\\u2000-\\u200B]+/g, "")\n      .replace(/[：:]/g, "")\n      .trim();\n  }\n\n  function csvEscape(value) {\n    return `"${String(value ?? "").replace(/"/g, \'""\')}"`;\n  }\n\n  function normalizeUrl(url) {\n    if (!url) return "";\n    if (url.startsWith("//")) return location.protocol + url;\n    if (url.startsWith("/")) return location.origin + url;\n    return url;\n  }\n\n  function numberOnly(text) {\n    const m = String(text || "").replace(/,/g, "").match(/-?\\d+(?:\\.\\d+)?/);\n    return m ? m[0] : "";\n  }\n\n  function parseAddress(fullAddress) {\n    const addr = cleanText(fullAddress);\n    const result = { full: addr, city: "", district: "", road: "", lane: "", alley: "", no: "", floor: "" };\n    if (!addr) return result;\n\n    const cityMatch = addr.match(/^(.*?[市縣])/);\n    if (cityMatch) result.city = cityMatch[1];\n\n    const afterCity = addr.replace(result.city, "");\n    const districtMatch = afterCity.match(/^(.*?[區鄉鎮市])/);\n    if (districtMatch) result.district = districtMatch[1];\n\n    const rest = afterCity.replace(result.district, "");\n    const laneMatch = rest.match(/([0-9０-９\\-]+)\\s*巷/);\n    const alleyMatch = rest.match(/([0-9０-９\\-]+)\\s*弄/);\n    const noMatch = rest.match(/([0-9０-９\\-]+)\\s*號/);\n    const floorMatch = rest.match(/([0-9０-９\\-]+)\\s*樓/);\n\n    if (laneMatch) result.lane = laneMatch[1];\n    if (alleyMatch) result.alley = alleyMatch[1];\n    if (noMatch) result.no = noMatch[1];\n    if (floorMatch) result.floor = floorMatch[1];\n\n    let road = rest;\n    road = road.replace(/([0-9０-９\\-]+)\\s*巷.*$/, "");\n    road = road.replace(/([0-9０-９\\-]+)\\s*弄.*$/, "");\n    road = road.replace(/([0-9０-９\\-]+)\\s*號.*$/, "");\n    road = road.replace(/([0-9０-９\\-]+)\\s*樓.*$/, "");\n    result.road = cleanText(road);\n    return result;\n  }\n\n  function parseFloorInfo(text) {\n    const cleaned = cleanText(text).replace(/\\s/g, "");\n    const parts = cleaned.split("/");\n    return { saleFloor: parts[0] || "", totalFloor: parts[1] || "" };\n  }\n\n  function parseLayoutInfo(text) {\n    const cleaned = cleanText(text).replace(/\\s/g, "");\n    const out = { room: "", living: "", bath: "", room2: "", balcony: "", kitchen: "" };\n\n    if (!cleaned) return out;\n    if (cleaned.includes("/")) {\n      const parts = cleaned.split("/");\n      out.room = parts[0] || "";\n      out.living = parts[1] || "";\n      out.bath = parts[2] || "";\n      out.room2 = parts[3] || "";\n      out.balcony = parts[4] || "";\n      out.kitchen = parts[5] || "";\n      return out;\n    }\n\n    const patterns = [\n      ["room", /(\\d+|\\+)房/],\n      ["living", /(\\d+|\\+)廳/],\n      ["bath", /(\\d+(?:\\.5)?|\\+)衛/],\n      ["room2", /(\\d+|\\+)室/],\n      ["balcony", /(\\d+|\\+)陽(?:台)?/],\n      ["kitchen", /(\\d+|\\+)廚房?/]\n    ];\n    for (const [key, pattern] of patterns) {\n      const m = cleaned.match(pattern);\n      if (m) out[key] = m[1];\n    }\n    return out;\n  }\n\n  function wanToYuan(text) {\n    const s = cleanText(text);\n    if (!s) return "";\n    const num = parseFloat(numberOnly(s));\n    if (Number.isNaN(num)) return "";\n    if (s.includes("萬")) return String(Math.round(num * 10000));\n    return String(Math.round(num));\n  }\n\n  function parseDepositInfo(text) {\n    const s = cleanText(text);\n    if (!s) return { label: "", mode: "", amount: "" };\n    if (/面議/.test(s)) return { label: "面議", mode: "99", amount: "" };\n    const m = s.match(/(\\d+)\\s*個月/);\n    if (m) return { label: `${m[1]}個月租金`, mode: m[1], amount: "" };\n    const amount = wanToYuan(s);\n    if (amount) return { label: "其他押金", mode: "0", amount };\n    return { label: "", mode: "", amount: "" };\n  }\n\n  function stripCodePrefix(text) {\n    return cleanText(text).replace(/^[A-Z]\\./, "").trim();\n  }\n\n  function parseCardTypeCategory(text) {\n    const s = cleanText(text);\n    const parts = s.split("/");\n    return { type: stripCodePrefix(parts[0] || ""), category: stripCodePrefix(parts[1] || "") };\n  }\n\n  function guessLegalUse(categoryText, typeText, title) {\n    const all = `${categoryText} ${typeText} ${title}`.trim();\n    if (/住家用/.test(all)) return "住家用";\n    if (/住商用/.test(all)) return "住商用";\n    if (/住工用/.test(all)) return "住工用";\n    if (/集合住宅/.test(all)) return "集合住宅";\n    if (/國民住宅/.test(all)) return "國民住宅";\n    if (/工商用/.test(all)) return "工商用";\n    if (/商業用|店面|商辦|辦公/.test(all)) return "商業用";\n    if (/工業用|廠房|工廠/.test(all)) return "工業用";\n    if (/農業用|農地|農舍/.test(all)) return "農業用";\n    if (/店鋪|店面/.test(all)) return "店鋪";\n    if (/廠房/.test(all)) return "廠房";\n    if (/農舍/.test(all)) return "農舍";\n    if (/一般零售業/.test(all)) return "一般零售業";\n    if (/一般事務所/.test(all)) return "一般事務所";\n    return "";\n  }\n\n  function guessRentUsecode(typeText, categoryText, title) {\n    const all = `${typeText} ${categoryText} ${title}`.trim();\n    if (/雅房/.test(all)) return "雅房";\n    if (/分租/.test(all)) return "分租套房";\n    if (/套房/.test(all)) return "獨立套房";\n    if (/店面/.test(all)) return "店面";\n    if (/住辦/.test(all)) return "住辦";\n    if (/商辦|辦公|商用/.test(all)) return "商用";\n    if (/廠房|工廠/.test(all)) return "廠房";\n    if (/車位/.test(all)) return "車位";\n    if (/土地|建地|農地|林地|用地/.test(all)) return "土地";\n    return "整層住家";\n  }\n\n  function guessRentTypecode(typeText, categoryText) {\n    const first = cleanText((typeText || "").split("/")[0] || "");\n    const second = cleanText((categoryText || "").split("/")[0] || "");\n    return first || second || "";\n  }\n\n  function parseCatalogFieldMap(doc) {\n    const map = {};\n    doc.querySelectorAll(".t-tr").forEach(tr => {\n      const ths = Array.from(tr.querySelectorAll(".t-th"));\n      const tds = Array.from(tr.querySelectorAll(".t-td"));\n      const count = Math.min(ths.length, tds.length);\n      for (let i = 0; i < count; i++) {\n        const label = normalizeLabel(ths[i]?.textContent || "");\n        const value = cleanText(tds[i]?.querySelector("p")?.textContent || tds[i]?.textContent || "");\n        if (label) map[label] = value;\n      }\n    });\n    return map;\n  }\n\n  async function autoLoadAll(interval = 1200) {\n    return new Promise(resolve => {\n      const timer = setInterval(() => {\n        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });\n        const btn = document.querySelector("a.load_more");\n        if (btn) {\n          btn.click();\n        } else {\n          clearInterval(timer);\n          setTimeout(resolve, 2000);\n        }\n      }, interval);\n    });\n  }\n\n  function parseCardInfo(card) {\n    const hid = cleanText(card.querySelector(\'input[type="checkbox"][data-hid]\')?.dataset?.hid || "");\n    const numberText = cleanText(card.querySelector(".number")?.childNodes[0]?.textContent || "");\n    const objectNoMatch = numberText.match(/NO\\.?\\s*([A-Z0-9]+)/i);\n    const objectNo = objectNoMatch ? cleanText(objectNoMatch[1]) : "";\n\n    const title = cleanText(card.querySelector(".title a.li_name")?.textContent || "");\n    let fullAddress = "";\n    let catalogUrl = "";\n\n    const addressEl = card.querySelector(".address");\n    if (addressEl) {\n      const clone = addressEl.cloneNode(true);\n      const dlUrl = clone.querySelector(".dl_url");\n      if (dlUrl) dlUrl.remove();\n      fullAddress = cleanText(clone.textContent || "");\n\n      const catalogLink = addressEl.querySelector(\'.dl_url a[href*="Ecatalog.aspx"]\');\n      if (catalogLink) catalogUrl = normalizeUrl(catalogLink.getAttribute("href") || catalogLink.href || "");\n    }\n\n    const firstImageUrl = normalizeUrl(card.querySelector(".imgbox img")?.getAttribute("src") || "")\n      .replace("/web/images/pictures/", "/images/pictures/")\n      .split("?")[0];\n\n    const labelMap = {};\n    Array.from(card.querySelectorAll(".info ul li")).forEach(li => {\n      const label = cleanText(li.querySelector("h6 font")?.textContent || "");\n      if (!label) return;\n      const clone = li.cloneNode(true);\n      clone.querySelectorAll("h6").forEach(el => el.remove());\n      labelMap[label] = cleanText(clone.textContent || "");\n    });\n\n    const typeCategory = parseCardTypeCategory(labelMap["型式/類別"] || "");\n    return {\n      hid, objectNo, title, fullAddress, catalogUrl, firstImageUrl,\n      rent_card: labelMap["月租金"] || "",\n      layout_card: labelMap["格局"] || "",\n      reg_size_card: labelMap["登記面積"] || "",\n      land_size_card: labelMap["地坪"] || "",\n      agents_card: labelMap["業務人員"] || "",\n      status_card: labelMap["物件狀態"] || "",\n      type_category_card: labelMap["型式/類別"] || "",\n      card_type: typeCategory.type,\n      card_category: typeCategory.category,\n      section_card: labelMap["地段"] || "",\n      entrust_start_card: labelMap["委託起日"] || "",\n      entrust_end_card: labelMap["委託迄日"] || "",\n      images_card: labelMap["圖片"] || "",\n      service_fee_card: labelMap["服務費"] || ""\n    };\n  }\n\n  async function fetchCatalogData(catalogUrl, fallbackInfo = {}) {\n    try {\n      const res = await fetch(catalogUrl, { credentials: "include" });\n      const html = await res.text();\n      const doc = new DOMParser().parseFromString(html, "text/html");\n\n      const fieldMap = parseCatalogFieldMap(doc);\n      const title =\n        cleanText(doc.querySelector("header .title h3")?.textContent || "") ||\n        fallbackInfo.title || "";\n\n      const fullAddress =\n        cleanText(doc.querySelector("#showaddr")?.getAttribute("alt") || "") ||\n        cleanText(doc.querySelector("#addr")?.textContent || "") ||\n        fallbackInfo.fullAddress || "";\n\n      const featureText =\n        cleanText(doc.querySelector("#GoodSpan")?.innerText || "") ||\n        cleanText(doc.querySelector("#GoodDiv")?.innerText || "") ||\n        cleanText(doc.querySelector("#GoodSpan")?.textContent || "") ||\n        cleanText(doc.querySelector("#GoodDiv")?.textContent || "") || "";\n\n      return { title, fullAddress, fieldMap, featureText };\n    } catch (err) {\n      console.warn("型錄抓取失敗：", catalogUrl, err);\n      return {\n        title: fallbackInfo.title || "",\n        fullAddress: fallbackInfo.fullAddress || "",\n        fieldMap: {},\n        featureText: ""\n      };\n    }\n  }\n\n  await autoLoadAll();\n\n  const cards = Array.from(document.querySelectorAll(".wrapper.clickli"));\n  const seen = new Set();\n  const rows = [];\n\n  for (let idx = 0; idx < cards.length; idx++) {\n    const cardInfo = parseCardInfo(cards[idx]);\n    if (!cardInfo.objectNo) continue;\n\n    const uniqueKey = `${cardInfo.hid}_${cardInfo.objectNo}`;\n    if (seen.has(uniqueKey)) continue;\n    seen.add(uniqueKey);\n\n    const catalog = await fetchCatalogData(cardInfo.catalogUrl, {\n      title: cardInfo.title,\n      fullAddress: cardInfo.fullAddress\n    });\n\n    const fieldMap = catalog.fieldMap || {};\n    const fullAddress = catalog.fullAddress || cardInfo.fullAddress || "";\n    const addr = parseAddress(fullAddress);\n\n    const rentText = cardInfo.rent_card || fieldMap["租金"] || fieldMap["租金"] || fieldMap["租\u3000\u3000金"] || "";\n    const depositText = fieldMap["押金"] || fieldMap["押\u3000\u3000金"] || "";\n    const floorText = fieldMap["樓別/樓高"] || "";\n    const layoutText = cardInfo.layout_card || fieldMap["房/廳/衛"] || "";\n\n    const floorInfo = parseFloorInfo(floorText);\n    const roomInfo = parseLayoutInfo(layoutText);\n    const depositInfo = parseDepositInfo(depositText);\n\n    const typeText = fieldMap["類型/現況"] || cardInfo.card_type || "";\n    const categoryText = fieldMap["類別/謄本用途"] || cardInfo.card_category || "";\n\n    rows.push({\n      upload_to_rakuya: "",\n      upload_status: "",\n      upload_priority: "",\n      upload_batch: "",\n      upload_note: "",\n      rakuya_post_url: "",\n      last_error: "",\n      uploaded_at: "",\n\n      raw_分店代碼: cardInfo.hid,\n      raw_物件編號: cardInfo.objectNo,\n      raw_標題: catalog.title || cardInfo.title,\n      raw_完整地址: fullAddress,\n      raw_型錄網址: cardInfo.catalogUrl,\n      raw_首圖網址: cardInfo.firstImageUrl,\n      raw_月租金_卡片: cardInfo.rent_card,\n      raw_格局_卡片: cardInfo.layout_card,\n      raw_登記面積_卡片: cardInfo.reg_size_card,\n      raw_地坪_卡片: cardInfo.land_size_card,\n      raw_業務人員_卡片: cardInfo.agents_card,\n      raw_物件狀態_卡片: cardInfo.status_card,\n      raw_型式類別_卡片: cardInfo.type_category_card,\n      raw_地段_卡片: cardInfo.section_card,\n      raw_委託起日_卡片: cardInfo.entrust_start_card,\n      raw_委託迄日_卡片: cardInfo.entrust_end_card,\n      raw_圖片序號_卡片: cardInfo.images_card,\n      raw_服務費_卡片: cardInfo.service_fee_card,\n\n      raw_租金: fieldMap["租金"] || fieldMap["租\u3000\u3000金"] || rentText,\n      raw_押金: fieldMap["押金"] || fieldMap["押\u3000\u3000金"] || "",\n      raw_登記坪數: fieldMap["登記坪數"] || cardInfo.reg_size_card,\n      raw_建物面積: fieldMap["建物面積"] || "",\n      raw_主加附屬: fieldMap["主+附屬"] || fieldMap["主附屬"] || "",\n      raw_主建物坪: fieldMap["主建物坪"] || "",\n      raw_附屬建物: fieldMap["附屬建物"] || "",\n      raw_公設建坪: fieldMap["公設建坪"] || "",\n      raw_土地登記: fieldMap["土地登記"] || cardInfo.land_size_card,\n      raw_樓別樓高: floorText,\n      raw_房廳衛: layoutText,\n      raw_類別謄本用途: categoryText,\n      raw_類型現況: typeText,\n      raw_物件座向: fieldMap["物件座向"] || "",\n      raw_面臨路寬: fieldMap["面臨路寬"] || "",\n      raw_竣工日期: fieldMap["竣工日期"] || "",\n      raw_屋齡: fieldMap["屋齡"] || fieldMap["屋\u3000\u3000齡"] || "",\n      raw_建物外觀: fieldMap["建物外觀"] || "",\n      raw_建物結構: fieldMap["建物結構"] || "",\n      raw_鄰近學校: fieldMap["鄰近學校"] || "",\n      raw_環境特色: catalog.featureText || "",\n\n      rakuya_物件名稱: (catalog.title || cardInfo.title || "").slice(0, 25),\n      rakuya_法定用途: guessLegalUse(categoryText, typeText, catalog.title || cardInfo.title),\n      rakuya_現況型式: guessRentUsecode(typeText, categoryText, catalog.title || cardInfo.title),\n      rakuya_現況類型: guessRentTypecode(typeText, categoryText),\n      rakuya_縣市: addr.city,\n      rakuya_行政區: addr.district,\n      rakuya_路段: addr.road,\n      rakuya_巷: addr.lane,\n      rakuya_弄: addr.alley,\n      rakuya_號: addr.no,\n      rakuya_樓: addr.floor,\n      rakuya_地址全文: fullAddress,\n      rakuya_社區名稱: fieldMap["社區"] || "",\n\n      rakuya_租金_元: wanToYuan(rentText),\n      rakuya_押金說明: depositInfo.label,\n      rakuya_押金選項值: depositInfo.mode,\n      rakuya_押金金額: depositInfo.amount,\n\n      rakuya_使用坪數: numberOnly(fieldMap["主建物坪"] || fieldMap["主+附屬"] || fieldMap["主附屬"] || fieldMap["建物面積"] || ""),\n      rakuya_土地登記: numberOnly(fieldMap["土地登記"] || cardInfo.land_size_card || ""),\n      rakuya_產權登記: numberOnly(fieldMap["登記坪數"] || fieldMap["建物面積"] || "") ? "有" : "",\n      rakuya_權狀面積: numberOnly(fieldMap["登記坪數"] || fieldMap["建物面積"] || cardInfo.reg_size_card || ""),\n      rakuya_附屬建物: numberOnly(fieldMap["附屬建物"] || ""),\n\n      rakuya_出租樓層: floorInfo.saleFloor,\n      rakuya_總樓層: floorInfo.totalFloor,\n      rakuya_房: roomInfo.room,\n      rakuya_廳: roomInfo.living,\n      rakuya_衛: roomInfo.bath,\n      rakuya_室: roomInfo.room2,\n      rakuya_陽台: roomInfo.balcony,\n      rakuya_廚房: roomInfo.kitchen,\n\n      rakuya_屋齡: numberOnly(fieldMap["屋齡"] || fieldMap["屋\u3000\u3000齡"] || ""),\n      rakuya_竣工日期: fieldMap["竣工日期"] || "",\n      rakuya_朝向: fieldMap["物件座向"] || "",\n      rakuya_面前道路: fieldMap["面臨路寬"] || "",\n      rakuya_建物外觀: fieldMap["建物外觀"] || "",\n      rakuya_建物結構: fieldMap["建物結構"] || "",\n      rakuya_鄰近學校: fieldMap["鄰近學校"] || "",\n      rakuya_特色描述: catalog.featureText || "",\n      rakuya_刊登來源網址: cardInfo.catalogUrl\n    });\n  }\n\n  if (!rows.length) {\n    console.log("⚠️ 沒抓到租件資料");\n    return;\n  }\n\n  const headers = Array.from(rows.reduce((set, row) => {\n    Object.keys(row).forEach(k => set.add(k));\n    return set;\n  }, new Set()));\n\n  const csvLines = [\n    headers.map(csvEscape).join(","),\n    ...rows.map(row => headers.map(h => csvEscape(row[h] || "")).join(","))\n  ];\n\n  const csvContent = "\\uFEFF" + csvLines.join("\\n");\n  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });\n  const url = URL.createObjectURL(blob);\n  const now = new Date();\n  const stamp = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,\'0\')}${String(now.getDate()).padStart(2,\'0\')}_${String(now.getHours()).padStart(2,\'0\')}${String(now.getMinutes()).padStart(2,\'0\')}`;\n  const a = document.createElement("a");\n  a.href = url;\n  a.download = `愛屋_出租${stamp}.csv`;\n  document.body.appendChild(a);\n  a.click();\n  document.body.removeChild(a);\n  URL.revokeObjectURL(url);\n\n  console.log(`✅ 已輸出 ${rows.length} 筆出租 CSV`);\n  console.table(rows);\n})();'
+
+try:
+    if "LINE_COMMAND_TYPE_OPTIONS" in globals():
+        if not any(k == "aiwu_csv_update" for k, _ in LINE_COMMAND_TYPE_OPTIONS):
+            LINE_COMMAND_TYPE_OPTIONS.append((
+                "aiwu_csv_update",
+                "愛屋後台CSV更新：輸入 更新csv檔案，自動登入後台匯出並更新物件庫"
+            ))
+    print("✅ 愛屋CSV：設定中心已加入愛屋後台CSV更新權限")
+except Exception as e:
+    print("⚠️ 愛屋CSV：加入設定中心權限失敗：", e)
+
+
+def _aiwu_csv_source_target_id(event):
+    source = (event or {}).get("source") or {}
+    return source.get("groupId") or source.get("roomId") or source.get("userId") or ""
+
+
+def _aiwu_csv_is_update_command(text: str):
+    raw = (text or "").strip().replace("＃", "#")
+    first = _teamme_first_nonempty_line(raw) if "_teamme_first_nonempty_line" in globals() else (raw.splitlines()[0].strip() if raw else "")
+    normalized = first.replace(" ", "").replace("　", "").lower()
+    if normalized.startswith("#"):
+        normalized = normalized[1:]
+    return normalized in (
+        "更新csv檔案", "更新csv", "更新物件csv", "更新物件csv檔案",
+        "更新出售csv檔案", "更新出售csv", "更新售csv", "更新售物件",
+        "更新出租csv檔案", "更新出租csv", "更新租csv", "更新租物件",
+        "更新愛屋csv", "更新愛屋csv檔案"
+    )
+
+
+def _aiwu_csv_requested_deal_types(text: str):
+    raw = (text or "").replace("＃", "#")
+    compact = raw.replace(" ", "").replace("　", "")
+    if any(k in compact for k in ["出租", "租csv", "租物件"]):
+        return ["rent"]
+    if any(k in compact for k in ["出售", "售csv", "售物件"]):
+        return ["sale"]
+    return ["sale", "rent"]
+
+
+def _aiwu_csv_assert_credentials():
+    house_id = (os.environ.get("AIWU_HOUSE_ID") or "").strip()
+    member_id = (os.environ.get("AIWU_MEMBER_ID") or "").strip()
+    member_pw = (os.environ.get("AIWU_MEMBER_PW") or "").strip()
+    if not house_id or not member_id or not member_pw:
+        raise RuntimeError("尚未設定愛屋後台帳密環境變數：AIWU_HOUSE_ID、AIWU_MEMBER_ID、AIWU_MEMBER_PW")
+    return house_id, member_id, member_pw
+
+
+def _aiwu_csv_click_if_exists(page, selector: str, timeout=8000):
+    try:
+        loc = page.locator(selector).first
+        loc.wait_for(state="visible", timeout=timeout)
+        loc.click(timeout=timeout)
+        return True
+    except Exception as e:
+        print(f"⚠️ 愛屋CSV：點擊失敗 {selector}：{e}")
+        return False
+
+
+def _aiwu_csv_export_one_deal_type(deal_type: str):
+    from playwright.sync_api import sync_playwright
+
+    house_id, member_id, member_pw = _aiwu_csv_assert_credentials()
+    object_url = AIWU_RENT_OBJECT_URL if deal_type == "rent" else AIWU_SALE_OBJECT_URL
+    export_js = AIWU_RENT_EXPORT_JS if deal_type == "rent" else AIWU_SALE_EXPORT_JS
+    label = "出租" if deal_type == "rent" else "出售"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = browser.new_context(accept_downloads=True, viewport={"width": 1440, "height": 1000})
+        page = context.new_page()
+        page.set_default_timeout(60000)
+
+        try:
+            page.goto(AIWU_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            page.fill("#HouseID", house_id)
+            page.fill("#MemberID", member_id)
+            page.fill("#MemberPW", member_pw)
+            page.click("#LinkButton1")
+            page.wait_for_load_state("networkidle", timeout=60000)
+
+            page.goto(object_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=60000)
+
+            _aiwu_csv_click_if_exists(page, "a.open", timeout=10000)
+            _aiwu_csv_click_if_exists(page, "#Search_bnt", timeout=10000)
+            page.wait_for_load_state("networkidle", timeout=60000)
+            try:
+                page.wait_for_selector(".wrapper.clickli", timeout=60000)
+            except Exception:
+                print(f"⚠️ 愛屋CSV：{label}列表沒有等到 .wrapper.clickli，仍嘗試執行匯出 JS")
+
+            with page.expect_download(timeout=180000) as download_info:
+                page.evaluate(export_js)
+            download = download_info.value
+            suggested = download.suggested_filename or ("愛屋_出租.csv" if deal_type == "rent" else "愛屋_售.csv")
+            tmp_path = download.path()
+            csv_bytes = open(tmp_path, "rb").read()
+            return {"deal_type": deal_type, "label": label, "filename": suggested, "csv_bytes": csv_bytes}
+        finally:
+            context.close()
+            browser.close()
+
+
+def _aiwu_csv_preview_from_bytes(csv_bytes: bytes, filename: str, deal_type: str, limit=8):
+    try:
+        headers, rows, enc = _property_csv_read_rows(csv_bytes)
+        previews = []
+        for row in rows[:limit]:
+            prop = _property_csv_row_to_property(row, deal_type, filename)
+            title = prop.get("title") or "未命名物件"
+            area = prop.get("area") or ""
+            price = prop.get("rent_price") if deal_type == "rent" else prop.get("price_wan")
+            unit = "元" if deal_type == "rent" else "萬"
+            price_text = f"{int(price) if isinstance(price, float) and price.is_integer() else price}{unit}" if price is not None else "價格未填"
+            previews.append(f"- {title}｜{area or '-'}｜{price_text}")
+        return previews
+    except Exception as e:
+        print("⚠️ 愛屋CSV：產生預覽失敗：", e)
+        return []
+
+
+def _aiwu_csv_run_and_push(event, deal_types):
+    target_id = _aiwu_csv_source_target_id(event)
+    lines = ["愛屋後台 CSV 更新完成"]
+    ok_any = False
+
+    for deal_type in deal_types:
+        label = "出租" if deal_type == "rent" else "出售"
+        try:
+            exported = _aiwu_csv_export_one_deal_type(deal_type)
+            csv_bytes = exported["csv_bytes"]
+            filename = exported["filename"]
+            import_result = _property_csv_import_bytes(csv_bytes, filename, line_event=event)
+            preview = _aiwu_csv_preview_from_bytes(csv_bytes, filename, deal_type, limit=6)
+            ok_any = True
+            lines.extend([
+                "",
+                f"【{label}】",
+                f"檔案：{filename}",
+                f"CSV列數：{import_result.get('total_count')}",
+                f"成功匯入/更新：{import_result.get('imported_count')} 筆",
+                f"略過/失敗：{import_result.get('skipped_count')} 筆",
+            ])
+            if preview:
+                lines.append("前幾筆：")
+                lines.extend(preview)
+            if import_result.get("error_samples"):
+                lines.append("錯誤樣本：")
+                lines.extend(import_result.get("error_samples")[:3])
+        except Exception as e:
+            lines.extend(["", f"【{label}】更新失敗：{e}"])
+
+    text = "\n".join(lines).strip()[:5000]
+    if target_id:
+        try:
+            line_push_messages(target_id, [{"type": "text", "text": text}])
+        except Exception as e:
+            print("⚠️ 愛屋CSV：LINE 推播結果失敗：", e)
+    else:
+        print(text)
+    return ok_any
+
+
+def process_line_aiwu_csv_update_event(event):
+    msg = (event or {}).get("message") or {}
+    if msg.get("type") != "text":
+        return {"handled": False}
+    text = msg.get("text") or ""
+    if not _aiwu_csv_is_update_command(text):
+        return {"handled": False}
+
+    deal_types = _aiwu_csv_requested_deal_types(text)
+    label = "、".join(["出租" if x == "rent" else "出售" for x in deal_types])
+
+    try:
+        import threading
+        thread = threading.Thread(target=_aiwu_csv_run_and_push, args=(event, deal_types), daemon=True)
+        thread.start()
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": f"已開始更新愛屋後台 {label} CSV。完成後會自動回傳匯入結果。",
+            "parsed_tag": "愛屋CSV更新",
+        }
+    except Exception as e:
+        return {"handled": True, "ok": False, "reply_text": f"啟動愛屋CSV更新失敗：{e}", "parsed_tag": "愛屋CSV更新"}
+
+
+try:
+    _process_line_message_event_before_aiwu_csv_update = process_line_message_event
+
+    def process_line_message_event(event):
+        result = process_line_aiwu_csv_update_event(event)
+        if result.get("handled"):
+            return result
+        return _process_line_message_event_before_aiwu_csv_update(event)
+
+    print("✅ 愛屋CSV：已支援 LINE 指令自動登入後台匯出並更新 Firebase")
+except Exception as e:
+    print("⚠️ 愛屋CSV：process_line_message_event 覆寫失敗：", e)
+
+
+try:
+    _line_access_gate_before_aiwu_csv_update = line_access_gate
+
+    def line_access_gate(event):
+        msg = (event or {}).get("message") or {}
+        if msg.get("type") == "text" and _aiwu_csv_is_update_command(msg.get("text") or ""):
+            kind, target_id = line_event_source_kind_and_id(event)
+            group = None
+            if kind in ("group", "room"):
+                group = find_line_group_by_target_id(target_id)
+            elif kind == "user" and "find_line_personal_user_by_user_id" in globals():
+                try:
+                    group = find_line_personal_user_by_user_id(target_id)
+                except Exception:
+                    group = None
+            if not group:
+                if target_id:
+                    return False, f"未授權：此 LINE 來源尚未在後台設定。\nID：{target_id}", None
+                return False, "未授權：無法辨識 LINE 來源。", None
+            allowed = set((group or {}).get("command_types") or [])
+            if "all" in allowed or "aiwu_csv_update" in allowed or PROPERTY_CSV_COMMAND_KEY in allowed or "seller" in allowed or "ai_recommend" in allowed:
+                return True, "aiwu_csv_update", group
+            return False, "此群組未開放「愛屋後台CSV更新」權限，請到設定中心勾選愛屋後台CSV更新，或開放物件CSV更新/委託/AI推薦權限。", group
+        return _line_access_gate_before_aiwu_csv_update(event)
+
+    print("✅ 愛屋CSV：權限控管已支援 更新csv檔案 文字指令")
+except Exception as e:
+    print("⚠️ 愛屋CSV：line_access_gate 覆寫失敗：", e)
+
+print("✅ LINE 愛屋後台自動更新 CSV Patch 20260705 已啟用")
+# =============================================================================
+# LINE 愛屋後台自動更新 CSV Patch End
+# =============================================================================
