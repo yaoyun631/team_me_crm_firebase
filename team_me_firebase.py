@@ -25636,3 +25636,389 @@ except Exception as e:
 # =============================================================================
 # Team M.E 指令管理中心 + 設定中心分頁 Patch 20260706B End
 # =============================================================================
+
+
+# =============================================================================
+# Team M.E 自動化指令系統 Final Fix 20260706C
+# 修正重點：
+# 1. 設定中心首頁一定看得到「指令列表」入口，不需要手打網址
+# 2. LINE 權限選項一定包含 automation
+# 3. 自訂指令、#執行、#指令列表、#主機狀態 一律先進自動化指令辨識
+# 4. 修正已新增指令但 LINE 仍無法建立 automation_tasks 的問題
+# 5. 預設補上：#上架樂屋售新物件 -> rakuya_sell_new_listings
+# =============================================================================
+
+# ---- 1) automation 指令類型一定加入權限選項 ----
+try:
+    AUTOMATION_COMMAND_TYPE_KEY = "automation"
+except Exception:
+    AUTOMATION_COMMAND_TYPE_KEY = "automation"
+
+try:
+    if isinstance(LINE_COMMAND_TYPE_OPTIONS, list):
+        if not any(str(x[0]) == "automation" for x in LINE_COMMAND_TYPE_OPTIONS):
+            LINE_COMMAND_TYPE_OPTIONS.append((
+                "automation",
+                "自動化任務指令：#指令列表、#執行、#更新CSV、#上架樂屋售新物件"
+            ))
+except Exception as e:
+    print("⚠️ automation 權限選項加入失敗：", e)
+
+
+# ---- 2) 預設自動化指令：不管 marker 是否存在，都補齊缺少的預設指令 ----
+try:
+    DEFAULT_AUTOMATION_ALIASES.update({
+        "上架樂屋售新物件": {
+            "task_type": "rakuya_sell_new_listings",
+            "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+            "description": "比對愛屋出售最新兩份 CSV，產生新物件待上架清單並執行樂屋出售自動上架",
+        },
+        "更新出售CSV": {
+            "task_type": "aiwu_sell_csv",
+            "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+            "description": "愛屋出售 CSV 下載並同步",
+        },
+        "更新出租CSV": {
+            "task_type": "aiwu_rent_csv",
+            "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+            "description": "愛屋出租 CSV 下載並同步",
+        },
+        "更新愛屋CSV": {
+            "task_type": "aiwu_all_csv",
+            "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+            "description": "愛屋出售＋出租 CSV 下載並同步",
+        },
+        "更新樂屋": {
+            "task_type": "rakuya_inventory_cycle",
+            "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+            "description": "樂屋庫存輪替上架",
+        },
+    })
+except Exception as e:
+    print("⚠️ 預設自動化指令補齊失敗：", e)
+
+
+def ensure_default_automation_aliases_final():
+    """每次啟動都補齊預設指令；不再因為 _default_initialized 存在而跳過。"""
+    try:
+        now_iso = now_taipei().isoformat()
+        for alias, cfg in (DEFAULT_AUTOMATION_ALIASES or {}).items():
+            doc_id = _auto_cmd_doc_id(alias)
+            ref = db.collection(AUTOMATION_ALIAS_COLLECTION).document(doc_id)
+            snap = ref.get()
+            if snap.exists:
+                current = snap.to_dict() or {}
+                # 已存在就不覆蓋使用者自訂內容，只確保必要欄位存在。
+                patch_data = {
+                    "alias": current.get("alias") or alias,
+                    "task_type": current.get("task_type") or cfg.get("task_type", ""),
+                    "target_worker": current.get("target_worker") or cfg.get("target_worker", DEFAULT_AUTOMATION_WORKER_ID),
+                    "description": current.get("description") or cfg.get("description", ""),
+                    "enabled": current.get("enabled", True),
+                    "updated_at": current.get("updated_at") or now_iso,
+                }
+                ref.set(patch_data, merge=True)
+            else:
+                ref.set({
+                    "alias": alias,
+                    "task_type": cfg.get("task_type", ""),
+                    "target_worker": cfg.get("target_worker", DEFAULT_AUTOMATION_WORKER_ID),
+                    "description": cfg.get("description", ""),
+                    "enabled": True,
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                    "created_by": "system_default_final",
+                }, merge=True)
+
+        db.collection(AUTOMATION_ALIAS_COLLECTION).document("_default_initialized").set({
+            "initialized": True,
+            "updated_at": now_iso,
+            "version": "20260706C",
+        }, merge=True)
+    except Exception as e:
+        print("⚠️ 預設自動化指令補齊失敗：", e)
+
+
+try:
+    ensure_default_automation_aliases = ensure_default_automation_aliases_final
+    ensure_default_automation_aliases()
+except Exception as e:
+    print("⚠️ ensure_default_automation_aliases final 套用失敗：", e)
+
+
+# ---- 3) 指令辨識：先辨識 automation，再回到原本 CRM 指令 ----
+try:
+    _detect_line_command_type_base_final = detect_line_command_type
+
+    def detect_line_command_type(text: str, event=None) -> str:
+        raw = (text or "").strip().replace("＃", "#")
+        if not raw:
+            return ""
+
+        first = raw.splitlines()[0].strip()
+        body = first[1:].strip() if first.startswith("#") else first.strip()
+        body_no_space = re.sub(r"\s+", "", body)
+
+        # 系統查 ID 保持原邏輯
+        if body_no_space in ("綁定", "群組ID", "查詢群組ID", "取得群組ID", "GroupID", "groupid"):
+            return "system_group_id"
+
+        # 自動化固定指令
+        if (
+            body_no_space in ("主機狀態", "自動化狀態", "主機列表", "指令列表", "自動化指令", "指令管理", "任務指令")
+            or body_no_space.startswith("新增指令")
+            or body_no_space.startswith("修改指令")
+            or body_no_space.startswith("設定指令")
+            or body_no_space.startswith("刪除指令")
+            or body_no_space.startswith("移除指令")
+            or body_no_space.startswith("執行")
+        ):
+            return "automation"
+
+        # 自訂指令 alias
+        if first.startswith("#"):
+            try:
+                ensure_default_automation_aliases()
+                doc_id, data = get_automation_alias(body)
+                if data:
+                    return "automation"
+            except Exception as e:
+                print("⚠️ 自訂指令辨識失敗：", e)
+
+        return _detect_line_command_type_base_final(text, event=event)
+
+    print("✅ detect_line_command_type final 已啟用：支援自訂 automation 指令")
+except Exception as e:
+    print("⚠️ detect_line_command_type final 套用失敗：", e)
+
+
+# ---- 4) 權限判斷：支援 automation；若群組是 all 或有 automation 即可執行 ----
+try:
+    _line_group_allows_command_base_final = line_group_allows_command
+
+    def line_group_allows_command(group, command_type: str) -> bool:
+        if not group or not group.get("enabled"):
+            return False
+
+        allowed = set(group.get("command_types") or [])
+
+        if "all" in allowed:
+            return True
+
+        # automation 一定以 command_types 內的 automation 為準
+        if command_type == "automation":
+            return "automation" in allowed
+
+        return command_type in allowed
+
+    print("✅ line_group_allows_command final 已啟用：支援 automation 權限")
+except Exception as e:
+    print("⚠️ line_group_allows_command final 套用失敗：", e)
+
+
+# ---- 5) LINE message 處理：自動化指令優先處理 ----
+try:
+    _process_line_message_event_base_final = process_line_message_event
+
+    def process_line_message_event(event):
+        try:
+            result = process_line_dynamic_command_event(event)
+            if result and result.get("handled"):
+                return result
+        except Exception as e:
+            print("⚠️ 自動化指令處理失敗：", e)
+            return {
+                "handled": True,
+                "ok": False,
+                "reply_text": f"❌ 自動化指令處理失敗：{e}",
+                "parsed_tag": "automation_error",
+            }
+
+        return _process_line_message_event_base_final(event)
+
+    print("✅ process_line_message_event final 已啟用：automation 優先")
+except Exception as e:
+    print("⚠️ process_line_message_event final 套用失敗：", e)
+
+
+# ---- 6) LINE webhook：重新覆蓋，確保使用最新 detect / process / gate ----
+def line_webhook_final_with_automation_acl():
+    raw_body = request.get_data(cache=False, as_text=False)
+    signature = request.headers.get("x-line-signature", "")
+
+    if not verify_line_signature(raw_body, signature):
+        return "Invalid signature", 400
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception as e:
+        print("⚠️ LINE webhook JSON 解析失敗：", e)
+        return "Bad Request", 400
+
+    events = payload.get("events", [])
+    for event in events:
+        try:
+            reply_token = event.get("replyToken")
+
+            # 查群組 ID 任何來源都放行
+            if (event.get("message") or {}).get("type") == "text":
+                msg_text = (event.get("message") or {}).get("text", "")
+                if detect_line_command_type(msg_text) == "system_group_id":
+                    kind, target_id = line_event_source_kind_and_id(event)
+                    msg = f"來源類型：{kind}\nID：{target_id or '-'}\n請複製這個 ID 到後台「設定中心 → LINE 群組權限」。"
+                    if reply_token:
+                        reply_line_text(reply_token, msg)
+                    continue
+
+            allowed, reason_or_cmd, group = line_access_gate(event)
+            if not allowed:
+                if reply_token:
+                    reply_line_text(reply_token, reason_or_cmd)
+                continue
+
+            if event.get("type") == "postback":
+                result = process_line_postback_event(event)
+            else:
+                result = process_line_message_event(event)
+
+            if not result or not result.get("handled"):
+                continue
+
+            if not reply_token:
+                continue
+
+            reply_result = None
+            if result.get("reply_messages"):
+                reply_result = reply_line_messages(reply_token, result.get("reply_messages") or [])
+            elif result.get("reply_flex"):
+                reply_result = reply_line_flex(
+                    reply_token,
+                    result.get("reply_text", "CRM 卡片"),
+                    result.get("reply_flex"),
+                    quick_reply_items=result.get("reply_quick_reply"),
+                )
+            elif result.get("reply_text"):
+                reply_result = reply_line_text(reply_token, result.get("reply_text", ""))
+
+            if result.get("ok") and result.get("target_type") and result.get("target_id") and reply_result:
+                for sent in reply_result.get("sent_messages", []):
+                    sent_id = str(sent.get("id", "")).strip()
+                    if sent_id:
+                        save_line_message_link(
+                            sent_id,
+                            result["target_type"],
+                            result["target_id"],
+                            tag=result.get("parsed_tag", ""),
+                            action="bot_reply",
+                            customer_name=result.get("customer_name", ""),
+                            phone=result.get("phone", ""),
+                            source_event=event,
+                        )
+        except Exception as e:
+            print("⚠️ 處理 LINE event 發生錯誤：", e)
+
+    return "OK", 200
+
+
+try:
+    app.view_functions["line_webhook"] = line_webhook_final_with_automation_acl
+    print("✅ line_webhook final 已覆蓋：自訂 automation 指令可建立 automation_tasks")
+except Exception as e:
+    print("⚠️ line_webhook final 覆蓋失敗：", e)
+
+
+# ---- 7) 設定中心首頁直接顯示「指令列表」入口 ----
+COMMAND_SETTINGS_HOME_CARD_FINAL = """
+        <div id="commands" class="setting-card p-4 mb-4">
+          <h4 class="section-title">指令列表</h4>
+          <div class="hint mb-3">
+            這裡可以管理 LINE 自訂指令名稱、對應的任務代號與指定主機。
+            以後新增新的 .py / .bat，只要在這裡新增指令，不需要再改 Render 主程式。
+          </div>
+          <div class="d-flex flex-wrap gap-2">
+            <a class="btn btn-primary" href="{{ url_for('automation_command_settings') }}">進入指令列表</a>
+            <a class="btn btn-outline-secondary" href="{{ url_for('automation_command_settings') }}#new-command">新增指令</a>
+          </div>
+        </div>
+"""
+
+
+def patch_line_settings_template_final(template_text: str) -> str:
+    if not template_text:
+        return template_text
+
+    # 左側選單加入指令列表
+    if 'href="#commands"' not in template_text:
+        template_text = template_text.replace(
+            '<a class="list-group-item list-group-item-action" href="#groups">LINE 群組權限</a>',
+            '<a class="list-group-item list-group-item-action" href="#groups">LINE 群組權限</a>\n'
+            '            <a class="list-group-item list-group-item-action" href="#commands">指令列表</a>'
+        )
+
+    # 主內容加入指令列表卡片，放在 LINE 群組權限後面
+    if 'id="commands"' not in template_text:
+        marker = '<div id="card" class="setting-card p-4 mb-4">'
+        template_text = template_text.replace(marker, COMMAND_SETTINGS_HOME_CARD_FINAL + "\n\n        " + marker, 1)
+
+    # 指令說明補 automation
+    if "#指令列表" not in template_text:
+        template_text = template_text.replace(
+            '<div class="col-md-6"><strong>客需 / 委託 / 開發</strong><br><span class="code">#新增客需 / #新增委託 / #新增開發</span></div>',
+            '<div class="col-md-6"><strong>客需 / 委託 / 開發</strong><br><span class="code">#新增客需 / #新增委託 / #新增開發</span></div>\n'
+            '            <div class="col-md-6"><strong>自動化任務</strong><br><span class="code">#指令列表 / #執行 aiwu_sell_csv @ELLEN-PC / #上架樂屋售新物件</span></div>'
+        )
+
+    return template_text
+
+
+try:
+    LINE_SETTINGS_CENTER_TEMPLATE = patch_line_settings_template_final(LINE_SETTINGS_CENTER_TEMPLATE)
+    print("✅ 設定中心首頁 final 已加入「指令列表」入口")
+except Exception as e:
+    print("⚠️ 設定中心首頁 final patch 失敗：", e)
+
+
+try:
+    # 再次覆蓋設定中心，確保 command_options 帶有 automation 並使用已 patch 的 template
+    app.view_functions["line_card_settings"] = login_required(line_card_settings_center)
+    print("✅ 設定中心 final 已覆蓋：左側顯示指令列表，權限選項含 automation")
+except Exception as e:
+    print("⚠️ 設定中心 final 覆蓋失敗：", e)
+
+
+# ---- 8) 健康檢查：部署後可開 /debug/automation-check 確認 ----
+@app.route("/debug/automation-check")
+@login_required
+def debug_automation_check():
+    try:
+        ensure_default_automation_aliases()
+    except Exception:
+        pass
+
+    aliases = []
+    try:
+        for item in list_automation_aliases(include_disabled=True):
+            aliases.append({
+                "alias": item.get("alias"),
+                "task_type": item.get("task_type"),
+                "target_worker": item.get("target_worker"),
+                "enabled": item.get("enabled", True),
+            })
+    except Exception as e:
+        aliases.append({"error": str(e)})
+
+    return {
+        "ok": True,
+        "automation_in_command_options": any(str(x[0]) == "automation" for x in LINE_COMMAND_TYPE_OPTIONS),
+        "command_options": LINE_COMMAND_TYPE_OPTIONS,
+        "aliases": aliases,
+        "line_webhook_func": getattr(app.view_functions.get("line_webhook"), "__name__", ""),
+        "line_card_settings_func": getattr(app.view_functions.get("line_card_settings"), "__name__", ""),
+        "version": "20260706C",
+    }
+
+
+print("✅ Team M.E 自動化指令系統 Final Fix 20260706C 載入完成")
+# =============================================================================
+# Team M.E 自動化指令系統 Final Fix End
+# =============================================================================
