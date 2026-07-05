@@ -24184,3 +24184,305 @@ print("✅ LINE 愛屋後台自動更新 CSV Patch 20260705 已啟用")
 # =============================================================================
 # LINE 愛屋後台自動更新 CSV Patch End
 # =============================================================================
+
+
+
+# =============================================================================
+# Patch 20260705B：關閉愛屋後台自動更新 CSV，保留 LINE 手動上傳 CSV；新增樂屋曝光上架自動更新
+# =============================================================================
+
+# 1) 關閉「更新csv檔案」自動登入愛屋後台的舊流程。
+#    仍保留前一段「LINE 直接丟 CSV 附件」的手動上傳更新功能。
+def _teamme_manual_csv_upload_help_text():
+    return (
+        "已關閉：愛屋後台自動登入更新 CSV。\n\n"
+        "現在請改用原本方式：\n"
+        "直接把出售或出租 CSV 檔案丟到 LINE 群組，Bot 會自動判斷出售/出租並更新 Firebase 物件庫。\n\n"
+        "檔名建議：\n"
+        "愛屋_售_20260705.csv\n"
+        "愛屋_出租_20260705.csv"
+    )
+
+
+def _teamme_is_disabled_aiwu_csv_text_command(text: str):
+    raw = (text or "").strip().replace("＃", "#")
+    first = _teamme_first_nonempty_line(raw) if "_teamme_first_nonempty_line" in globals() else (raw.splitlines()[0].strip() if raw else "")
+    normalized = first.replace(" ", "").replace("　", "").lower()
+    if normalized.startswith("#"):
+        normalized = normalized[1:]
+    return normalized in (
+        "更新csv檔案", "更新csv", "更新物件csv", "更新物件csv檔案",
+        "更新出售csv檔案", "更新出售csv", "更新售csv", "更新售物件",
+        "更新出租csv檔案", "更新出租csv", "更新租csv", "更新租物件",
+        "更新愛屋csv", "更新愛屋csv檔案"
+    )
+
+
+# 2) 樂屋曝光上架自動更新。
+RAKUYA_HOME_URL = "https://www.rakuya.com.tw/"
+RAKUYA_SELL_UP_URL = "https://member.rakuya.com.tw/sell-item/up"
+
+try:
+    if "LINE_COMMAND_TYPE_OPTIONS" in globals():
+        if not any(k == "rakuya_update" for k, _ in LINE_COMMAND_TYPE_OPTIONS):
+            LINE_COMMAND_TYPE_OPTIONS.append((
+                "rakuya_update",
+                "樂屋曝光上架更新：輸入 更新樂屋物件，自動登入樂屋並執行一鍵手動更新"
+            ))
+    print("✅ 樂屋更新：設定中心已加入樂屋更新權限")
+except Exception as e:
+    print("⚠️ 樂屋更新：加入設定中心權限失敗：", e)
+
+
+def _rakuya_update_source_target_id(event):
+    source = (event or {}).get("source") or {}
+    return source.get("groupId") or source.get("roomId") or source.get("userId") or ""
+
+
+def _rakuya_is_update_command(text: str):
+    raw = (text or "").strip().replace("＃", "#")
+    first = _teamme_first_nonempty_line(raw) if "_teamme_first_nonempty_line" in globals() else (raw.splitlines()[0].strip() if raw else "")
+    normalized = first.replace(" ", "").replace("　", "").lower()
+    if normalized.startswith("#"):
+        normalized = normalized[1:]
+    return normalized in (
+        "更新樂屋物件", "樂屋更新物件", "更新樂屋", "樂屋更新",
+        "樂屋曝光", "樂屋曝光上架", "更新樂屋曝光", "更新樂屋曝光上架",
+        "rakuya更新", "updaterakuya"
+    )
+
+
+def _rakuya_assert_credentials():
+    # 請在 Render Environment Variables 設定：RAKUYA_LOGIN_ID、RAKUYA_PASSWORD
+    login_id = (os.environ.get("RAKUYA_LOGIN_ID") or "").strip()
+    password = (os.environ.get("RAKUYA_PASSWORD") or "").strip()
+    if not login_id or not password:
+        raise RuntimeError("尚未設定樂屋帳密環境變數：RAKUYA_LOGIN_ID、RAKUYA_PASSWORD")
+    return login_id, password
+
+
+def _rakuya_click_first_visible(page, selectors, timeout=12000):
+    last_error = None
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            loc.wait_for(state="visible", timeout=timeout)
+            loc.click(timeout=timeout)
+            return selector
+        except Exception as e:
+            last_error = e
+            print(f"⚠️ 樂屋更新：點擊失敗 {selector}：{e}")
+    if last_error:
+        raise last_error
+    raise RuntimeError("沒有可點擊的 selector")
+
+
+def _rakuya_run_one_key_update():
+    from playwright.sync_api import sync_playwright
+
+    login_id, password = _rakuya_assert_credentials()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-setuid-sandbox",
+            ],
+        )
+        context = browser.new_context(viewport={"width": 1440, "height": 1000})
+        page = context.new_page()
+        page.set_default_timeout(45000)
+        steps = []
+
+        try:
+            steps.append("開啟樂屋首頁")
+            page.goto(RAKUYA_HOME_URL, wait_until="domcontentloaded", timeout=60000)
+
+            # 若尚未登入，點登入並填帳密；若已被導向登入頁也可直接填。
+            try:
+                if page.locator("#login_username").count() == 0:
+                    _rakuya_click_first_visible(page, [
+                        "span.menu__text:has-text('登入')",
+                        "text=登入",
+                    ], timeout=12000)
+                    page.wait_for_timeout(1200)
+            except Exception as e:
+                print("⚠️ 樂屋更新：首頁登入按鈕點擊略過：", e)
+
+            steps.append("輸入帳密")
+            page.locator("#login_username").wait_for(state="visible", timeout=30000)
+            page.fill("#login_username", login_id)
+            page.fill("#login_password", password)
+            page.click("#loginWithId")
+            page.wait_for_load_state("networkidle", timeout=60000)
+            page.wait_for_timeout(2000)
+
+            steps.append("進入曝光上架頁")
+            page.goto(RAKUYA_SELL_UP_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=60000)
+            page.wait_for_timeout(2000)
+
+            # 點「一鍵手動更新」
+            steps.append("點擊一鍵手動更新")
+            _rakuya_click_first_visible(page, [
+                "span:has-text('一鍵手動更新')",
+                "text=一鍵手動更新",
+                "button:has-text('一鍵手動更新')",
+            ], timeout=30000)
+            page.wait_for_timeout(1200)
+
+            # 點確認
+            steps.append("確認更新")
+            _rakuya_click_first_visible(page, [
+                "button.el-button--primary.el-button--small:has-text('確定')",
+                "button:has-text('確定')",
+                "text=確定",
+            ], timeout=30000)
+
+            # 等待頁面回應，嘗試抓成功文字。
+            page.wait_for_timeout(5000)
+            success_text = ""
+            try:
+                success_text = page.locator(".el-message, .el-notification, .el-dialog, body").last.inner_text(timeout=5000)
+                success_text = re.sub(r"\s+", " ", success_text or "").strip()
+                if len(success_text) > 500:
+                    success_text = success_text[:500]
+            except Exception:
+                success_text = ""
+
+            return {
+                "ok": True,
+                "steps": steps,
+                "message": success_text or "已送出樂屋一鍵手動更新。",
+            }
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+def _rakuya_update_run_and_push(event):
+    target_id = _rakuya_update_source_target_id(event)
+    started_at = now_taipei()
+    try:
+        result = _rakuya_run_one_key_update()
+        elapsed = int((now_taipei() - started_at).total_seconds())
+        text = (
+            "樂屋物件自動更新完成\n\n"
+            f"結果：{result.get('message') or '已送出一鍵手動更新'}\n"
+            f"耗時：{elapsed} 秒"
+        )
+    except Exception as e:
+        elapsed = int((now_taipei() - started_at).total_seconds())
+        text = (
+            "樂屋物件自動更新失敗\n\n"
+            f"錯誤：{e}\n"
+            f"耗時：{elapsed} 秒\n\n"
+            "請確認 Render 已安裝 Playwright Chromium，且 RAKUYA_LOGIN_ID / RAKUYA_PASSWORD 已設定。"
+        )
+
+    if target_id:
+        try:
+            line_push_messages(target_id, [{"type": "text", "text": text[:5000]}])
+        except Exception as e:
+            print("⚠️ 樂屋更新：LINE 推播結果失敗：", e)
+    else:
+        print(text)
+
+
+def process_line_rakuya_update_event(event):
+    msg = (event or {}).get("message") or {}
+    if msg.get("type") != "text":
+        return {"handled": False}
+    text = msg.get("text") or ""
+    if not _rakuya_is_update_command(text):
+        return {"handled": False}
+
+    try:
+        import threading
+        thread = threading.Thread(target=_rakuya_update_run_and_push, args=(event,), daemon=True)
+        thread.start()
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": "已開始更新樂屋曝光上架，完成後會自動回傳結果。",
+            "parsed_tag": "樂屋更新",
+        }
+    except Exception as e:
+        return {"handled": True, "ok": False, "reply_text": f"啟動樂屋更新失敗：{e}", "parsed_tag": "樂屋更新"}
+
+
+try:
+    _process_line_message_event_before_rakuya_update = process_line_message_event
+
+    def process_line_message_event(event):
+        msg = (event or {}).get("message") or {}
+        if msg.get("type") == "text" and _teamme_is_disabled_aiwu_csv_text_command(msg.get("text") or ""):
+            return {
+                "handled": True,
+                "ok": True,
+                "reply_text": _teamme_manual_csv_upload_help_text(),
+                "parsed_tag": "CSV手動上傳提醒",
+            }
+        result = process_line_rakuya_update_event(event)
+        if result.get("handled"):
+            return result
+        return _process_line_message_event_before_rakuya_update(event)
+
+    print("✅ Patch：已關閉愛屋自動CSV文字指令，並新增樂屋曝光上架更新")
+except Exception as e:
+    print("⚠️ Patch：process_line_message_event 覆寫失敗：", e)
+
+
+try:
+    _line_access_gate_before_rakuya_update = line_access_gate
+
+    def line_access_gate(event):
+        msg = (event or {}).get("message") or {}
+        if msg.get("type") == "text" and _teamme_is_disabled_aiwu_csv_text_command(msg.get("text") or ""):
+            # 讓這個文字指令能進來回覆「請改手動上傳 CSV」。實際匯入仍走附件流程。
+            return True, "property_csv", None
+
+        if msg.get("type") == "text" and _rakuya_is_update_command(msg.get("text") or ""):
+            kind, target_id = line_event_source_kind_and_id(event)
+            group = None
+            if kind in ("group", "room"):
+                group = find_line_group_by_target_id(target_id)
+            elif kind == "user" and "find_line_personal_user_by_user_id" in globals():
+                try:
+                    group = find_line_personal_user_by_user_id(target_id)
+                except Exception:
+                    group = None
+            if not group:
+                if target_id:
+                    return False, f"未授權：此 LINE 來源尚未在後台設定。\nID：{target_id}", None
+                return False, "未授權：無法辨識 LINE 來源。", None
+            allowed = set((group or {}).get("command_types") or [])
+            if "all" in allowed or "rakuya_update" in allowed or "seller" in allowed or PROPERTY_CSV_COMMAND_KEY in allowed:
+                return True, "rakuya_update", group
+            return False, "此群組未開放「樂屋曝光上架更新」權限，請到設定中心勾選樂屋更新，或開放物件CSV更新/委託權限。", group
+
+        return _line_access_gate_before_rakuya_update(event)
+
+    print("✅ Patch：權限控管已支援樂屋更新，並關閉愛屋自動CSV")
+except Exception as e:
+    print("⚠️ Patch：line_access_gate 覆寫失敗：", e)
+
+print("✅ Patch 20260705B 已啟用：手動 CSV 上傳 + 樂屋自動更新")
+# =============================================================================
+# Patch 20260705B End
+# =============================================================================
