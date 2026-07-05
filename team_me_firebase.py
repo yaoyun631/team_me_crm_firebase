@@ -23396,3 +23396,165 @@ try:
     print("✅ CASE_FORM_AI V4：設定中心已新增 AI文案 / 案件表獨立權限勾選 case_ai")
 except Exception as e:
     print("⚠️ CASE_FORM_AI V4 權限勾選修正失敗：", e)
+
+
+# =============================================================================
+# LINE CRM Patch 20260705：
+# 1) #新增客需 / #買方追蹤 等欄位支援多行內容，備註/內容換行也會完整寫入。
+# 2) LINE 訊息第一行沒有 # 時視為一般聊天，不回覆「沒有可辨識的指令」。
+#    注意：此段放在檔案最後，目的是覆蓋前面多個歷史版本的同名函式。
+# =============================================================================
+def _teamme_first_nonempty_line(text: str) -> str:
+    for ln in (text or "").splitlines():
+        if ln.strip():
+            return ln.strip()
+    return ""
+
+
+def _teamme_parse_key_value_multiline(body_lines):
+    """
+    解析 LINE #指令的欄位，支援：
+      備註: 第一行
+      第二行
+      第三行
+    會解析成 fields['content'] = '第一行\n第二行\n第三行'
+
+    規則：
+    - 遇到「欄位: 值」就開新欄位
+    - 沒有冒號的行，接到上一個欄位後面
+    - 空白行也會保留在上一個欄位中，避免使用者分段備註消失
+    """
+    fields = {}
+    current_key = None
+
+    for raw in body_lines:
+        raw = raw.rstrip("\r")
+        line = raw.strip()
+
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", line) if line else None
+        if m:
+            key = normalize_line_key(m.group(1))
+            value = (m.group(2) or "").strip()
+            current_key = key
+            if key == "labels":
+                fields[key] = parse_label_csv(value)
+            else:
+                fields[key] = value
+            continue
+
+        # 沒有「欄位:」的行，視為上一個欄位的續行。
+        if current_key:
+            if current_key == "labels":
+                old = ensure_list(fields.get(current_key))
+                more = parse_label_csv(line)
+                fields[current_key] = dedupe_keep_order(old + more)
+            else:
+                old = fields.get(current_key, "")
+                if old:
+                    fields[current_key] = old + "\n" + line
+                else:
+                    fields[current_key] = line
+
+    return fields
+
+
+def parse_line_formatted_message(text: str):
+    raw_text = text or ""
+    lines = [ln.rstrip() for ln in raw_text.splitlines()]
+    nonempty = [ln.strip() for ln in lines if ln.strip()]
+    if not nonempty:
+        return None
+
+    first = nonempty[0].replace("＃", "#")
+    if not first.startswith("#"):
+        return None
+
+    tag = first.lstrip("#").strip()
+    tag_map = {
+        "新增客需": "create_buyer_need",
+        "新增委託": "create_seller_listing",
+        "新增開發": "create_development",
+        "新增開發批次": "create_development_batch",
+        "開發追蹤": "development_followup",
+        "買方追蹤": "buyer_followup",
+        "賣方追蹤": "seller_followup",
+        "客戶分類": "classify",
+        "查詢紀錄": "query_records",
+        "查詢委託到期": "query_contract_end",
+        "帶看": "buyer_followup",
+        "成交": "buyer_followup",
+        "委託": "seller_followup",
+        "紀錄": "generic_note",
+    }
+    action = tag_map.get(tag)
+    if not action:
+        return None
+
+    # 取第一個 #標題 後面的所有原始行，保留換行。
+    started = False
+    body_lines = []
+    for ln in lines:
+        stripped = ln.strip().replace("＃", "#")
+        if not started:
+            if stripped == first:
+                started = True
+            continue
+        body_lines.append(ln)
+    raw_body = "\n".join(body_lines).strip("\n")
+
+    if action == "create_development":
+        fields = _strict_parse_development_fields(raw_body)
+        return {"tag": tag, "action": action, "fields": fields, "raw_text": raw_text, "raw_body": raw_body}
+
+    if action == "create_development_batch":
+        items = _strict_parse_development_batch(raw_body)
+        if not items:
+            return None
+        return {"tag": tag, "action": action, "fields": {}, "raw_text": raw_text, "raw_body": raw_body}
+
+    fields = _teamme_parse_key_value_multiline(body_lines)
+
+    if tag in ("買方追蹤", "帶看", "成交") and not fields.get("target_type"):
+        fields["target_type"] = "buyer"
+    if tag in ("賣方追蹤", "委託") and not fields.get("target_type"):
+        fields["target_type"] = "seller"
+    if tag == "開發追蹤" and not fields.get("target_type"):
+        fields["target_type"] = "development"
+
+    fields["target_type"] = normalize_target_type(fields.get("target_type", "")) or fields.get("target_type", "")
+    fields["intent_type"] = normalize_intent_type(fields.get("intent_type_raw", ""), fields)
+    fields["deal_type"] = normalize_deal_type(fields.get("deal_type_raw", ""))
+    fields["limit"] = parse_int_limit(fields.get("limit", 10), default=10, max_value=30)
+
+    if action == "create_buyer_need":
+        if not (fields.get("name") and fields.get("phone")):
+            return None
+    elif action == "create_seller_listing":
+        if not (fields.get("name") and fields.get("phone")):
+            return None
+    elif action in ("buyer_followup", "seller_followup", "classify", "query_records", "query_contract_end", "development_followup"):
+        if not (fields.get("record_id") or fields.get("phone") or fields.get("name") or fields.get("address")):
+            return None
+
+    return {"tag": tag, "action": action, "fields": fields, "raw_text": raw_text, "raw_body": raw_body}
+
+
+# 沒有文字就不要呼叫 LINE reply API，避免用空訊息硬回覆。
+_teamme_reply_line_text_before_no_empty = reply_line_text
+def reply_line_text(reply_token: str, text_message: str):
+    if not (text_message or "").strip():
+        return None
+    return _teamme_reply_line_text_before_no_empty(reply_token, text_message)
+
+
+_teamme_line_access_gate_before_ignore_non_hash = line_access_gate
+def line_access_gate(event):
+    if (event.get("message") or {}).get("type") == "text":
+        text = ((event.get("message") or {}).get("text") or "").replace("＃", "#")
+        first = _teamme_first_nonempty_line(text)
+        # 沒有 # 開頭：當成群組一般聊天，不回覆、不處理。
+        if first and not first.startswith("#"):
+            return False, "", None
+    return _teamme_line_access_gate_before_ignore_non_hash(event)
+
+print("✅ LINE CRM Patch 20260705：多行備註保存 + 非 # 訊息靜默忽略 已啟用")
