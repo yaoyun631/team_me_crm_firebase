@@ -24486,3 +24486,236 @@ print("✅ Patch 20260705B 已啟用：手動 CSV 上傳 + 樂屋自動更新")
 # =============================================================================
 # Patch 20260705B End
 # =============================================================================
+
+# =============================================================================
+# Patch 20260705C：樂屋登入流程修正
+# - 原本等待 #login_username 會 Timeout，原因常見是登入視窗預設停在「電話驗證登入」
+# - 這版會先點「帳號密碼登入」，並支援多組 selector
+# - 失敗時回傳 current_url / title / 目前頁面片段，方便判斷是否卡驗證、改版或被導頁
+# =============================================================================
+
+def _rakuya_first_visible_locator(page, selectors, timeout=8000):
+    last_error = None
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            loc.wait_for(state="visible", timeout=timeout)
+            return loc, selector
+        except Exception as e:
+            last_error = e
+    if last_error:
+        raise last_error
+    raise RuntimeError("找不到可見元素")
+
+
+def _rakuya_click_text_by_js(page, text_value: str):
+    """用 JS 點擊可見文字，避開 Playwright strict mode 與多個 text=登入 的問題。"""
+    script = """
+    (txt) => {
+      const nodes = Array.from(document.querySelectorAll('a,button,span,div,li'));
+      function visible(el) {
+        const s = window.getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return s && s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+      }
+      const candidates = nodes.filter(el => visible(el) && (el.innerText || el.textContent || '').trim() === txt);
+      const el = candidates[candidates.length - 1];
+      if (!el) return false;
+      el.click();
+      return true;
+    }
+    """
+    try:
+        return bool(page.evaluate(script, text_value))
+    except Exception:
+        return False
+
+
+def _rakuya_debug_page_text(page):
+    try:
+        body = page.locator("body").inner_text(timeout=3000)
+        body = re.sub(r"\s+", " ", body or "").strip()
+        return body[:700]
+    except Exception:
+        return ""
+
+
+def _rakuya_run_one_key_update():
+    from playwright.sync_api import sync_playwright
+
+    login_id, password = _rakuya_assert_credentials()
+    steps = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-setuid-sandbox",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1000},
+            locale="zh-TW",
+            timezone_id="Asia/Taipei",
+        )
+        page = context.new_page()
+        page.set_default_timeout(45000)
+
+        try:
+            steps.append("開啟樂屋曝光上架頁")
+            page.goto(RAKUYA_SELL_UP_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2500)
+
+            # 如果尚未登入，通常會被導到首頁/會員登入狀態；先開首頁並叫出登入視窗。
+            if page.locator("span:has-text('一鍵手動更新'), button:has-text('一鍵手動更新')").count() == 0:
+                steps.append("開啟樂屋首頁並叫出登入視窗")
+                page.goto(RAKUYA_HOME_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2000)
+
+                # 嘗試點登入入口。樂屋首頁有多個「登入」，用多方法提高成功率。
+                clicked_login = False
+                for selector in [
+                    "span.menu__text:has-text('登入')",
+                    "a:has-text('登入')",
+                    "span:has-text('登入')",
+                    "text=登入",
+                ]:
+                    try:
+                        page.locator(selector).first.click(timeout=4000)
+                        clicked_login = True
+                        break
+                    except Exception:
+                        pass
+                if not clicked_login:
+                    clicked_login = _rakuya_click_text_by_js(page, "登入")
+                page.wait_for_timeout(1500)
+
+                # 樂屋登入視窗預設常在「電話驗證登入」，必須切到「帳號密碼登入」。
+                steps.append("切換帳號密碼登入")
+                for selector in [
+                    "text=帳號密碼登入",
+                    "span:has-text('帳號密碼登入')",
+                    "button:has-text('帳號密碼登入')",
+                    "div:has-text('帳號密碼登入')",
+                ]:
+                    try:
+                        page.locator(selector).last.click(timeout=5000)
+                        page.wait_for_timeout(1000)
+                        break
+                    except Exception:
+                        pass
+                _rakuya_click_text_by_js(page, "帳號密碼登入")
+                page.wait_for_timeout(1000)
+
+                steps.append("輸入樂屋帳密")
+                username_loc, username_selector = _rakuya_first_visible_locator(page, [
+                    "#login_username",
+                    "input[name='login_id']",
+                    "input[data-type='id']",
+                    "input[placeholder*='電子信箱']",
+                    "input[placeholder*='手機號碼']",
+                ], timeout=15000)
+                username_loc.fill(login_id)
+
+                password_loc, password_selector = _rakuya_first_visible_locator(page, [
+                    "#login_password",
+                    "input[name='password']",
+                    "input[type='password']",
+                    "input[placeholder*='密碼']",
+                ], timeout=15000)
+                password_loc.fill(password)
+
+                steps.append("送出登入")
+                submitted = False
+                for selector in [
+                    "#loginWithId",
+                    "span.rkyLoginBtn:has-text('登入')",
+                    ".rkyLoginBtn:has-text('登入')",
+                    "button:has-text('登入')",
+                    "span:has-text('登入')",
+                ]:
+                    try:
+                        page.locator(selector).last.click(timeout=6000)
+                        submitted = True
+                        break
+                    except Exception:
+                        pass
+                if not submitted:
+                    _rakuya_click_text_by_js(page, "登入")
+
+                # 等登入完成，不強制 networkidle，避免 SPA/追蹤請求讓它一直等。
+                page.wait_for_timeout(5000)
+
+            steps.append("進入曝光上架頁")
+            page.goto(RAKUYA_SELL_UP_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(5000)
+
+            # 若登入失敗/需要驗證，直接回報現在畫面。
+            if page.locator("span:has-text('一鍵手動更新'), button:has-text('一鍵手動更新')").count() == 0:
+                debug = _rakuya_debug_page_text(page)
+                raise RuntimeError(
+                    "登入後找不到『一鍵手動更新』，可能帳密錯誤、需要簡訊/驗證碼、或樂屋頁面改版。"
+                    f" current_url={page.url} title={page.title()} page_text={debug}"
+                )
+
+            steps.append("點擊一鍵手動更新")
+            _rakuya_click_first_visible(page, [
+                "span:has-text('一鍵手動更新')",
+                "button:has-text('一鍵手動更新')",
+                "text=一鍵手動更新",
+            ], timeout=30000)
+            page.wait_for_timeout(1500)
+
+            steps.append("確認更新")
+            _rakuya_click_first_visible(page, [
+                "button.el-button--primary.el-button--small:has-text('確定')",
+                ".el-dialog button:has-text('確定')",
+                "button:has-text('確定')",
+                "text=確定",
+            ], timeout=30000)
+
+            page.wait_for_timeout(5000)
+            success_text = ""
+            try:
+                success_text = page.locator(".el-message, .el-notification, .el-dialog, body").last.inner_text(timeout=5000)
+                success_text = re.sub(r"\s+", " ", success_text or "").strip()
+                if len(success_text) > 500:
+                    success_text = success_text[:500]
+            except Exception:
+                success_text = ""
+
+            return {
+                "ok": True,
+                "steps": steps,
+                "message": success_text or "已送出樂屋一鍵手動更新。",
+            }
+        except Exception as e:
+            debug = ""
+            try:
+                debug = f"目前網址：{page.url}\n頁面標題：{page.title()}\n頁面文字：{_rakuya_debug_page_text(page)}"
+            except Exception:
+                pass
+            raise RuntimeError(f"{e}\n{debug}")
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+print("✅ Patch 20260705C：樂屋登入流程修正版已載入")
+# =============================================================================
+# Patch 20260705C End
+# =============================================================================
