@@ -24906,3 +24906,734 @@ except Exception as e:
 # =============================================================================
 # Team M.E Automation Task Center Patch 20260706 End
 # =============================================================================
+
+
+# =============================================================================
+# Team M.E 指令管理中心 + 設定中心分頁 Patch 20260706B
+# 功能：
+# 1. 設定中心新增「指令列表」分頁 /line-card-settings/commands
+# 2. 可在網頁新增 / 修改 / 刪除 LINE 自訂指令
+# 3. LINE 自訂指令會寫入 automation_tasks，由指定主機 Agent 執行
+# 4. 之後新增功能只要：
+#    - 主機 C:\TeamME\agent_config.json 加任務代號
+#    - 設定中心新增指令名稱
+#    不需要再更新 Render 主程式
+# =============================================================================
+
+AUTOMATION_ALIAS_COLLECTION = "automation_command_aliases"
+AUTOMATION_COMMAND_TYPE_KEY = "automation"
+
+try:
+    if isinstance(LINE_COMMAND_TYPE_OPTIONS, list):
+        if not any(x[0] == AUTOMATION_COMMAND_TYPE_KEY for x in LINE_COMMAND_TYPE_OPTIONS):
+            LINE_COMMAND_TYPE_OPTIONS.append((
+                AUTOMATION_COMMAND_TYPE_KEY,
+                "自動化任務指令：自訂指令、#執行、#指令列表、#主機狀態"
+            ))
+except Exception:
+    pass
+
+
+DEFAULT_AUTOMATION_ALIASES = {
+    "更新樂屋": {
+        "task_type": "rakuya_inventory_cycle",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "樂屋庫存輪替上架",
+    },
+    "樂屋更新": {
+        "task_type": "rakuya_inventory_cycle",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "樂屋庫存輪替上架",
+    },
+    "更新出售CSV": {
+        "task_type": "aiwu_sell_csv",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "愛屋出售 CSV 下載並同步 Firebase",
+    },
+    "更新出租CSV": {
+        "task_type": "aiwu_rent_csv",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "愛屋出租 CSV 下載並同步 Firebase",
+    },
+    "更新愛屋CSV": {
+        "task_type": "aiwu_all_csv",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "愛屋出售＋出租 CSV 下載並同步 Firebase",
+    },
+}
+
+
+def _auto_cmd_doc_id(alias: str) -> str:
+    alias = (alias or "").strip().replace("＃", "#")
+    if alias.startswith("#"):
+        alias = alias[1:].strip()
+    alias = re.sub(r"\s+", "", alias)
+    alias = alias.replace("/", "／")
+    return alias[:120]
+
+
+def _auto_cmd_clean_alias(alias: str) -> str:
+    alias = (alias or "").strip().replace("＃", "#")
+    if alias.startswith("#"):
+        alias = alias[1:].strip()
+    return alias.strip()
+
+
+def _auto_cmd_first_line(raw_text: str) -> str:
+    first = (raw_text or "").strip().splitlines()[0].strip().replace("＃", "#")
+    if first.startswith("#"):
+        first = first[1:].strip()
+    return first.strip()
+
+
+def _auto_cmd_parse_fields(raw_text: str):
+    fields = {}
+    lines = [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
+    for line in lines[1:]:
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", line)
+        if not m:
+            continue
+        key = m.group(1).strip().replace(" ", "")
+        val = m.group(2).strip()
+        fields[key] = val
+    return fields
+
+
+def _auto_cmd_get_field(fields, *names, default=""):
+    for name in names:
+        if name in fields and str(fields[name]).strip():
+            return str(fields[name]).strip()
+    return default
+
+
+def _auto_cmd_extract_worker(text: str, default_worker: str = ""):
+    text = text or ""
+    m = re.search(r"@([A-Za-z0-9_\-]+)", text)
+    if m:
+        return m.group(1).strip()
+
+    parts = text.split()
+    if len(parts) >= 2 and re.match(r"^[A-Za-z0-9_\-]+$", parts[-1]):
+        return parts[-1].strip()
+
+    return (default_worker or DEFAULT_AUTOMATION_WORKER_ID).strip()
+
+
+def ensure_default_automation_aliases():
+    try:
+        marker_ref = db.collection(AUTOMATION_ALIAS_COLLECTION).document("_default_initialized")
+        marker = marker_ref.get()
+        if marker.exists:
+            return
+
+        now_iso = now_taipei().isoformat()
+        for alias, cfg in DEFAULT_AUTOMATION_ALIASES.items():
+            doc_id = _auto_cmd_doc_id(alias)
+            db.collection(AUTOMATION_ALIAS_COLLECTION).document(doc_id).set({
+                "alias": alias,
+                "task_type": cfg.get("task_type", ""),
+                "target_worker": cfg.get("target_worker", DEFAULT_AUTOMATION_WORKER_ID),
+                "description": cfg.get("description", ""),
+                "enabled": True,
+                "created_at": now_iso,
+                "updated_at": now_iso,
+                "created_by": "system_default",
+            }, merge=True)
+
+        marker_ref.set({
+            "initialized": True,
+            "updated_at": now_iso,
+        }, merge=True)
+    except Exception as e:
+        print("⚠️ 預設自動化指令初始化失敗：", e)
+
+
+def list_automation_aliases(include_disabled=True):
+    ensure_default_automation_aliases()
+    docs = list(db.collection(AUTOMATION_ALIAS_COLLECTION).stream())
+    rows = []
+    for doc in docs:
+        if doc.id.startswith("_"):
+            continue
+        data = doc.to_dict() or {}
+        data["id"] = doc.id
+        data.setdefault("alias", doc.id)
+        data.setdefault("task_type", "")
+        data.setdefault("target_worker", DEFAULT_AUTOMATION_WORKER_ID)
+        data.setdefault("description", "")
+        data.setdefault("enabled", True)
+        if include_disabled or data.get("enabled", True):
+            rows.append(data)
+    rows.sort(key=lambda x: (not bool(x.get("enabled", True)), x.get("alias", "")))
+    return rows
+
+
+def get_automation_alias(alias: str):
+    ensure_default_automation_aliases()
+    clean_alias = _auto_cmd_clean_alias(alias)
+    doc_id = _auto_cmd_doc_id(clean_alias)
+    if not doc_id:
+        return None, None
+
+    doc = db.collection(AUTOMATION_ALIAS_COLLECTION).document(doc_id).get()
+    if doc.exists:
+        data = doc.to_dict() or {}
+        if data.get("enabled", True):
+            data["id"] = doc.id
+            return doc.id, data
+
+    # 備援：用欄位查詢，避免舊資料 doc id 不一致。
+    try:
+        docs = list(
+            db.collection(AUTOMATION_ALIAS_COLLECTION)
+            .where("alias", "==", clean_alias)
+            .limit(1)
+            .stream()
+        )
+        if docs:
+            data = docs[0].to_dict() or {}
+            if data.get("enabled", True):
+                data["id"] = docs[0].id
+                return docs[0].id, data
+    except Exception:
+        pass
+
+    return None, None
+
+
+def save_automation_alias(alias: str, task_type: str, target_worker: str = "", description: str = "", enabled=True, event=None):
+    alias = _auto_cmd_clean_alias(alias)
+    task_type = (task_type or "").strip()
+    target_worker = (target_worker or DEFAULT_AUTOMATION_WORKER_ID).strip()
+
+    if not alias:
+        raise ValueError("指令名稱不可空白")
+    if not task_type:
+        raise ValueError("任務代號不可空白")
+
+    doc_id = _auto_cmd_doc_id(alias)
+    now_iso = now_taipei().isoformat()
+    ref = db.collection(AUTOMATION_ALIAS_COLLECTION).document(doc_id)
+    exists = ref.get().exists
+
+    data = {
+        "alias": alias,
+        "task_type": task_type,
+        "target_worker": target_worker,
+        "description": description or "",
+        "enabled": bool(enabled),
+        "updated_at": now_iso,
+        "updated_by": _automation_sender_name(event) if event else session.get("user_name", "設定中心"),
+    }
+    if not exists:
+        data["created_at"] = now_iso
+        data["created_by"] = _automation_sender_name(event) if event else session.get("user_name", "設定中心")
+
+    ref.set(data, merge=True)
+    data["id"] = doc_id
+    return data
+
+
+def delete_automation_alias(alias_or_id: str):
+    doc_id = _auto_cmd_doc_id(alias_or_id)
+    if not doc_id:
+        return False
+    ref = db.collection(AUTOMATION_ALIAS_COLLECTION).document(doc_id)
+    if ref.get().exists:
+        ref.delete()
+        return True
+    return False
+
+
+def automation_alias_list_text(limit=50):
+    rows = list_automation_aliases(include_disabled=False)
+    if not rows:
+        return "目前沒有可用的自動化指令。"
+
+    lines = ["可用自動化指令"]
+    for item in rows[:limit]:
+        lines.append("")
+        lines.append(f"#{item.get('alias', '')}")
+        lines.append(f"任務：{item.get('task_type', '')}")
+        lines.append(f"主機：{item.get('target_worker', '') or DEFAULT_AUTOMATION_WORKER_ID}")
+        desc = item.get("description", "")
+        if desc:
+            lines.append(f"說明：{desc}")
+
+    lines.append("")
+    lines.append("可到後台：設定中心 → 指令列表 修改指令名稱。")
+    return "\n".join(lines).strip()[:5000]
+
+
+def create_automation_task_from_alias(alias_text: str, event, raw_text: str):
+    doc_id, data = get_automation_alias(alias_text)
+    if not data:
+        return None
+
+    task_type = data.get("task_type", "")
+    target_worker = _auto_cmd_extract_worker(alias_text, data.get("target_worker") or DEFAULT_AUTOMATION_WORKER_ID)
+
+    task_id, task_data = _automation_create_task(
+        task_type=task_type,
+        event=event,
+        target_worker=target_worker,
+        command_text=raw_text,
+    )
+
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": (
+            f"✅ 已建立任務：{data.get('alias', alias_text)}\n"
+            f"任務ID：{task_id}\n"
+            f"任務代號：{task_type}\n"
+            f"指定主機：{target_worker}\n\n"
+            "完成後會由主機 Agent 回傳結果。"
+        ),
+        "parsed_tag": data.get("alias", alias_text),
+    }
+
+
+def process_line_dynamic_command_event(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+
+    raw_text = (message.get("text") or "").strip()
+    if not raw_text:
+        return {"handled": False}
+
+    first_raw = raw_text.splitlines()[0].strip().replace("＃", "#")
+    if not first_raw.startswith("#"):
+        return {"handled": False}
+
+    body = _auto_cmd_first_line(raw_text)
+    body_no_space = re.sub(r"\s+", "", body)
+
+    if body_no_space in ("主機狀態", "自動化狀態", "主機列表"):
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": _automation_worker_status_text(),
+            "parsed_tag": "主機狀態",
+        }
+
+    if body_no_space in ("指令列表", "自動化指令", "指令管理", "任務指令"):
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": automation_alias_list_text(),
+            "parsed_tag": "指令列表",
+        }
+
+    if body_no_space.startswith("新增指令") or body_no_space.startswith("修改指令") or body_no_space.startswith("設定指令"):
+        fields = _auto_cmd_parse_fields(raw_text)
+        alias = _auto_cmd_get_field(fields, "名稱", "指令", "指令名稱", "alias")
+        task_type = _auto_cmd_get_field(fields, "任務", "任務代號", "task", "type")
+        target_worker = _auto_cmd_get_field(fields, "主機", "worker", "target_worker", default=DEFAULT_AUTOMATION_WORKER_ID)
+        description = _auto_cmd_get_field(fields, "說明", "描述", "description")
+
+        if not alias or not task_type:
+            parts = body.split()
+            if len(parts) >= 3:
+                alias = alias or parts[1].strip()
+                task_type = task_type or parts[2].strip()
+                if len(parts) >= 4:
+                    target_worker = parts[3].strip().lstrip("@").strip() or target_worker
+
+        if not alias or not task_type:
+            return {
+                "handled": True,
+                "ok": False,
+                "reply_text": (
+                    "新增指令格式：\n"
+                    "#新增指令\n"
+                    "名稱：更新出售CSV\n"
+                    "任務：aiwu_sell_csv\n"
+                    "主機：ELLEN-PC\n\n"
+                    "或到後台：設定中心 → 指令列表"
+                ),
+                "parsed_tag": "新增指令",
+            }
+
+        try:
+            data = save_automation_alias(
+                alias=alias,
+                task_type=task_type,
+                target_worker=target_worker,
+                description=description,
+                enabled=True,
+                event=event,
+            )
+            return {
+                "handled": True,
+                "ok": True,
+                "reply_text": (
+                    "✅ 指令已建立/更新\n"
+                    f"指令：#{data['alias']}\n"
+                    f"任務：{data['task_type']}\n"
+                    f"主機：{data['target_worker']}\n\n"
+                    f"之後直接輸入：#{data['alias']}"
+                ),
+                "parsed_tag": "新增指令",
+            }
+        except Exception as e:
+            return {"handled": True, "ok": False, "reply_text": f"❌ 新增指令失敗：{e}", "parsed_tag": "新增指令"}
+
+    if body_no_space.startswith("刪除指令") or body_no_space.startswith("移除指令"):
+        fields = _auto_cmd_parse_fields(raw_text)
+        alias = _auto_cmd_get_field(fields, "名稱", "指令", "指令名稱", "alias")
+        if not alias:
+            parts = body.split(maxsplit=1)
+            if len(parts) >= 2:
+                alias = parts[1].strip()
+        if not alias:
+            return {"handled": True, "ok": False, "reply_text": "刪除指令格式：\n#刪除指令 更新出售CSV", "parsed_tag": "刪除指令"}
+        ok = delete_automation_alias(alias)
+        return {
+            "handled": True,
+            "ok": ok,
+            "reply_text": f"✅ 已刪除指令：#{alias}" if ok else f"找不到指令：#{alias}",
+            "parsed_tag": "刪除指令",
+        }
+
+    if body_no_space.startswith("執行"):
+        parts = body.split()
+        if len(parts) < 2:
+            return {"handled": True, "ok": False, "reply_text": "執行格式：\n#執行 aiwu_sell_csv @ELLEN-PC", "parsed_tag": "執行"}
+
+        task_type = parts[1].strip()
+        target_worker = DEFAULT_AUTOMATION_WORKER_ID
+        if len(parts) >= 3:
+            target_worker = parts[2].strip().lstrip("@").strip() or DEFAULT_AUTOMATION_WORKER_ID
+
+        task_id, task_data = _automation_create_task(
+            task_type=task_type,
+            event=event,
+            target_worker=target_worker,
+            command_text=raw_text,
+        )
+
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": (
+                "✅ 已建立通用任務\n"
+                f"任務ID：{task_id}\n"
+                f"任務代號：{task_type}\n"
+                f"指定主機：{target_worker}"
+            ),
+            "parsed_tag": "執行",
+        }
+
+    alias_result = create_automation_task_from_alias(body, event, raw_text)
+    if alias_result:
+        return alias_result
+
+    return {"handled": False}
+
+
+try:
+    _detect_line_command_type_before_automation_alias_patch = detect_line_command_type
+
+    def detect_line_command_type(text: str, event=None) -> str:
+        raw = (text or "").strip().replace("＃", "#")
+        if raw.startswith("#"):
+            body = _auto_cmd_first_line(raw)
+            body_no_space = re.sub(r"\s+", "", body)
+            if (
+                body_no_space in ("主機狀態", "自動化狀態", "主機列表", "指令列表", "自動化指令", "指令管理", "任務指令")
+                or body_no_space.startswith("新增指令")
+                or body_no_space.startswith("修改指令")
+                or body_no_space.startswith("設定指令")
+                or body_no_space.startswith("刪除指令")
+                or body_no_space.startswith("移除指令")
+                or body_no_space.startswith("執行")
+            ):
+                return AUTOMATION_COMMAND_TYPE_KEY
+
+            try:
+                doc_id, data = get_automation_alias(body)
+                if data:
+                    return AUTOMATION_COMMAND_TYPE_KEY
+            except Exception:
+                pass
+
+        return _detect_line_command_type_before_automation_alias_patch(text, event=event)
+
+    print("✅ 自動化指令辨識已啟用：自訂指令歸類為 automation 權限")
+except Exception as e:
+    print("⚠️ 自動化指令辨識 patch 失敗：", e)
+
+
+try:
+    _process_line_message_event_before_automation_alias_patch = process_line_message_event
+
+    def process_line_message_event(event):
+        dynamic_result = process_line_dynamic_command_event(event)
+        if dynamic_result.get("handled"):
+            return dynamic_result
+        return _process_line_message_event_before_automation_alias_patch(event)
+
+    print("✅ LINE 自訂指令管理已啟用：#新增指令 / #指令列表 / 自訂指令")
+except Exception as e:
+    print("⚠️ LINE 自訂指令管理啟用失敗：", e)
+
+
+COMMAND_ALIAS_SETTINGS_TEMPLATE = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <title>設定中心｜指令列表</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body{background:#f6f1ea;color:#3f3328;}
+    .setting-card{background:#fffaf4;border:1px solid #eaddcc;border-radius:18px;box-shadow:0 8px 22px rgba(90,60,30,.06);}
+    .sticky-nav{position:sticky;top:16px;}
+    .code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#f2eadf;border-radius:8px;padding:2px 6px;}
+    .hint{color:#8a7662;font-size:.9rem;}
+    .btn-main{background:#C9874A;border-color:#C9874A;color:#fff;}
+    .btn-main:hover{background:#b5753e;border-color:#b5753e;color:#fff;}
+    .table thead th{background:#f4eadf;color:#5a4636;}
+    .form-control,.form-select{border-color:#eaddcc;}
+  </style>
+</head>
+<body>
+<div class="container py-4">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <div>
+      <h3 class="mb-1">設定中心</h3>
+      <div class="hint">自訂 LINE 指令名稱，對應到主機 Agent 的任務代號。</div>
+    </div>
+    <div class="d-flex gap-2">
+      <a href="{{ url_for('line_card_settings') }}" class="btn btn-outline-secondary btn-sm">回設定中心</a>
+      <a href="{{ url_for('buyers') }}" class="btn btn-outline-secondary btn-sm">回後台</a>
+      <form method="post" action="{{ url_for('line_settings_admin_logout') }}">
+        <button class="btn btn-outline-danger btn-sm">離開管理模式</button>
+      </form>
+    </div>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, msg in messages %}
+        <div class="alert alert-{{ category }} py-2">{{ msg }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="row g-3">
+    <div class="col-lg-3">
+      <div class="setting-card p-3 sticky-nav">
+        <div class="list-group small">
+          <a class="list-group-item list-group-item-action" href="{{ url_for('line_card_settings') }}">設定中心首頁</a>
+          <a class="list-group-item list-group-item-action active" href="{{ url_for('automation_command_settings') }}">指令列表</a>
+          <a class="list-group-item list-group-item-action" href="{{ url_for('automation_command_settings') }}#new-command">新增指令</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-lg-9">
+      <div id="new-command" class="setting-card p-4 mb-4">
+        <h5 class="mb-3">新增 / 修改指令</h5>
+        <form method="post" class="row g-3">
+          <input type="hidden" name="action" value="save">
+          <div class="col-md-4">
+            <label class="form-label">指令名稱</label>
+            <div class="input-group">
+              <span class="input-group-text">#</span>
+              <input name="alias" class="form-control" placeholder="更新出售CSV" required>
+            </div>
+            <div class="hint mt-1">之後 LINE 直接輸入，例如：#更新出售CSV</div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">任務代號</label>
+            <input name="task_type" class="form-control" placeholder="aiwu_sell_csv" required>
+            <div class="hint mt-1">要對應 C:\\TeamME\\agent_config.json 的 tasks key。</div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">指定主機</label>
+            <input name="target_worker" class="form-control" value="{{ default_worker }}" placeholder="ELLEN-PC">
+          </div>
+          <div class="col-md-8">
+            <label class="form-label">說明</label>
+            <input name="description" class="form-control" placeholder="愛屋出售 CSV 下載並同步 Firebase">
+          </div>
+          <div class="col-md-4 d-flex align-items-end">
+            <div class="form-check mb-2">
+              <input class="form-check-input" type="checkbox" name="enabled" value="1" id="enabled_new" checked>
+              <label class="form-check-label" for="enabled_new">啟用</label>
+            </div>
+          </div>
+          <div class="col-12">
+            <button class="btn btn-main">儲存指令</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="setting-card p-4 mb-4">
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <h5 class="mb-0">指令列表</h5>
+          <div class="hint">共 {{ aliases|length }} 筆</div>
+        </div>
+
+        <div class="table-responsive">
+          <table class="table table-sm align-middle">
+            <thead>
+              <tr>
+                <th style="width:18%;">LINE 指令</th>
+                <th style="width:22%;">任務代號</th>
+                <th style="width:16%;">主機</th>
+                <th>說明</th>
+                <th style="width:8%;">啟用</th>
+                <th style="width:18%;">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in aliases %}
+              <tr>
+                <form method="post">
+                  <input type="hidden" name="action" value="save">
+                  <input type="hidden" name="original_id" value="{{ item.id }}">
+                  <td>
+                    <div class="input-group input-group-sm">
+                      <span class="input-group-text">#</span>
+                      <input name="alias" class="form-control" value="{{ item.alias }}">
+                    </div>
+                  </td>
+                  <td><input name="task_type" class="form-control form-control-sm" value="{{ item.task_type }}"></td>
+                  <td><input name="target_worker" class="form-control form-control-sm" value="{{ item.target_worker or default_worker }}"></td>
+                  <td><input name="description" class="form-control form-control-sm" value="{{ item.description }}"></td>
+                  <td class="text-center"><input type="checkbox" name="enabled" value="1" {% if item.enabled %}checked{% endif %}></td>
+                  <td>
+                    <button class="btn btn-outline-primary btn-sm">儲存</button>
+                </form>
+                    <form method="post" class="d-inline" onsubmit="return confirm('確定刪除這個指令？');">
+                      <input type="hidden" name="action" value="delete">
+                      <input type="hidden" name="alias" value="{{ item.alias }}">
+                      <button class="btn btn-outline-danger btn-sm">刪除</button>
+                    </form>
+                  </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="hint mt-3">
+          可用 LINE 指令：<span class="code">#指令列表</span>、<span class="code">#執行 aiwu_sell_csv @ELLEN-PC</span>。<br>
+          若群組或個人權限有控管，請回設定中心勾選「自動化任務指令」權限。
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/line-card-settings/commands", methods=["GET", "POST"], endpoint="automation_command_settings")
+@login_required
+def automation_command_settings():
+    if not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
+        # 沿用原本設定中心管理員密碼
+        return render_template_string(LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE)
+
+    ensure_default_automation_aliases()
+
+    if request.method == "POST":
+        action = (request.form.get("action") or "").strip()
+        try:
+            if action == "save":
+                alias = request.form.get("alias", "").strip()
+                task_type = request.form.get("task_type", "").strip()
+                target_worker = request.form.get("target_worker", "").strip() or DEFAULT_AUTOMATION_WORKER_ID
+                description = request.form.get("description", "").strip()
+                enabled = request.form.get("enabled") == "1"
+
+                original_id = request.form.get("original_id", "").strip()
+                data = save_automation_alias(
+                    alias=alias,
+                    task_type=task_type,
+                    target_worker=target_worker,
+                    description=description,
+                    enabled=enabled,
+                )
+
+                # 若改了指令名稱，刪除舊 doc，避免留下重複指令
+                if original_id and original_id != data.get("id") and not original_id.startswith("_"):
+                    try:
+                        db.collection(AUTOMATION_ALIAS_COLLECTION).document(original_id).delete()
+                    except Exception:
+                        pass
+
+                flash(f"已儲存指令：#{data.get('alias')}", "success")
+
+            elif action == "delete":
+                alias = request.form.get("alias", "").strip()
+                ok = delete_automation_alias(alias)
+                flash(f"已刪除指令：#{alias}" if ok else f"找不到指令：#{alias}", "info" if ok else "warning")
+            else:
+                flash("未知操作", "warning")
+        except Exception as e:
+            flash(f"操作失敗：{e}", "danger")
+
+        return redirect(url_for("automation_command_settings"))
+
+    aliases = list_automation_aliases(include_disabled=True)
+    return render_template_string(
+        COMMAND_ALIAS_SETTINGS_TEMPLATE,
+        aliases=aliases,
+        default_worker=DEFAULT_AUTOMATION_WORKER_ID,
+    )
+
+
+# 設定中心首頁側欄插入「指令列表」入口；並加一張快速入口卡。
+_COMMAND_SETTINGS_NAV_LINK = '<a class="list-group-item list-group-item-action" href="{{ url_for(\\'automation_command_settings\\') }}">指令列表</a>'
+_COMMAND_SETTINGS_CARD = """
+        <div id="commands" class="setting-card p-4 mb-4">
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              <h5>指令列表</h5>
+              <div class="hint">管理 LINE 自訂指令名稱、任務代號與指定主機。新增功能後，只要在這裡新增指令，不必再改主程式。</div>
+            </div>
+            <a class="btn btn-outline-primary btn-sm" href="{{ url_for('automation_command_settings') }}">管理指令</a>
+          </div>
+        </div>
+"""
+
+
+def _patch_settings_center_template_commands(template_text: str) -> str:
+    if not template_text:
+        return template_text
+
+    if "automation_command_settings" not in template_text:
+        template_text = template_text.replace(
+            '<a class="list-group-item list-group-item-action" href="#rules">權限規則</a>',
+            '<a class="list-group-item list-group-item-action" href="#commands">指令列表</a>\n        <a class="list-group-item list-group-item-action" href="#rules">權限規則</a>'
+        )
+
+    if 'id="commands"' not in template_text:
+        if '<div id="rules"' in template_text:
+            template_text = template_text.replace('<div id="rules"', _COMMAND_SETTINGS_CARD + '\n        <div id="rules"', 1)
+        else:
+            template_text = template_text.replace('</form>', _COMMAND_SETTINGS_CARD + '\n  </form>', 1)
+
+    return template_text
+
+
+try:
+    if "LINE_SETTINGS_CENTER_TEMPLATE" in globals():
+        LINE_SETTINGS_CENTER_TEMPLATE = _patch_settings_center_template_commands(LINE_SETTINGS_CENTER_TEMPLATE)
+    if "LINE_SETTINGS_CENTER_TEMPLATE_V2" in globals():
+        LINE_SETTINGS_CENTER_TEMPLATE_V2 = _patch_settings_center_template_commands(LINE_SETTINGS_CENTER_TEMPLATE_V2)
+    print("✅ 設定中心已新增「指令列表」分頁：/line-card-settings/commands")
+except Exception as e:
+    print("⚠️ 設定中心指令列表分頁 patch 失敗：", e)
+
+# =============================================================================
+# Team M.E 指令管理中心 + 設定中心分頁 Patch 20260706B End
+# =============================================================================
