@@ -23558,3 +23558,369 @@ def line_access_gate(event):
     return _teamme_line_access_gate_before_ignore_non_hash(event)
 
 print("✅ LINE CRM Patch 20260705：多行備註保存 + 非 # 訊息靜默忽略 已啟用")
+
+# =============================================================================
+# LINE CSV 物件庫更新 Patch 20260705
+# 目的：LINE 直接丟 CSV 附件，Bot 自動判斷出售/出租，匯入/更新 Firestore properties。
+# - 檔名含「售 / 出售 / sale / buy」=> deal_type=sale
+# - 檔名含「租 / 出租 / rent」=> deal_type=rent
+# - 若檔名不明，依欄位 rakuya_租金_元 / 租金 判斷出租，否則預設出售
+# - 用 raw_物件編號 / 物件編號 / 網址 hash 當文件 ID，重複匯入會更新同一筆
+# =============================================================================
+PROPERTY_CSV_COMMAND_KEY = "property_csv"
+
+try:
+    if "LINE_COMMAND_TYPE_OPTIONS" in globals():
+        if not any(k == PROPERTY_CSV_COMMAND_KEY for k, _ in LINE_COMMAND_TYPE_OPTIONS):
+            LINE_COMMAND_TYPE_OPTIONS.append((
+                PROPERTY_CSV_COMMAND_KEY,
+                "物件CSV更新：直接丟 CSV 檔，自動更新出售/出租物件庫"
+            ))
+    print("✅ LINE CSV：設定中心已加入物件CSV更新權限")
+except Exception as e:
+    print("⚠️ LINE CSV：加入設定中心權限失敗：", e)
+
+
+def _property_csv_is_csv_file_message(event):
+    msg = (event or {}).get("message") or {}
+    if msg.get("type") != "file":
+        return False
+    filename = str(msg.get("fileName") or msg.get("filename") or "").strip()
+    return filename.lower().endswith(".csv")
+
+
+def _property_csv_detect_deal_type(filename: str, headers=None):
+    name = str(filename or "").lower()
+    headers = [str(h or "") for h in (headers or [])]
+    header_text = " ".join(headers)
+    if any(k in name for k in ["租", "出租", "rent", "lease"]):
+        return "rent"
+    if any(k in name for k in ["售", "出售", "sale", "sell", "buy"]):
+        return "sale"
+    if any(k in header_text for k in ["租金", "月租", "rakuya_租金_元", "rent_price"]):
+        return "rent"
+    return "sale"
+
+
+def _property_csv_safe_text(value):
+    try:
+        if value is None:
+            return ""
+        # pandas 的 NaN 轉字串會變 nan，這裡清掉。
+        s = str(value)
+        if s.lower() == "nan":
+            return ""
+        return s.strip()
+    except Exception:
+        return ""
+
+
+def _property_csv_float(value):
+    s = _property_csv_safe_text(value)
+    if not s:
+        return None
+    s = s.replace(",", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def _property_csv_pick(row: dict, *keys, default=""):
+    for k in keys:
+        if k in row:
+            v = _property_csv_safe_text(row.get(k))
+            if v:
+                return v
+    return default
+
+
+def _property_csv_pick_float(row: dict, *keys):
+    for k in keys:
+        if k in row:
+            v = _property_csv_float(row.get(k))
+            if v is not None:
+                return v
+    return None
+
+
+def _property_csv_doc_id(row: dict, deal_type: str):
+    source_no = _property_csv_pick(row, "raw_物件編號", "物件編號", "編號", "case_id", "id")
+    branch = _property_csv_pick(row, "raw_分店代碼", "分店代碼", "branch")
+    url = _property_csv_pick(row, "rakuya_刊登來源網址", "raw_型錄網址", "網址", "連結", "url", "source_url")
+    key = "|".join([deal_type, branch, source_no, url]).strip("|")
+    if not key:
+        title = _property_csv_pick(row, "rakuya_物件名稱", "raw_標題", "標題", "title")
+        address = _property_csv_pick(row, "rakuya_地址全文", "raw_完整地址", "地址", "address")
+        price = _property_csv_pick(row, "rakuya_總價_萬", "raw_委託總價", "rakuya_租金_元", "租金")
+        key = "|".join([deal_type, title, address, price])
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:20]
+    return f"{deal_type}_{digest}"
+
+
+def _property_csv_row_to_property(row: dict, deal_type: str, filename: str):
+    title = _property_csv_pick(row, "rakuya_物件名稱", "raw_標題", "物件名稱", "案名", "標題", "title")
+    address = _property_csv_pick(row, "rakuya_地址全文", "raw_完整地址", "地址", "address", "rakuya_地址")
+    area = _property_csv_pick(row, "rakuya_行政區", "行政區", "區域", "area")
+    city = _property_csv_pick(row, "rakuya_縣市", "縣市", "city")
+    property_type = _property_csv_pick(row, "rakuya_現況類型", "raw_類型現況", "產品類型", "現況類型", "類型", "property_type")
+    community = _property_csv_pick(row, "rakuya_社區名稱", "raw_社區", "社區", "community")
+    url = _property_csv_pick(row, "rakuya_刊登來源網址", "raw_型錄網址", "網址", "連結", "url", "source_url")
+    description = _property_csv_pick(row, "rakuya_特色描述", "raw_環境特色", "特色描述", "描述", "description")
+
+    price_wan = _property_csv_pick_float(row, "rakuya_總價_萬", "總價_萬", "總價", "raw_委託總價", "price_wan")
+    rent_price = _property_csv_pick_float(row, "rakuya_租金_元", "租金_元", "租金", "月租", "rent_price")
+
+    rooms = _property_csv_pick_float(row, "rakuya_房", "房", "rooms")
+    halls = _property_csv_pick_float(row, "rakuya_廳", "廳", "halls")
+    baths = _property_csv_pick_float(row, "rakuya_衛", "衛", "baths")
+    age = _property_csv_pick_float(row, "rakuya_屋齡", "raw_屋齡", "屋齡", "age")
+    building_area = _property_csv_pick_float(row, "rakuya_建物登記", "rakuya_權狀面積", "raw_建物面積", "raw_登記坪數", "建物面積", "權狀面積", "登記坪數", "building_area")
+    main_building_area = _property_csv_pick_float(row, "rakuya_主建物", "raw_主建物坪", "主建物", "主建物坪", "室內坪", "使用坪數", "main_building_area")
+    land_area = _property_csv_pick_float(row, "rakuya_土地登記", "raw_土地登記", "土地登記", "土地坪", "land_area")
+    floor = _property_csv_pick(row, "rakuya_出售樓層", "樓層", "floor")
+    total_floor = _property_csv_pick(row, "rakuya_總樓層", "總樓層", "floor_total")
+    parking = _property_csv_pick(row, "車位", "rakuya_車位", "parking")
+
+    searchable_parts = [
+        title, city, area, address, property_type, community, description, parking,
+        _property_csv_pick(row, "raw_房廳衛"),
+        _property_csv_pick(row, "raw_樓別樓高"),
+        _property_csv_pick(row, "raw_鄰近學校", "rakuya_鄰近學校"),
+    ]
+
+    data = {
+        "active": True,
+        "deal_type": "rent" if deal_type == "rent" else "sale",
+        "title": title or "未命名物件",
+        "city": city,
+        "area": area,
+        "address": address,
+        "property_type": property_type,
+        "community": community,
+        "description": description,
+        "url": url,
+        "price_wan": price_wan if deal_type == "sale" else None,
+        "rent_price": rent_price if deal_type == "rent" else None,
+        "rooms": rooms,
+        "halls": halls,
+        "baths": baths,
+        "age": age,
+        "building_area": building_area,
+        "main_building_area": main_building_area,
+        "land_area": land_area,
+        "floor": floor,
+        "total_floor": total_floor,
+        "parking": parking,
+        "source_platform": "LINE CSV",
+        "source_file": filename,
+        "source_case_no": _property_csv_pick(row, "raw_物件編號", "物件編號", "編號"),
+        "source_branch": _property_csv_pick(row, "raw_分店代碼", "分店代碼"),
+        "searchable_text": " ".join([p for p in searchable_parts if p]),
+        "raw": {str(k): _property_csv_safe_text(v) for k, v in row.items()},
+        "imported_at": now_taipei().isoformat(),
+        "updated_at": now_taipei().isoformat(),
+        "updated_by_id": "line_bot",
+        "updated_by_name": "LINE Bot",
+    }
+    # 出租 CSV 若沒有租金但有價格欄，仍保留在 raw；搜尋時主要看 rent_price。
+    return data
+
+
+def _property_csv_read_rows(csv_bytes: bytes):
+    last_error = None
+    for enc in ("utf-8-sig", "utf-8", "cp950", "big5"):
+        try:
+            text = csv_bytes.decode(enc)
+            reader = csv.DictReader(StringIO(text))
+            rows = list(reader)
+            headers = reader.fieldnames or []
+            return headers, rows, enc
+        except Exception as e:
+            last_error = e
+    raise ValueError(f"CSV 讀取失敗，請確認檔案編碼為 UTF-8 或 Big5：{last_error}")
+
+
+def _property_csv_import_bytes(csv_bytes: bytes, filename: str, line_event=None):
+    headers, rows, encoding = _property_csv_read_rows(csv_bytes)
+    deal_type = _property_csv_detect_deal_type(filename, headers=headers)
+    now_iso = now_taipei().isoformat()
+
+    total = 0
+    imported = 0
+    skipped = 0
+    errors = []
+    batch = db.batch()
+    batch_count = 0
+    touched_ids = []
+
+    for idx, row in enumerate(rows, start=2):
+        total += 1
+        try:
+            # 全空列略過。
+            if not any(_property_csv_safe_text(v) for v in row.values()):
+                skipped += 1
+                continue
+            prop = _property_csv_row_to_property(row, deal_type, filename)
+            # 太空的資料不匯入。
+            if not (prop.get("title") or prop.get("address") or prop.get("url")):
+                skipped += 1
+                continue
+            doc_id = _property_csv_doc_id(row, deal_type)
+            prop["id"] = doc_id
+            prop["created_at"] = prop.get("created_at") or now_iso
+            ref = db.collection("properties").document(doc_id)
+            batch.set(ref, prop, merge=True)
+            touched_ids.append(doc_id)
+            imported += 1
+            batch_count += 1
+            if batch_count >= 400:
+                batch.commit()
+                batch = db.batch()
+                batch_count = 0
+        except Exception as e:
+            skipped += 1
+            if len(errors) < 5:
+                errors.append(f"第{idx}列：{e}")
+
+    if batch_count:
+        batch.commit()
+
+    log_data = {
+        "deal_type": deal_type,
+        "file_name": filename,
+        "encoding": encoding,
+        "total_count": total,
+        "imported_count": imported,
+        "skipped_count": skipped,
+        "error_samples": errors,
+        "created_at": now_iso,
+        "imported_at": now_iso,
+        "source": "LINE file message",
+    }
+    try:
+        src = (line_event or {}).get("source") or {}
+        msg = (line_event or {}).get("message") or {}
+        log_data.update({
+            "line_group_id": src.get("groupId", ""),
+            "line_room_id": src.get("roomId", ""),
+            "line_user_id": src.get("userId", ""),
+            "line_message_id": msg.get("id", ""),
+            "sender_display_name": get_line_sender_display_name(line_event) if line_event else "",
+        })
+    except Exception:
+        pass
+
+    try:
+        db.collection("property_import_logs").add(log_data)
+    except Exception as e:
+        print("⚠️ 寫入 property_import_logs 失敗：", e)
+
+    try:
+        if "clear_ai_property_memory_cache" in globals():
+            clear_ai_property_memory_cache(deal_type)
+    except Exception as e:
+        print("⚠️ 清除物件推薦快取失敗：", e)
+
+    return {
+        "deal_type": deal_type,
+        "file_name": filename,
+        "encoding": encoding,
+        "total_count": total,
+        "imported_count": imported,
+        "skipped_count": skipped,
+        "error_samples": errors,
+    }
+
+
+def _line_download_message_content(message_id: str):
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        raise RuntimeError("尚未設定 LINE_CHANNEL_ACCESS_TOKEN")
+    if not message_id:
+        raise RuntimeError("LINE message_id 不存在")
+    import requests
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    res = requests.get(url, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}, timeout=30)
+    if res.status_code != 200:
+        raise RuntimeError(f"下載 LINE 檔案失敗：HTTP {res.status_code} {res.text[:200]}")
+    return res.content
+
+
+def process_line_property_csv_file_event(event):
+    msg = (event or {}).get("message") or {}
+    if msg.get("type") != "file":
+        return {"handled": False}
+    filename = str(msg.get("fileName") or msg.get("filename") or "").strip()
+    if not filename.lower().endswith(".csv"):
+        return {"handled": False}
+
+    try:
+        content = _line_download_message_content(msg.get("id", ""))
+        result = _property_csv_import_bytes(content, filename, line_event=event)
+        label = "出租" if result.get("deal_type") == "rent" else "出售"
+        text = (
+            f"已更新{label}物件庫\n"
+            f"檔案：{result.get('file_name')}\n"
+            f"讀取編碼：{result.get('encoding')}\n"
+            f"CSV列數：{result.get('total_count')}\n"
+            f"成功匯入/更新：{result.get('imported_count')} 筆\n"
+            f"略過/失敗：{result.get('skipped_count')} 筆"
+        )
+        if result.get("error_samples"):
+            text += "\n\n前幾筆錯誤：\n" + "\n".join(result.get("error_samples")[:5])
+        return {"handled": True, "ok": True, "reply_text": text[:5000], "parsed_tag": "CSV更新物件"}
+    except Exception as e:
+        return {"handled": True, "ok": False, "reply_text": f"CSV更新失敗：{e}", "parsed_tag": "CSV更新物件"}
+
+
+# 覆寫 LINE 處理：CSV 檔優先處理；其他訊息交給原本流程。
+try:
+    _process_line_message_event_before_property_csv = process_line_message_event
+
+    def process_line_message_event(event):
+        csv_result = process_line_property_csv_file_event(event)
+        if csv_result.get("handled"):
+            return csv_result
+        return _process_line_message_event_before_property_csv(event)
+
+    print("✅ LINE CSV：已支援直接丟 CSV 檔更新物件庫")
+except Exception as e:
+    print("⚠️ LINE CSV：process_line_message_event 覆寫失敗：", e)
+
+
+# 覆寫權限：CSV 檔沒有 # 指令，因此用檔案類型判斷；有 seller / property_csv / ai_recommend / all 任一權限即可。
+try:
+    _line_access_gate_before_property_csv = line_access_gate
+
+    def line_access_gate(event):
+        if _property_csv_is_csv_file_message(event):
+            kind, target_id = line_event_source_kind_and_id(event)
+            group = None
+            if kind in ("group", "room"):
+                group = find_line_group_by_target_id(target_id)
+            elif kind == "user" and "find_line_personal_user_by_user_id" in globals():
+                try:
+                    group = find_line_personal_user_by_user_id(target_id)
+                except Exception:
+                    group = None
+            if not group:
+                if target_id:
+                    return False, f"未授權：此 LINE 來源尚未在後台設定。\nID：{target_id}", None
+                return False, "未授權：無法辨識 LINE 來源。", None
+            allowed = set((group or {}).get("command_types") or [])
+            if "all" in allowed or PROPERTY_CSV_COMMAND_KEY in allowed or "seller" in allowed or "ai_recommend" in allowed:
+                return True, PROPERTY_CSV_COMMAND_KEY, group
+            return False, "此群組未開放「物件CSV更新」權限，請到設定中心勾選物件CSV更新，或開放委託/AI推薦權限。", group
+        return _line_access_gate_before_property_csv(event)
+
+    print("✅ LINE CSV：權限控管已支援 CSV 檔案訊息")
+except Exception as e:
+    print("⚠️ LINE CSV：line_access_gate 覆寫失敗：", e)
+
+print("✅ LINE CSV 物件庫更新 Patch 20260705 已啟用")
+# =============================================================================
+# LINE CSV 物件庫更新 Patch End
+# =============================================================================
