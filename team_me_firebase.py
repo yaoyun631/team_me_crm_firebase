@@ -24719,3 +24719,190 @@ print("✅ Patch 20260705C：樂屋登入流程修正版已載入")
 # =============================================================================
 # Patch 20260705C End
 # =============================================================================
+
+
+# =============================================================================
+# Team M.E Automation Task Center Patch 20260706
+# - LINE 指令：#更新樂屋 / #主機狀態 / #指定主機
+# - 不在 Render 直接跑 Playwright，而是寫入 Firestore automation_tasks
+# - 本機或雲端 Agent 依 target_worker 領取任務執行 BAT
+# =============================================================================
+
+AUTOMATION_TASK_COLLECTION = "automation_tasks"
+AUTOMATION_WORKER_COLLECTION = "automation_workers"
+DEFAULT_AUTOMATION_WORKER_ID = os.environ.get("DEFAULT_AUTOMATION_WORKER_ID", "ELLEN-PC").strip() or "ELLEN-PC"
+
+
+def _automation_line_source(event):
+    source = event.get("source") or {}
+    if source.get("groupId"):
+        return {"kind": "group", "target_id": source.get("groupId", "")}
+    if source.get("roomId"):
+        return {"kind": "room", "target_id": source.get("roomId", "")}
+    return {"kind": "user", "target_id": source.get("userId", "")}
+
+
+def _automation_sender_name(event):
+    try:
+        return get_line_sender_display_name(event) or "LINE使用者"
+    except Exception:
+        return "LINE使用者"
+
+
+def _automation_create_task(task_type: str, event, target_worker: str = "", command_text: str = ""):
+    target_worker = (target_worker or DEFAULT_AUTOMATION_WORKER_ID).strip()
+    line_source = _automation_line_source(event)
+    sender_name = _automation_sender_name(event)
+    now_iso = now_taipei().isoformat()
+
+    data = {
+        "type": task_type,
+        "status": "waiting",
+        "target_worker": target_worker,
+        "command_text": command_text,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "created_by": sender_name,
+        "line_source_kind": line_source.get("kind", ""),
+        "line_target_id": line_source.get("target_id", ""),
+        "line_user_id": (event.get("source") or {}).get("userId", ""),
+        "line_group_id": (event.get("source") or {}).get("groupId", ""),
+        "line_room_id": (event.get("source") or {}).get("roomId", ""),
+        "webhook_event_id": event.get("webhookEventId", ""),
+        "result_message": "",
+        "error_message": "",
+    }
+    doc_ref = db.collection(AUTOMATION_TASK_COLLECTION).document()
+    doc_ref.set(data)
+    return doc_ref.id, data
+
+
+def _automation_worker_status_text(limit=8):
+    docs = list(db.collection(AUTOMATION_WORKER_COLLECTION).stream())
+    if not docs:
+        return "目前沒有任何主機回報在線。\n請先在本機或雲端主機啟動 automation_agent.py。"
+
+    rows = []
+    now_dt = now_taipei()
+    for doc in docs:
+        data = doc.to_dict() or {}
+        worker_id = data.get("worker_id") or doc.id
+        status = data.get("status", "unknown")
+        current_task = data.get("current_task_type") or "-"
+        last_seen = data.get("last_seen") or ""
+        online_mark = "⚪"
+        try:
+            last_dt = datetime.fromisoformat(str(last_seen))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=TAIPEI_TZ)
+            diff = (now_dt - last_dt).total_seconds()
+            if diff <= 90:
+                online_mark = "🟢"
+            elif diff <= 300:
+                online_mark = "🟡"
+            else:
+                online_mark = "🔴"
+        except Exception:
+            pass
+        rows.append((worker_id, online_mark, status, current_task, last_seen))
+
+    rows = rows[:limit]
+    lines = ["主機狀態"]
+    for worker_id, mark, status, current_task, last_seen in rows:
+        lines.append(f"{mark} {worker_id}")
+        lines.append(f"狀態：{status}")
+        lines.append(f"任務：{current_task}")
+        lines.append(f"最後回報：{last_seen or '-'}")
+        lines.append("")
+    lines.append("指令：#更新樂屋 或 #更新樂屋 @主機代號")
+    return "\n".join(lines).strip()[:5000]
+
+
+def process_line_automation_task_event(event):
+    message = event.get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+
+    raw_text = (message.get("text") or "").strip()
+    if not raw_text:
+        return {"handled": False}
+
+    first_line = raw_text.splitlines()[0].strip()
+
+    # 支援：#更新樂屋、更新樂屋、#更新樂屋 @VPS1
+    normalized = first_line.replace("＃", "#").strip()
+    if normalized.startswith("#"):
+        body = normalized[1:].strip()
+    else:
+        body = normalized
+
+    body_no_space = re.sub(r"\s+", "", body)
+
+    if body_no_space.startswith("主機狀態") or body_no_space.startswith("自動化狀態"):
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": _automation_worker_status_text(),
+            "parsed_tag": "主機狀態",
+        }
+
+    if body_no_space.startswith("更新樂屋"):
+        # 指定主機：#更新樂屋 @ELLEN-PC 或 #更新樂屋 ELLEN-PC
+        target_worker = DEFAULT_AUTOMATION_WORKER_ID
+        parts = body.split()
+        if len(parts) >= 2:
+            target_worker = parts[1].strip().lstrip("@").strip() or DEFAULT_AUTOMATION_WORKER_ID
+
+        task_id, data = _automation_create_task(
+            task_type="rakuya_inventory_cycle",
+            event=event,
+            target_worker=target_worker,
+            command_text=raw_text,
+        )
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": (
+                "✅ 已建立樂屋更新任務\n"
+                f"任務ID：{task_id}\n"
+                f"指定主機：{target_worker}\n\n"
+                "請確認該主機已啟動 automation_agent.py。"
+            ),
+            "parsed_tag": "更新樂屋",
+        }
+
+    if body_no_space.startswith("指定主機"):
+        parts = body.split()
+        if len(parts) < 2:
+            return {
+                "handled": True,
+                "ok": False,
+                "reply_text": f"目前預設主機：{DEFAULT_AUTOMATION_WORKER_ID}\n用法：#指定主機 ELLEN-PC\n提醒：Render 環境變數 DEFAULT_AUTOMATION_WORKER_ID 才是永久設定。",
+                "parsed_tag": "指定主機",
+            }
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": "指定主機建議改 Render 環境變數 DEFAULT_AUTOMATION_WORKER_ID。\n臨時指定可用：#更新樂屋 @主機代號",
+            "parsed_tag": "指定主機",
+        }
+
+    return {"handled": False}
+
+
+try:
+    _process_line_message_event_before_automation_task_patch = process_line_message_event
+
+    def process_line_message_event(event):
+        automation_result = process_line_automation_task_event(event)
+        if automation_result.get("handled"):
+            return automation_result
+        return _process_line_message_event_before_automation_task_patch(event)
+
+    print("✅ Team M.E 自動化任務中心已啟用：#更新樂屋 / #主機狀態")
+except Exception as e:
+    print("⚠️ Team M.E 自動化任務中心啟用失敗：", e)
+
+# =============================================================================
+# Team M.E Automation Task Center Patch 20260706 End
+# =============================================================================
