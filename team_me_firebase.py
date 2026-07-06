@@ -24749,29 +24749,130 @@ def _automation_sender_name(event):
         return "LINE使用者"
 
 
+def _automation_task_source_ids(event):
+    source = (event or {}).get("source") or {}
+    group_id = source.get("groupId") or ""
+    room_id = source.get("roomId") or ""
+    user_id = source.get("userId") or ""
+    target_id = group_id or room_id or user_id
+    source_kind = "group" if group_id else ("room" if room_id else "user")
+    return {
+        "source_type": source.get("type") or source_kind,
+        "source_group_id": group_id,
+        "source_room_id": room_id,
+        "source_user_id": user_id,
+        "line_group_id": group_id,
+        "line_room_id": room_id,
+        "line_user_id": user_id,
+        "line_source_kind": source_kind,
+        "line_target_id": target_id,
+    }
+
+
+def _automation_event_dedupe_key(event):
+    event = event or {}
+    webhook_event_id = str(event.get("webhookEventId") or "").strip()
+    message_id = str(((event.get("message") or {}).get("id") or "")).strip()
+    return webhook_event_id or message_id
+
+
+def _automation_find_active_duplicate(task_type: str, target_worker: str, source_target_id: str):
+    """找同主機、同任務、同 LINE 來源仍在 waiting/running 的任務。"""
+    if not source_target_id:
+        return None
+
+    for status in ("waiting", "running"):
+        try:
+            docs = list(
+                db.collection(AUTOMATION_TASK_COLLECTION)
+                .where("target_worker", "==", target_worker)
+                .where("status", "==", status)
+                .limit(50)
+                .stream()
+            )
+        except Exception as e:
+            print(f"⚠️ automation active duplicate 查詢失敗 status={status}：", e)
+            continue
+
+        for doc in docs:
+            data = doc.to_dict() or {}
+            existing_type = data.get("type") or data.get("task_type") or ""
+            if existing_type != task_type:
+                continue
+            existing_target = (
+                data.get("source_group_id")
+                or data.get("line_group_id")
+                or data.get("source_room_id")
+                or data.get("line_room_id")
+                or data.get("line_target_id")
+                or data.get("source_user_id")
+                or data.get("line_user_id")
+                or ""
+            )
+            if existing_target == source_target_id:
+                found = dict(data)
+                found["_deduplicated"] = True
+                found["_dedupe_reason"] = f"active_{status}"
+                return doc.id, found
+    return None
+
+
 def _automation_create_task(task_type: str, event, target_worker: str = "", command_text: str = ""):
+    """
+    建立 automation task，具備兩層防重複：
+    1. webhookEventId / LINE message id 使用固定 Firestore document id，Webhook 重送不會重建。
+    2. 同來源、同主機、同 task_type 已有 waiting/running 時，直接沿用既有任務。
+    """
+    task_type = (task_type or "").strip()
     target_worker = (target_worker or DEFAULT_AUTOMATION_WORKER_ID).strip()
-    line_source = _automation_line_source(event)
     sender_name = _automation_sender_name(event)
     now_iso = now_taipei().isoformat()
+    source_ids = _automation_task_source_ids(event)
+    source_target_id = source_ids.get("line_target_id", "")
+    event_key = _automation_event_dedupe_key(event)
+
+    # 不同 LINE event 但同一任務仍在 waiting/running：不要再排第二筆。
+    active = _automation_find_active_duplicate(task_type, target_worker, source_target_id)
+    if active:
+        return active
 
     data = {
         "type": task_type,
+        "task_type": task_type,
         "status": "waiting",
         "target_worker": target_worker,
         "command_text": command_text,
         "created_at": now_iso,
         "updated_at": now_iso,
         "created_by": sender_name,
-        "line_source_kind": line_source.get("kind", ""),
-        "line_target_id": line_source.get("target_id", ""),
-        "line_user_id": (event.get("source") or {}).get("userId", ""),
-        "line_group_id": (event.get("source") or {}).get("groupId", ""),
-        "line_room_id": (event.get("source") or {}).get("roomId", ""),
-        "webhook_event_id": event.get("webhookEventId", ""),
+        "webhook_event_id": (event or {}).get("webhookEventId", ""),
+        "line_message_id": ((event or {}).get("message") or {}).get("id", ""),
         "result_message": "",
         "error_message": "",
+        "attempt_count": 0,
+        "dedupe_key": event_key,
     }
+    data.update(source_ids)
+
+    if event_key:
+        # 同一 webhook/message 無論被 LINE 重送幾次，都命中同一份文件。
+        doc_id = "line_" + hashlib.sha256(event_key.encode("utf-8")).hexdigest()[:40]
+        doc_ref = db.collection(AUTOMATION_TASK_COLLECTION).document(doc_id)
+
+        @firestore.transactional
+        def txn_create(transaction):
+            fresh = doc_ref.get(transaction=transaction)
+            if fresh.exists:
+                existing = fresh.to_dict() or {}
+                existing["_deduplicated"] = True
+                existing["_dedupe_reason"] = "same_line_event"
+                return existing
+            transaction.set(doc_ref, data)
+            return dict(data)
+
+        returned = txn_create(db.transaction())
+        return doc_ref.id, returned
+
     doc_ref = db.collection(AUTOMATION_TASK_COLLECTION).document()
     doc_ref.set(data)
     return doc_ref.id, data
@@ -25180,15 +25281,22 @@ def create_automation_task_from_alias(alias_text: str, event, raw_text: str):
         command_text=raw_text,
     )
 
+    deduplicated = bool((task_data or {}).get("_deduplicated"))
+    first_line = (
+        f"♻️ 任務已存在，未重複建立：{data.get('alias', alias_text)}"
+        if deduplicated
+        else f"✅ 已建立任務：{data.get('alias', alias_text)}"
+    )
+
     return {
         "handled": True,
         "ok": True,
         "reply_text": (
-            f"✅ 已建立任務：{data.get('alias', alias_text)}\n"
+            f"{first_line}\n"
             f"任務ID：{task_id}\n"
             f"任務代號：{task_type}\n"
             f"指定主機：{target_worker}\n\n"
-            "完成後會由主機 Agent 回傳結果。"
+            "完成後會由主機 Agent 回傳結果並同步到 test 群組。"
         ),
         "parsed_tag": data.get("alias", alias_text),
     }
@@ -26020,27 +26128,9 @@ def debug_automation_check():
 
 print("✅ Team M.E 自動化指令系統 Final Fix 20260706C 載入完成")
 
-def _teamme_event_source_ids(event):
-    src = event.get("source") or {}
-    return {
-        "source_type": src.get("type") or "",
-        "source_group_id": src.get("groupId") or src.get("roomId") or "",
-        "source_user_id": src.get("userId") or "",
-    }
-
-try:
-    _teamme_create_automation_task_base = create_automation_task
-
-    def create_automation_task(*args, **kwargs):
-        event = kwargs.get("event")
-        if event:
-            kwargs.update(_teamme_event_source_ids(event))
-        task_id = _teamme_create_automation_task_base(*args, **kwargs)
-        return task_id
-
-    print("✅ TeamME automation_tasks source id patch 已啟用")
-except Exception as e:
-    print("⚠️ TeamME automation_tasks source id patch 啟用失敗：", e)
+# automation task 的 source_group_id / source_room_id / source_user_id
+# 已直接在 _automation_create_task 寫入，不再用不存在的 create_automation_task 做二次 monkey patch。
+print("✅ TeamME automation_tasks source id 已整合至 _automation_create_task")
     
 # =============================================================================
 # Team M.E 自動化指令系統 Final Fix End
