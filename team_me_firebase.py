@@ -26019,6 +26019,29 @@ def debug_automation_check():
 
 
 print("✅ Team M.E 自動化指令系統 Final Fix 20260706C 載入完成")
+
+def _teamme_event_source_ids(event):
+    src = event.get("source") or {}
+    return {
+        "source_type": src.get("type") or "",
+        "source_group_id": src.get("groupId") or src.get("roomId") or "",
+        "source_user_id": src.get("userId") or "",
+    }
+
+try:
+    _teamme_create_automation_task_base = create_automation_task
+
+    def create_automation_task(*args, **kwargs):
+        event = kwargs.get("event")
+        if event:
+            kwargs.update(_teamme_event_source_ids(event))
+        task_id = _teamme_create_automation_task_base(*args, **kwargs)
+        return task_id
+
+    print("✅ TeamME automation_tasks source id patch 已啟用")
+except Exception as e:
+    print("⚠️ TeamME automation_tasks source id patch 啟用失敗：", e)
+    
 # =============================================================================
 # Team M.E 自動化指令系統 Final Fix End
 # =============================================================================
