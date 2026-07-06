@@ -26135,3 +26135,493 @@ print("✅ TeamME automation_tasks source id 已整合至 _automation_create_tas
 # =============================================================================
 # Team M.E 自動化指令系統 Final Fix End
 # =============================================================================
+
+
+# =============================================================================
+# Team M.E Automation Test Group Control Fix 20260706D
+# 目的：
+# 1. 固定 test 群組不只接收 Agent push，也可直接下 automation 指令。
+# 2. 只放行 automation，不額外開放 buyer / seller / todo 等 CRM 指令。
+# 3. 加入清楚的 Render log，方便確認 LINE 指令是否有進 webhook。
+# =============================================================================
+AUTOMATION_TEST_GROUP_ID = (
+    os.environ.get("AUTOMATION_TEST_GROUP_ID", "").strip()
+    or "Ccc41ded5cf9764c5742fee75013c5e0e"
+)
+
+try:
+    _line_access_gate_before_automation_test_group = line_access_gate
+
+    def line_access_gate(event):
+        kind, target_id = line_event_source_kind_and_id(event)
+        message = (event or {}).get("message") or {}
+        raw_text = (message.get("text") or "").strip() if message.get("type") == "text" else ""
+
+        # test 群組只特別放行 automation 指令。
+        if kind == "group" and target_id == AUTOMATION_TEST_GROUP_ID and raw_text:
+            try:
+                cmd_type = detect_line_command_type(raw_text, event=event)
+            except TypeError:
+                cmd_type = detect_line_command_type(raw_text)
+            except Exception as e:
+                print("⚠️ test 群組 automation 指令辨識失敗：", e, flush=True)
+                cmd_type = ""
+
+            if cmd_type == "automation":
+                print(
+                    f"🤖 test 群組 automation 指令已放行 target={target_id} text={raw_text.splitlines()[0][:120]}",
+                    flush=True,
+                )
+                return True, "automation", {
+                    "name": "Team M.E test 群組",
+                    "target_id": target_id,
+                    "enabled": True,
+                    "command_types": ["automation"],
+                    "receive_types": [],
+                    "view_types": [],
+                    "automation_test_group": True,
+                }
+
+        return _line_access_gate_before_automation_test_group(event)
+
+    print(f"✅ automation test 群組已開放 automation 指令：{AUTOMATION_TEST_GROUP_ID}", flush=True)
+except Exception as e:
+    print("⚠️ automation test 群組權限 patch 失敗：", e, flush=True)
+
+
+# 預設 alias 在本檔前段已於啟動時補齊。之後每次 LINE 指令辨識不再重複寫 5 組預設文件，
+# 避免 webhook 為了辨識一個指令做大量 Firestore set，造成回覆變慢或 LINE 重送事件。
+try:
+    _ensure_default_automation_aliases_before_runtime_cache = ensure_default_automation_aliases
+    _AUTOMATION_DEFAULT_ALIASES_READY = True
+
+    def ensure_default_automation_aliases(force: bool = False):
+        global _AUTOMATION_DEFAULT_ALIASES_READY
+        if _AUTOMATION_DEFAULT_ALIASES_READY and not force:
+            return
+        _ensure_default_automation_aliases_before_runtime_cache()
+        _AUTOMATION_DEFAULT_ALIASES_READY = True
+
+    print("✅ automation 預設指令已改為啟動補齊，LINE webhook 不再每次重複寫入", flush=True)
+except Exception as e:
+    print("⚠️ automation alias runtime cache patch 失敗：", e, flush=True)
+
+
+# Webhook 入口增加 automation 指令接收紀錄；不改原本實際處理流程。
+try:
+    _line_webhook_before_automation_receive_log = app.view_functions.get("line_webhook")
+
+    def line_webhook_with_automation_receive_log():
+        try:
+            raw_preview = request.get_data(cache=True, as_text=False)
+            payload_preview = json.loads(raw_preview.decode("utf-8")) if raw_preview else {}
+            for event in payload_preview.get("events", []):
+                message = (event or {}).get("message") or {}
+                if message.get("type") != "text":
+                    continue
+                text = (message.get("text") or "").strip()
+                if not text.startswith(("#", "＃")):
+                    continue
+                kind, target_id = line_event_source_kind_and_id(event)
+                print(
+                    f"📨 LINE 指令收到 kind={kind} target={target_id or '-'} text={text.splitlines()[0][:120]}",
+                    flush=True,
+                )
+        except Exception as e:
+            print("⚠️ LINE 指令接收 log 解析失敗：", e, flush=True)
+
+        return _line_webhook_before_automation_receive_log()
+
+    if _line_webhook_before_automation_receive_log:
+        app.view_functions["line_webhook"] = line_webhook_with_automation_receive_log
+        print("✅ LINE webhook 已加入 automation 指令接收 log", flush=True)
+except Exception as e:
+    print("⚠️ LINE webhook 指令接收 log patch 失敗：", e, flush=True)
+
+print("✅ Team M.E Automation Test Group Control Fix 20260706D 載入完成", flush=True)
+# =============================================================================
+# Team M.E Automation Test Group Control Fix End
+# =============================================================================
+
+
+# =============================================================================
+# Team M.E Automation Live Status Patch 20260706E
+# 功能：
+# 1. LINE 新增 #狀態 / #任務狀態 / #目前狀態 / #Agent狀態。
+# 2. 每次建立 automation 任務後，以第二則 LINE 訊息回覆即時狀態。
+# 3. 狀態清楚區分：任務等待中 / 執行中 / 完成整理中 / 待命中 / Agent 離線。
+# 4. 偵測 Firebase task 與 automation_workers 心跳不一致，直接顯示「疑似卡住」。
+# =============================================================================
+
+AUTOMATION_STATUS_COMMAND_NAMES = {
+    "狀態", "任務狀態", "目前狀態", "現階段狀態", "自動化狀態",
+    "agent狀態", "Agent狀態", "主機狀態", "自動化主機狀態",
+}
+AUTOMATION_WORKER_ONLINE_SECONDS = int(os.environ.get("AUTOMATION_WORKER_ONLINE_SECONDS", "90") or 90)
+AUTOMATION_WAITING_WARN_SECONDS = int(os.environ.get("AUTOMATION_WAITING_WARN_SECONDS", "60") or 60)
+
+
+def _automation_status_parse_dt(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TAIPEI_TZ)
+        return dt.astimezone(TAIPEI_TZ)
+    except Exception:
+        return None
+
+
+def _automation_status_age_seconds(value):
+    dt = _automation_status_parse_dt(value)
+    if not dt:
+        return None
+    try:
+        return max(0.0, (now_taipei() - dt).total_seconds())
+    except Exception:
+        return None
+
+
+def _automation_status_duration_text(seconds):
+    if seconds is None:
+        return "-"
+    try:
+        seconds = max(0, int(seconds))
+    except Exception:
+        return "-"
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {sec} 秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小時 {minutes} 分"
+
+
+def _automation_status_task_name(data):
+    data = data or {}
+    command = str(data.get("command_text") or data.get("command") or "").strip()
+    if command:
+        first = command.splitlines()[0].strip().replace("＃", "#")
+        return first.lstrip("#").strip() or (data.get("type") or data.get("task_type") or "-")
+    return str(data.get("type") or data.get("task_type") or "-")
+
+
+def _automation_status_worker_info(worker_id):
+    info = {
+        "worker_id": worker_id,
+        "exists": False,
+        "online": False,
+        "status": "unknown",
+        "current_task_id": "",
+        "current_task_type": "",
+        "last_seen": "",
+        "last_seen_age": None,
+        "phase_message": "",
+        "agent_pid": "",
+        "agent_session_id": "",
+    }
+    try:
+        snap = db.collection(AUTOMATION_WORKER_COLLECTION).document(worker_id).get()
+        if not snap.exists:
+            return info
+        data = snap.to_dict() or {}
+        info.update({
+            "exists": True,
+            "status": str(data.get("status") or "unknown"),
+            "current_task_id": str(data.get("current_task_id") or ""),
+            "current_task_type": str(data.get("current_task_type") or ""),
+            "last_seen": str(data.get("last_seen") or ""),
+            "phase_message": str(data.get("phase_message") or ""),
+            "agent_pid": str(data.get("agent_pid") or ""),
+            "agent_session_id": str(data.get("agent_session_id") or ""),
+        })
+        age = _automation_status_age_seconds(info["last_seen"])
+        info["last_seen_age"] = age
+        info["online"] = age is not None and age <= AUTOMATION_WORKER_ONLINE_SECONDS
+    except Exception as e:
+        info["error"] = str(e)
+    return info
+
+
+def _automation_status_tasks(worker_id, statuses=("running", "waiting"), limit=100):
+    rows = []
+    for status in statuses:
+        try:
+            docs = list(
+                db.collection(AUTOMATION_TASK_COLLECTION)
+                .where("target_worker", "==", worker_id)
+                .where("status", "==", status)
+                .limit(limit)
+                .stream()
+            )
+        except Exception as e:
+            print(f"⚠️ automation status task query failed worker={worker_id} status={status}: {e}", flush=True)
+            continue
+        for doc in docs:
+            data = doc.to_dict() or {}
+            rows.append({"id": doc.id, "data": data, "status": str(data.get("status") or status)})
+    rows.sort(key=lambda item: str((item.get("data") or {}).get("created_at") or ""))
+    return rows
+
+
+def _automation_status_find_task(task_id):
+    if not task_id:
+        return None
+    try:
+        snap = db.collection(AUTOMATION_TASK_COLLECTION).document(task_id).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            return {"id": snap.id, "data": data, "status": str(data.get("status") or "")}
+    except Exception as e:
+        print(f"⚠️ automation status read task failed task={task_id}: {e}", flush=True)
+    return None
+
+
+def _automation_worker_phase_label(worker_info):
+    worker_info = worker_info or {}
+    if not worker_info.get("online"):
+        return "🔴 Agent 離線"
+    status = str(worker_info.get("status") or "").lower()
+    if status == "running":
+        return "🟠 執行中"
+    if status == "finalizing":
+        return "🔵 完成整理中"
+    if status in ("claiming", "starting"):
+        return "🟣 正在領取任務"
+    if status in ("idle", "standby", "waiting"):
+        return "🟢 待命中"
+    if status == "error":
+        return "🔴 Agent 異常"
+    return f"⚪ {status or '狀態未知'}"
+
+
+def _automation_task_phase_label(task_status):
+    status = str(task_status or "").lower()
+    return {
+        "waiting": "🟡 任務等待中",
+        "running": "🟠 任務執行中",
+        "done": "✅ 任務已完成",
+        "failed": "❌ 任務失敗",
+        "timeout": "⏱️ 任務逾時停止",
+        "cancelled": "⚪ 任務已取消",
+    }.get(status, f"⚪ 任務狀態：{status or '未知'}")
+
+
+def _automation_live_status_text(worker_id=None, focus_task_id="", compact=False):
+    worker_id = (worker_id or DEFAULT_AUTOMATION_WORKER_ID).strip()
+    worker = _automation_status_worker_info(worker_id)
+    active_tasks = _automation_status_tasks(worker_id, statuses=("running", "waiting"), limit=100)
+    running = [x for x in active_tasks if x.get("status") == "running"]
+    waiting = [x for x in active_tasks if x.get("status") == "waiting"]
+    focus = _automation_status_find_task(focus_task_id) if focus_task_id else None
+
+    lines = ["🤖 Team M.E 現階段狀態", f"主機：{worker_id}"]
+    lines.append(f"Agent：{_automation_worker_phase_label(worker)}")
+
+    if worker.get("last_seen"):
+        age_text = _automation_status_duration_text(worker.get("last_seen_age"))
+        lines.append(f"最後心跳：{age_text}前")
+    else:
+        lines.append("最後心跳：尚未回報")
+
+    warning_lines = []
+
+    if focus:
+        data = focus.get("data") or {}
+        status = focus.get("status") or data.get("status") or ""
+        lines += [
+            "",
+            f"目前指令：{_automation_status_task_name(data)}",
+            f"任務狀態：{_automation_task_phase_label(status)}",
+            f"任務ID：{focus.get('id')}",
+        ]
+
+        if status == "waiting":
+            queue_ids = [x.get("id") for x in waiting]
+            try:
+                position = queue_ids.index(focus.get("id")) + 1
+                lines.append(f"排隊順位：第 {position} 筆")
+            except ValueError:
+                pass
+            age = _automation_status_age_seconds(data.get("created_at") or data.get("updated_at"))
+            lines.append(f"已等待：{_automation_status_duration_text(age)}")
+
+            if worker.get("online") and str(worker.get("status") or "").lower() in ("idle", "standby", "waiting"):
+                if age is not None and age >= AUTOMATION_WAITING_WARN_SECONDS:
+                    warning_lines.append("⚠️ Agent 顯示待命，但這筆 waiting 任務超過 60 秒仍未被領取。")
+                    warning_lines.append("判斷：Agent 輪詢可能卡住，或本機仍在執行舊版 automation_agent.py。")
+            elif worker.get("online") and str(worker.get("status") or "").lower() in ("running", "finalizing"):
+                current_type = worker.get("current_task_type") or "-"
+                lines.append(f"主機目前正在處理：{current_type}")
+            elif not worker.get("online"):
+                warning_lines.append("⚠️ 任務已排入 waiting，但 Agent 沒有在線心跳，因此終端機不會領取。")
+
+        elif status == "running":
+            started_age = _automation_status_age_seconds(data.get("started_at") or data.get("updated_at"))
+            lines.append(f"已執行：{_automation_status_duration_text(started_age)}")
+            current_task_id = str(worker.get("current_task_id") or "")
+            worker_status = str(worker.get("status") or "").lower()
+            if not worker.get("online"):
+                warning_lines.append("⚠️ Firebase 任務仍是 running，但 Agent 已離線；這很可能是舊任務狀態沒有清乾淨。")
+            elif current_task_id != focus.get("id") or worker_status not in ("running", "finalizing"):
+                warning_lines.append("⚠️ Firebase 任務顯示 running，但 Agent 心跳沒有執行這個任務。")
+                warning_lines.append("判斷：舊任務狀態疑似卡住，這也會讓新指令顯示『任務已存在』。")
+
+        elif status in ("done", "failed", "timeout", "cancelled"):
+            finished_age = _automation_status_age_seconds(data.get("finished_at") or data.get("updated_at"))
+            lines.append(f"最後更新：{_automation_status_duration_text(finished_age)}前")
+
+    else:
+        worker_status = str(worker.get("status") or "").lower()
+        if worker.get("online") and worker_status in ("running", "finalizing"):
+            current_id = worker.get("current_task_id") or ""
+            current = _automation_status_find_task(current_id) if current_id else None
+            current_data = (current or {}).get("data") or {}
+            lines += [
+                "",
+                f"現階段：{_automation_worker_phase_label(worker)}",
+                f"目前任務：{_automation_status_task_name(current_data) if current_data else (worker.get('current_task_type') or '-')}",
+                f"任務ID：{current_id or '-'}",
+            ]
+        elif worker.get("online"):
+            lines += ["", "現階段：🟢 待命中", "目前任務：無"]
+        else:
+            lines += ["", "現階段：🔴 Agent 離線", "目前任務：無法確認"]
+
+    lines.append(f"等待任務：{len(waiting)} 筆")
+    if waiting:
+        next_task = waiting[0]
+        next_data = next_task.get("data") or {}
+        lines.append(f"下一筆：{_automation_status_task_name(next_data)}")
+        lines.append(f"下一筆ID：{next_task.get('id')}")
+
+    # 額外檢查：Firebase 還有 running，但 worker 說自己 idle / offline。
+    if running:
+        worker_status = str(worker.get("status") or "").lower()
+        worker_current = str(worker.get("current_task_id") or "")
+        mismatched = [x for x in running if x.get("id") != worker_current]
+        if (not worker.get("online") or worker_status in ("idle", "standby", "waiting")) and running:
+            warning_lines.append(f"⚠️ Firebase 尚有 {len(running)} 筆 running 任務，但 Agent 並未回報執行中。")
+        elif mismatched:
+            warning_lines.append(f"⚠️ 另有 {len(mismatched)} 筆 running 任務與 Agent 目前任務不一致。")
+
+    if warning_lines:
+        lines += ["", "【狀態判斷】"]
+        seen = set()
+        for item in warning_lines:
+            if item not in seen:
+                seen.add(item)
+                lines.append(item)
+    elif focus and focus.get("status") == "waiting":
+        lines += ["", "判斷：任務已排隊，Agent 會依序領取。"]
+    elif worker.get("online") and str(worker.get("status") or "").lower() in ("idle", "standby", "waiting"):
+        lines += ["", "判斷：Agent 已恢復待機，可以接下一個任務。"]
+
+    if not compact:
+        lines += ["", "查詢指令：#狀態"]
+    return "\n".join(lines).strip()[:4900]
+
+
+def _automation_worker_status_text(limit=8):
+    """新版主機狀態：顯示 Agent 心跳、目前任務與 waiting 佇列。"""
+    try:
+        worker_docs = list(db.collection(AUTOMATION_WORKER_COLLECTION).stream())
+    except Exception:
+        worker_docs = []
+
+    worker_ids = []
+    for doc in worker_docs:
+        data = doc.to_dict() or {}
+        worker_id = str(data.get("worker_id") or doc.id or "").strip()
+        if worker_id and worker_id not in worker_ids:
+            worker_ids.append(worker_id)
+    if DEFAULT_AUTOMATION_WORKER_ID not in worker_ids:
+        worker_ids.insert(0, DEFAULT_AUTOMATION_WORKER_ID)
+    worker_ids = worker_ids[:limit]
+
+    blocks = [_automation_live_status_text(worker_id, compact=True) for worker_id in worker_ids]
+    return "\n\n──────────\n\n".join(blocks)[:5000]
+
+
+# 讓 #狀態 在 test 群組權限 gate 中被辨識為 automation。
+try:
+    _detect_line_command_type_before_live_status = detect_line_command_type
+
+    def detect_line_command_type(text: str, event=None):
+        raw = str(text or "").strip().replace("＃", "#")
+        first = raw.splitlines()[0].strip() if raw else ""
+        body = first[1:].strip() if first.startswith("#") else first
+        body_no_space = re.sub(r"\s+", "", body)
+        status_names = {re.sub(r"\s+", "", x) for x in AUTOMATION_STATUS_COMMAND_NAMES}
+        if body_no_space in status_names or any(body_no_space.startswith(x + "@") for x in status_names):
+            return "automation"
+        try:
+            return _detect_line_command_type_before_live_status(text, event=event)
+        except TypeError:
+            return _detect_line_command_type_before_live_status(text)
+
+    print("✅ automation live status：#狀態 已納入 automation 權限辨識", flush=True)
+except Exception as e:
+    print("⚠️ automation live status detect patch 失敗：", e, flush=True)
+
+
+# automation 指令處理：
+# - #狀態 直接查詢
+# - 任務建立/命中去重後，追加第二則 LINE 訊息顯示即時狀態
+try:
+    _process_line_dynamic_command_event_before_live_status = process_line_dynamic_command_event
+
+    def process_line_dynamic_command_event(event):
+        message = (event or {}).get("message") or {}
+        raw_text = (message.get("text") or "").strip() if message.get("type") == "text" else ""
+        first = raw_text.splitlines()[0].strip().replace("＃", "#") if raw_text else ""
+        body = first[1:].strip() if first.startswith("#") else first
+        body_no_space = re.sub(r"\s+", "", body)
+        status_names = {re.sub(r"\s+", "", x) for x in AUTOMATION_STATUS_COMMAND_NAMES}
+
+        if body_no_space in status_names or any(body_no_space.startswith(x + "@") for x in status_names):
+            target_worker = DEFAULT_AUTOMATION_WORKER_ID
+            parts = body.split()
+            if len(parts) >= 2:
+                target_worker = parts[1].strip().lstrip("@").strip() or DEFAULT_AUTOMATION_WORKER_ID
+            return {
+                "handled": True,
+                "ok": True,
+                "reply_text": _automation_live_status_text(target_worker),
+                "parsed_tag": "狀態",
+            }
+
+        result = _process_line_dynamic_command_event_before_live_status(event)
+        if not result or not result.get("handled"):
+            return result
+
+        # 所有 automation 任務建立回覆，只要文字中有任務ID，就補第二則「現階段狀態」。
+        if not result.get("reply_messages"):
+            reply_text = str(result.get("reply_text") or "")
+            task_match = re.search(r"任務ID[：:]\s*([^\s]+)", reply_text)
+            if task_match:
+                task_id = task_match.group(1).strip()
+                task_item = _automation_status_find_task(task_id)
+                target_worker = DEFAULT_AUTOMATION_WORKER_ID
+                if task_item:
+                    target_worker = str((task_item.get("data") or {}).get("target_worker") or target_worker).strip()
+                status_text = _automation_live_status_text(target_worker, focus_task_id=task_id, compact=True)
+                result = dict(result)
+                result["reply_messages"] = [
+                    {"type": "text", "text": reply_text[:4900]},
+                    {"type": "text", "text": status_text[:4900]},
+                ]
+        return result
+
+    print("✅ automation live status：任務建立後會回覆第二則現階段狀態", flush=True)
+except Exception as e:
+    print("⚠️ automation live status process patch 失敗：", e, flush=True)
+
+
+print("✅ Team M.E Automation Live Status Patch 20260706E 載入完成", flush=True)
+# =============================================================================
+# Team M.E Automation Live Status Patch End
+# =============================================================================
