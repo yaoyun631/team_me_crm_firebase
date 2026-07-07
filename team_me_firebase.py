@@ -25061,6 +25061,36 @@ DEFAULT_AUTOMATION_ALIASES = {
         "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
         "description": "愛屋出售＋出租 CSV 下載並同步 Firebase",
     },
+    "上架臉書Marketplace出售新物件": {
+        "task_type": "fb_marketplace_sell_new_listings",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "篩選未上架出售新物件並發佈 Facebook Marketplace",
+    },
+    "上架FB出售新物件": {
+        "task_type": "fb_marketplace_sell_new_listings",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "篩選未上架出售新物件並發佈 Facebook Marketplace",
+    },
+    "上架Marketplace出售新物件": {
+        "task_type": "fb_marketplace_sell_new_listings",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "篩選未上架出售新物件並發佈 Facebook Marketplace",
+    },
+    "上架臉書Marketplace出租新物件": {
+        "task_type": "fb_marketplace_rent_new_listings",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "篩選未上架出租新物件並發佈 Facebook Marketplace",
+    },
+    "上架FB出租新物件": {
+        "task_type": "fb_marketplace_rent_new_listings",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "篩選未上架出租新物件並發佈 Facebook Marketplace",
+    },
+    "上架Marketplace出租新物件": {
+        "task_type": "fb_marketplace_rent_new_listings",
+        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
+        "description": "篩選未上架出租新物件並發佈 Facebook Marketplace",
+    },
 }
 
 
@@ -26625,3 +26655,543 @@ print("✅ Team M.E Automation Live Status Patch 20260706E 載入完成", flush=
 # =============================================================================
 # Team M.E Automation Live Status Patch End
 # =============================================================================
+
+
+# =============================================================================
+# Team M.E LINE Quoted Reply Context Fix 20260707F
+# 目的：
+# 1. LINE「回覆該則訊息」不再要求 # 指令。
+# 2. quotedMessageId 若已存在 line_message_links，直接依 target_type 找 buyer / seller / development。
+# 3. 權限支援 followup，並相容舊設定只勾 buyer / seller / development 的群組。
+# 4. 真正的儲存流程仍交給既有 process_quote_context_message：
+#    - 更新客戶 note
+#    - 加入 LINE紀錄 / 群組回覆註記 labels
+#    - 新增 buyer_followups / seller_followups / development_followups
+#    - 解析進度、下一步、下次聯絡日、地址、電話、姓名、網址、來源等欄位
+# 5. automation / #狀態 / test 群組 ACL 全部保留原邏輯。
+# =============================================================================
+
+TEAMME_QUOTED_REPLY_PERMISSION_KEY = "followup"
+TEAMME_QUOTED_REPLY_TARGET_PERMISSION_MAP = {
+    "buyer": "buyer",
+    "seller": "seller",
+    "development": "development",
+}
+
+
+def _teamme_quoted_reply_source_config(event):
+    """取得 LINE 來源與設定中心 ACL 設定。"""
+    kind, target_id = line_event_source_kind_and_id(event)
+    source_cfg = None
+
+    if kind in ("group", "room"):
+        try:
+            source_cfg = find_line_group_by_target_id(target_id)
+        except Exception as e:
+            print(f"⚠️ 回覆追蹤：讀取群組 ACL 失敗 target={target_id}: {e}", flush=True)
+            source_cfg = None
+
+    elif kind == "user":
+        finder = globals().get("find_line_personal_user_by_user_id")
+        if callable(finder):
+            try:
+                source_cfg = finder(target_id)
+            except Exception as e:
+                print(f"⚠️ 回覆追蹤：讀取個人 LINE ACL 失敗 target={target_id}: {e}", flush=True)
+                source_cfg = None
+
+    return kind, target_id, source_cfg
+
+
+def _teamme_quoted_reply_acl_allowed(event):
+    """
+    專門判斷「回覆該則訊息」。
+
+    回傳：
+    (is_quoted_reply, allowed, reason_or_command_type, source_cfg)
+    """
+    message = (event or {}).get("message") or {}
+    if message.get("type") != "text":
+        return False, False, "", None
+
+    raw_text = str(message.get("text") or "").strip()
+    quoted_message_id = str(message.get("quotedMessageId") or "").strip()
+
+    if not quoted_message_id or not raw_text:
+        return False, False, "", None
+
+    kind, target_id, source_cfg = _teamme_quoted_reply_source_config(event)
+
+    print(
+        f"📎 LINE 回覆訊息收到 kind={kind} target={target_id or '-'} "
+        f"quoted={quoted_message_id} text={raw_text.splitlines()[0][:120]}",
+        flush=True,
+    )
+
+    if not source_cfg:
+        return (
+            True,
+            False,
+            f"未授權：此 LINE 來源尚未在後台設定。\nID：{target_id or '-'}",
+            None,
+        )
+
+    if not bool(source_cfg.get("enabled", True)):
+        return True, False, "此 LINE 來源目前已停用。", source_cfg
+
+    allowed_types = set(source_cfg.get("command_types") or [])
+    link = None
+    try:
+        link = get_line_message_link(quoted_message_id)
+    except Exception as e:
+        print(f"⚠️ 回覆追蹤：讀取 line_message_links 失敗 quoted={quoted_message_id}: {e}", flush=True)
+
+    # 有 link：可精準依客戶類型驗權。
+    if link:
+        target_type = str(link.get("target_type") or "").strip()
+        required_permission = TEAMME_QUOTED_REPLY_TARGET_PERMISSION_MAP.get(target_type, "")
+
+        if (
+            "all" in allowed_types
+            or TEAMME_QUOTED_REPLY_PERMISSION_KEY in allowed_types
+            or (required_permission and required_permission in allowed_types)
+        ):
+            print(
+                f"✅ LINE 回覆追蹤已放行 quoted={quoted_message_id} "
+                f"target_type={target_type or '-'} permission={required_permission or TEAMME_QUOTED_REPLY_PERMISSION_KEY}",
+                flush=True,
+            )
+            return True, True, TEAMME_QUOTED_REPLY_PERMISSION_KEY, source_cfg
+
+        label = {
+            "buyer": "客需",
+            "seller": "委託",
+            "development": "開發",
+        }.get(target_type, "回覆追蹤")
+
+        return (
+            True,
+            False,
+            f"此群組未開放「{label}回覆追蹤」權限。"
+            f"\n請到設定中心勾選「卡片回覆追蹤」"
+            f"{f'或「{required_permission}」類指令' if required_permission else ''}。",
+            source_cfg,
+        )
+
+    # 沒有 link：
+    # 只要來源原本有 followup / buyer / seller / development / all，
+    # 就放行進既有 process_quote_context_message，
+    # 讓 Bot 回覆「找不到對標資料」，而不是被誤判成 unknown #指令。
+    fallback_permissions = {
+        "all",
+        TEAMME_QUOTED_REPLY_PERMISSION_KEY,
+        "buyer",
+        "seller",
+        "development",
+    }
+    if allowed_types.intersection(fallback_permissions):
+        print(
+            f"⚠️ LINE 回覆訊息找不到 link，仍放行至 quoted handler 回覆明確錯誤 "
+            f"quoted={quoted_message_id}",
+            flush=True,
+        )
+        return True, True, TEAMME_QUOTED_REPLY_PERMISSION_KEY, source_cfg
+
+    return (
+        True,
+        False,
+        "此群組未開放「卡片回覆追蹤」權限，請到設定中心勾選「卡片回覆追蹤」。",
+        source_cfg,
+    )
+
+
+try:
+    _line_access_gate_before_quoted_reply_fix = line_access_gate
+
+    def line_access_gate(event):
+        is_quoted, allowed, reason_or_cmd, source_cfg = _teamme_quoted_reply_acl_allowed(event)
+        if is_quoted:
+            return allowed, reason_or_cmd, source_cfg
+        return _line_access_gate_before_quoted_reply_fix(event)
+
+    print(
+        "✅ LINE 回覆追蹤 ACL 已修正：quotedMessageId 優先，不再要求 # 指令",
+        flush=True,
+    )
+except Exception as e:
+    print("⚠️ LINE 回覆追蹤 ACL 修正失敗：", e, flush=True)
+
+
+print("✅ Team M.E LINE Quoted Reply Context Fix 20260707F 載入完成", flush=True)
+# =============================================================================
+# Team M.E LINE Quoted Reply Context Fix End
+# =============================================================================
+
+
+# =============================================================================
+# Team M.E Facebook Marketplace Multi-Account Command Patch 20260707G
+# =============================================================================
+
+FB_MARKETPLACE_UPLOAD_COMMANDS = {
+    "上架FB出售新物件": "fb_marketplace_sell_new_listings",
+    "上架臉書Marketplace出售新物件": "fb_marketplace_sell_new_listings",
+    "上架Marketplace出售新物件": "fb_marketplace_sell_new_listings",
+    "上架FB出租新物件": "fb_marketplace_rent_new_listings",
+    "上架臉書Marketplace出租新物件": "fb_marketplace_rent_new_listings",
+    "上架Marketplace出租新物件": "fb_marketplace_rent_new_listings",
+}
+
+FB_MARKETPLACE_ACCOUNT_STATUS_COMMANDS = {
+    "FB帳號",
+    "FB帳號列表",
+    "Marketplace帳號",
+    "臉書帳號",
+}
+FB_MARKETPLACE_LOGIN_COMMANDS = {
+    "登入FB帳號",
+    "登入Marketplace帳號",
+    "登入臉書帳號",
+}
+FB_MARKETPLACE_RESET_COMMANDS = {
+    "重設FB帳號",
+    "重置FB帳號",
+    "重設Marketplace帳號",
+}
+
+
+def _fb_marketplace_command_body(raw_text: str) -> str:
+    first = str(raw_text or "").strip().splitlines()[0].strip().replace("＃", "#")
+    if first.startswith("#"):
+        first = first[1:].strip()
+    return first
+
+
+def _fb_marketplace_match_prefix(body: str, names):
+    body = str(body or "").strip()
+    for name in sorted(names, key=len, reverse=True):
+        if body == name:
+            return name, ""
+        if body.startswith(name + " "):
+            return name, body[len(name):].strip()
+    return "", ""
+
+
+def _fb_marketplace_parse_tail(tail: str):
+    account_key = ""
+    target_worker = DEFAULT_AUTOMATION_WORKER_ID
+    for token in str(tail or "").split():
+        token = token.strip()
+        if not token:
+            continue
+        if token.startswith("@"):
+            target_worker = token[1:].strip() or target_worker
+        elif not account_key and re.match(r"^[A-Za-z0-9_\-]+$", token):
+            account_key = token.lower()
+    return account_key, target_worker
+
+
+def _fb_marketplace_task_source_target(data):
+    return (
+        data.get("source_group_id")
+        or data.get("line_group_id")
+        or data.get("source_room_id")
+        or data.get("line_room_id")
+        or data.get("line_target_id")
+        or data.get("source_user_id")
+        or data.get("line_user_id")
+        or ""
+    )
+
+
+def _fb_marketplace_find_active_duplicate(task_type, target_worker, source_target_id, account_key):
+    scope = str(account_key or "").strip().lower()
+    for status in ("waiting", "running"):
+        try:
+            docs = list(
+                db.collection(AUTOMATION_TASK_COLLECTION)
+                .where("target_worker", "==", target_worker)
+                .where("status", "==", status)
+                .limit(100)
+                .stream()
+            )
+        except Exception as e:
+            print(f"⚠️ FB Marketplace duplicate 查詢失敗 status={status}: {e}", flush=True)
+            continue
+
+        for doc in docs:
+            data = doc.to_dict() or {}
+            existing_type = data.get("type") or data.get("task_type") or ""
+            if existing_type != task_type:
+                continue
+            if _fb_marketplace_task_source_target(data) != source_target_id:
+                continue
+            existing_account = str(data.get("fb_account_key") or "").strip().lower()
+            if existing_account != scope:
+                continue
+            found = dict(data)
+            found["_deduplicated"] = True
+            found["_dedupe_reason"] = f"active_{status}_fb_account"
+            return doc.id, found
+    return None
+
+
+def _fb_marketplace_create_task(task_type, event, target_worker, command_text, account_key=""):
+    task_type = str(task_type or "").strip()
+    target_worker = str(target_worker or DEFAULT_AUTOMATION_WORKER_ID).strip()
+    account_key = str(account_key or "").strip().lower()
+    sender_name = _automation_sender_name(event)
+    now_iso = now_taipei().isoformat()
+    source_ids = _automation_task_source_ids(event)
+    source_target_id = source_ids.get("line_target_id", "")
+    event_key = _automation_event_dedupe_key(event)
+
+    active = _fb_marketplace_find_active_duplicate(
+        task_type,
+        target_worker,
+        source_target_id,
+        account_key,
+    )
+    if active:
+        return active
+
+    data = {
+        "type": task_type,
+        "task_type": task_type,
+        "status": "waiting",
+        "target_worker": target_worker,
+        "command_text": command_text,
+        "fb_account_key": account_key,
+        "task_scope": f"fb_account:{account_key or '__default__'}",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "created_by": sender_name,
+        "webhook_event_id": (event or {}).get("webhookEventId", ""),
+        "line_message_id": ((event or {}).get("message") or {}).get("id", ""),
+        "result_message": "",
+        "error_message": "",
+        "attempt_count": 0,
+        "dedupe_key": event_key,
+    }
+    data.update(source_ids)
+
+    if event_key:
+        doc_id = "line_" + hashlib.sha256(event_key.encode("utf-8")).hexdigest()[:40]
+        doc_ref = db.collection(AUTOMATION_TASK_COLLECTION).document(doc_id)
+
+        @firestore.transactional
+        def txn_create(transaction):
+            fresh = doc_ref.get(transaction=transaction)
+            if fresh.exists:
+                existing = fresh.to_dict() or {}
+                existing["_deduplicated"] = True
+                existing["_dedupe_reason"] = "same_line_event"
+                return existing
+            transaction.set(doc_ref, data)
+            return dict(data)
+
+        returned = txn_create(db.transaction())
+        return doc_ref.id, returned
+
+    doc_ref = db.collection(AUTOMATION_TASK_COLLECTION).document()
+    doc_ref.set(data)
+    return doc_ref.id, data
+
+
+def _fb_marketplace_task_reply(task_id, task_data, title, task_type, target_worker, account_key):
+    deduplicated = bool((task_data or {}).get("_deduplicated"))
+    first_line = (
+        f"♻️ 任務已存在，未重複建立：{title}"
+        if deduplicated
+        else f"✅ 已建立任務：{title}"
+    )
+    account_text = account_key or "本機預設帳號"
+    reply_text = (
+        f"{first_line}\n"
+        f"任務ID：{task_id}\n"
+        f"任務代號：{task_type}\n"
+        f"發文帳號：{account_text}\n"
+        f"指定主機：{target_worker}\n\n"
+        "完成後會由主機 Agent 回傳結果並同步到 test 群組。"
+    )
+
+    result = {
+        "handled": True,
+        "ok": True,
+        "reply_text": reply_text,
+        "parsed_tag": title,
+    }
+
+    try:
+        status_text = _automation_live_status_text(
+            target_worker,
+            focus_task_id=task_id,
+            compact=True,
+        )
+        result["reply_messages"] = [
+            {"type": "text", "text": reply_text[:4900]},
+            {"type": "text", "text": status_text[:4900]},
+        ]
+    except Exception:
+        pass
+    return result
+
+
+def process_fb_marketplace_multi_account_command(event):
+    message = (event or {}).get("message") or {}
+    if message.get("type") != "text":
+        return {"handled": False}
+
+    raw_text = str(message.get("text") or "").strip()
+    if not raw_text:
+        return {"handled": False}
+
+    body = _fb_marketplace_command_body(raw_text)
+
+    command, tail = _fb_marketplace_match_prefix(
+        body,
+        FB_MARKETPLACE_ACCOUNT_STATUS_COMMANDS,
+    )
+    if command:
+        account_key, target_worker = _fb_marketplace_parse_tail(tail)
+        task_id, task_data = _fb_marketplace_create_task(
+            "fb_marketplace_accounts_status",
+            event,
+            target_worker,
+            raw_text,
+            account_key="",
+        )
+        return _fb_marketplace_task_reply(
+            task_id,
+            task_data,
+            "查詢 Facebook Marketplace 帳號",
+            "fb_marketplace_accounts_status",
+            target_worker,
+            "",
+        )
+
+    command, tail = _fb_marketplace_match_prefix(
+        body,
+        FB_MARKETPLACE_LOGIN_COMMANDS,
+    )
+    if command:
+        account_key, target_worker = _fb_marketplace_parse_tail(tail)
+        task_id, task_data = _fb_marketplace_create_task(
+            "fb_marketplace_login_account",
+            event,
+            target_worker,
+            raw_text,
+            account_key=account_key,
+        )
+        return _fb_marketplace_task_reply(
+            task_id,
+            task_data,
+            "登入 Facebook Marketplace 帳號",
+            "fb_marketplace_login_account",
+            target_worker,
+            account_key,
+        )
+
+    command, tail = _fb_marketplace_match_prefix(
+        body,
+        FB_MARKETPLACE_RESET_COMMANDS,
+    )
+    if command:
+        account_key, target_worker = _fb_marketplace_parse_tail(tail)
+        if not account_key:
+            return {
+                "handled": True,
+                "ok": False,
+                "reply_text": "重設帳號必須明確指定代號。\n例如：#重設FB帳號 ellen",
+                "parsed_tag": "重設FB帳號",
+            }
+        task_id, task_data = _fb_marketplace_create_task(
+            "fb_marketplace_reset_account",
+            event,
+            target_worker,
+            raw_text,
+            account_key=account_key,
+        )
+        return _fb_marketplace_task_reply(
+            task_id,
+            task_data,
+            "重設 Facebook Marketplace 帳號",
+            "fb_marketplace_reset_account",
+            target_worker,
+            account_key,
+        )
+
+    command, tail = _fb_marketplace_match_prefix(
+        body,
+        FB_MARKETPLACE_UPLOAD_COMMANDS.keys(),
+    )
+    if command:
+        account_key, target_worker = _fb_marketplace_parse_tail(tail)
+        task_type = FB_MARKETPLACE_UPLOAD_COMMANDS[command]
+        task_id, task_data = _fb_marketplace_create_task(
+            task_type,
+            event,
+            target_worker,
+            raw_text,
+            account_key=account_key,
+        )
+        return _fb_marketplace_task_reply(
+            task_id,
+            task_data,
+            command,
+            task_type,
+            target_worker,
+            account_key,
+        )
+
+    return {"handled": False}
+
+
+try:
+    _detect_line_command_type_before_fb_multi_account = detect_line_command_type
+
+    def detect_line_command_type(text: str, event=None):
+        raw = str(text or "").strip().replace("＃", "#")
+        if raw.startswith("#"):
+            body = _fb_marketplace_command_body(raw)
+            all_names = (
+                set(FB_MARKETPLACE_UPLOAD_COMMANDS.keys())
+                | FB_MARKETPLACE_ACCOUNT_STATUS_COMMANDS
+                | FB_MARKETPLACE_LOGIN_COMMANDS
+                | FB_MARKETPLACE_RESET_COMMANDS
+            )
+            command, _ = _fb_marketplace_match_prefix(body, all_names)
+            if command:
+                return "automation"
+        try:
+            return _detect_line_command_type_before_fb_multi_account(text, event=event)
+        except TypeError:
+            return _detect_line_command_type_before_fb_multi_account(text)
+
+    print("✅ FB Marketplace 多帳號指令已納入 automation 權限辨識", flush=True)
+except Exception as e:
+    print("⚠️ FB Marketplace 多帳號 detect patch 失敗：", e, flush=True)
+
+
+try:
+    _process_line_message_event_before_fb_multi_account = process_line_message_event
+
+    def process_line_message_event(event):
+        fb_result = process_fb_marketplace_multi_account_command(event)
+        if fb_result.get("handled"):
+            return fb_result
+        return _process_line_message_event_before_fb_multi_account(event)
+
+    print(
+        "✅ FB Marketplace 多帳號 LINE 指令已啟用："
+        "#FB帳號 / #登入FB帳號 / #重設FB帳號 / 上架指令+帳號代號",
+        flush=True,
+    )
+except Exception as e:
+    print("⚠️ FB Marketplace 多帳號 process patch 失敗：", e, flush=True)
+
+
+print("✅ Team M.E Facebook Marketplace Multi-Account Patch 20260707G 載入完成", flush=True)
+# =============================================================================
+# Team M.E Facebook Marketplace Multi-Account Command Patch End
+# =============================================================================
+
