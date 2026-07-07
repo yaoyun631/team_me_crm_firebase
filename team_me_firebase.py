@@ -24817,7 +24817,7 @@ def _automation_find_active_duplicate(task_type: str, target_worker: str, source
     return None
 
 
-def _automation_create_task(task_type: str, event, target_worker: str = "", command_text: str = ""):
+def _automation_create_task(task_type: str, event, target_worker: str = "", command_text: str = "", extra_data=None):
     """
     建立 automation task，具備兩層防重複：
     1. webhookEventId / LINE message id 使用固定 Firestore document id，Webhook 重送不會重建。
@@ -24853,6 +24853,9 @@ def _automation_create_task(task_type: str, event, target_worker: str = "", comm
         "dedupe_key": event_key,
     }
     data.update(source_ids)
+
+    if isinstance(extra_data, dict):
+        data.update(extra_data)
 
     if event_key:
         # 同一 webhook/message 無論被 LINE 重送幾次，都命中同一份文件。
@@ -24948,29 +24951,216 @@ def process_line_automation_task_event(event):
         }
 
     if body_no_space.startswith("更新樂屋"):
-        # 指定主機：#更新樂屋 @ELLEN-PC 或 #更新樂屋 ELLEN-PC
+        # 新版格式：
+        # #更新樂屋
+        # AA6316787
+        # AA6352131
+        #
+        # 亦支援：
+        # #更新樂屋 @ELLEN-PC
+        # AA6316787
+
+        def _normalize_rakuya_object_no(value):
+            value = str(value or "").strip().upper()
+            value = value.translate(
+                str.maketrans(
+                    "０１２３４５６７８９",
+                    "0123456789",
+                )
+            )
+            return re.sub(
+                r"[^A-Z0-9]",
+                "",
+                value,
+            )
+
+        def _looks_like_rakuya_object_no(value):
+            value = _normalize_rakuya_object_no(value)
+            return (
+                5 <= len(value) <= 24
+                and bool(re.search(r"[A-Z]", value))
+                and bool(re.search(r"\d", value))
+            )
+
         target_worker = DEFAULT_AUTOMATION_WORKER_ID
-        parts = body.split()
-        if len(parts) >= 2:
-            target_worker = parts[1].strip().lstrip("@").strip() or DEFAULT_AUTOMATION_WORKER_ID
+        object_ids = []
+        duplicate_object_ids = []
+        seen_object_ids = set()
+
+        raw_lines = [
+            line.strip()
+            for line in raw_text.replace(
+                "\r\n",
+                "\n",
+            ).split("\n")
+            if line.strip()
+        ]
+
+        for line_index, line in enumerate(raw_lines):
+            cleaned_line = (
+                line.replace("＃", "#").strip()
+            )
+
+            if line_index == 0:
+                if cleaned_line.startswith("#"):
+                    cleaned_line = cleaned_line[1:].strip()
+
+                cleaned_line = re.sub(
+                    r"^(更新樂屋|樂屋更新)",
+                    "",
+                    cleaned_line,
+                    flags=re.I,
+                ).strip()
+
+            for token in re.split(
+                r"[\s,，、;；|]+",
+                cleaned_line,
+            ):
+                token = token.strip()
+
+                if not token:
+                    continue
+
+                if token.startswith("@"):
+                    target_worker = (
+                        token[1:].strip()
+                        or target_worker
+                    )
+                    continue
+
+                object_no = _normalize_rakuya_object_no(
+                    token
+                )
+
+                if not _looks_like_rakuya_object_no(
+                    object_no
+                ):
+                    continue
+
+                if object_no in seen_object_ids:
+                    duplicate_object_ids.append(
+                        object_no
+                    )
+                    continue
+
+                seen_object_ids.add(object_no)
+                object_ids.append(object_no)
+
+        if not object_ids:
+            return {
+                "handled": True,
+                "ok": False,
+                "reply_text": (
+                    "❌ #更新樂屋 現在必須提供要直接上架的物件編號。\n\n"
+                    "格式：\n"
+                    "#更新樂屋\n"
+                    "AA6316787\n"
+                    "AA6352131\n"
+                    "AA6334831"
+                ),
+                "parsed_tag": "更新樂屋",
+            }
 
         task_id, data = _automation_create_task(
             task_type="rakuya_inventory_cycle",
             event=event,
             target_worker=target_worker,
             command_text=raw_text,
+            extra_data={
+                "rakuya_object_ids": object_ids,
+                "rakuya_object_count": len(
+                    object_ids
+                ),
+                "rakuya_duplicate_object_ids": (
+                    duplicate_object_ids
+                ),
+                "task_scope": (
+                    "rakuya_direct_publish:"
+                    + ",".join(object_ids)
+                ),
+            },
         )
-        return {
+
+        deduplicated = bool(
+            (data or {}).get("_deduplicated")
+        )
+
+        first_line_text = (
+            "♻️ 樂屋更新任務已存在，未重複建立"
+            if deduplicated
+            else "✅ 已建立樂屋指定物件更新任務"
+        )
+
+        task_object_ids = (
+            (data or {}).get("rakuya_object_ids")
+            or object_ids
+        )
+
+        preview = "\n".join(
+            f"{index}. {object_no}"
+            for index, object_no in enumerate(
+                task_object_ids[:30],
+                start=1,
+            )
+        )
+
+        if len(task_object_ids) > 30:
+            preview += (
+                f"\n…另有 "
+                f"{len(task_object_ids) - 30} 筆"
+            )
+
+        duplicate_note = ""
+
+        if (
+            duplicate_object_ids
+            and not deduplicated
+        ):
+            duplicate_note = (
+                "\n\n已自動移除重複編號："
+                + "、".join(
+                    duplicate_object_ids
+                )
+            )
+
+        reply_text = (
+            f"{first_line_text}\n"
+            f"任務ID：{task_id}\n"
+            f"指定主機：{target_worker}\n"
+            f"指定上架：{len(task_object_ids)} 筆\n\n"
+            f"{preview}"
+            f"{duplicate_note}\n\n"
+            "流程：曝光全選關閉 → 停售全選刪除並確認 → "
+            "依上述編號直接上架，不走可售庫存。"
+        )
+
+        result = {
             "handled": True,
             "ok": True,
-            "reply_text": (
-                "✅ 已建立樂屋更新任務\n"
-                f"任務ID：{task_id}\n"
-                f"指定主機：{target_worker}\n\n"
-                "請確認該主機已啟動 automation_agent.py。"
-            ),
+            "reply_text": reply_text,
             "parsed_tag": "更新樂屋",
         }
+
+        try:
+            status_text = _automation_live_status_text(
+                target_worker,
+                focus_task_id=task_id,
+                compact=True,
+            )
+            result["reply_messages"] = [
+                {
+                    "type": "text",
+                    "text": reply_text[:4900],
+                },
+                {
+                    "type": "text",
+                    "text": status_text[:4900],
+                },
+            ]
+        except Exception:
+            pass
+
+        return result
 
     if body_no_space.startswith("指定主機"):
         parts = body.split()
@@ -25039,12 +25229,12 @@ DEFAULT_AUTOMATION_ALIASES = {
     "更新樂屋": {
         "task_type": "rakuya_inventory_cycle",
         "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "樂屋庫存輪替上架",
+        "description": "依 LINE 指定物件編號重建樂屋曝光上架，不走可售庫存",
     },
     "樂屋更新": {
         "task_type": "rakuya_inventory_cycle",
         "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "樂屋庫存輪替上架",
+        "description": "依 LINE 指定物件編號重建樂屋曝光上架，不走可售庫存",
     },
     "更新出售CSV": {
         "task_type": "aiwu_sell_csv",
@@ -25829,7 +26019,7 @@ try:
         "更新樂屋": {
             "task_type": "rakuya_inventory_cycle",
             "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-            "description": "樂屋庫存輪替上架",
+            "description": "依 LINE 指定物件編號重建樂屋曝光上架，不走可售庫存",
         },
     })
 except Exception as e:
