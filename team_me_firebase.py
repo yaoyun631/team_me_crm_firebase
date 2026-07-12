@@ -26141,7 +26141,7 @@ print("✅ TeamME automation_tasks source id 已整合至 _automation_create_tas
 # Firebase 物件庫狀態 / 重複清理 Patch v20260712
 # - 設定中心顯示 properties 出售 / 出租筆數與最新更新時間
 # - 偵測 sale/rent 重複資料
-# - 一鍵停用舊版重複資料，只保留最新 active 版本
+# - 一鍵刪除舊版重複資料，只保留最新 active 版本
 # =============================================================================
 
 PROPERTY_LIBRARY_COLLECTION = os.environ.get(
@@ -26806,6 +26806,22 @@ def get_property_library_status():
 def cleanup_duplicate_properties_keep_latest(
     deal_type: str = "",
 ) -> dict:
+    """
+    直接刪除重複舊版，只保留最新版本。
+
+    重複判斷：
+    1. 物件編號＋分店代碼
+    2. 物件網址
+    3. 案名＋地址＋價格
+
+    最新版本排序：
+    updated_at / imported_at / created_at 最大者保留。
+
+    注意：
+    - 這版使用 Firestore batch.delete()
+    - 舊版文件會真的刪除，不是 active=False
+    - 清理紀錄會寫入 property_maintenance_logs
+    """
     target_deal_types = (
         [
             "sale",
@@ -26824,16 +26840,18 @@ def cleanup_duplicate_properties_keep_latest(
     now_iso = now_taipei().isoformat()
 
     result = {
+        "action": "delete_duplicates_keep_latest",
         "processed_groups": 0,
-        "archived_docs": 0,
+        "deleted_docs": 0,
         "kept_docs": 0,
         "by_type": {},
+        "deleted_doc_ids": [],
+        "kept_doc_ids": [],
         "errors": [],
         "ran_at": now_iso,
     }
 
     batch = db.batch()
-
     batch_count = 0
 
     def commit_if_needed(
@@ -26871,9 +26889,6 @@ def cleanup_duplicate_properties_keep_latest(
             ):
                 data = doc.to_dict() or {}
 
-                if data.get("active") is False:
-                    continue
-
                 identity_key = (
                     _property_maintenance_identity_key(
                         data,
@@ -26899,7 +26914,7 @@ def cleanup_duplicate_properties_keep_latest(
                     }
                 )
 
-            type_archived = 0
+            type_deleted = 0
             type_groups = 0
             type_kept = 0
 
@@ -26927,10 +26942,58 @@ def cleanup_duplicate_properties_keep_latest(
                 type_groups += 1
                 type_kept += 1
 
+                keep_doc_id = (
+                    keep.get("doc_id")
+                    or ""
+                )
+
+                result[
+                    "kept_doc_ids"
+                ].append(
+                    {
+                        "deal_type": deal,
+                        "duplicate_key": identity_key,
+                        "doc_id": keep_doc_id,
+                    }
+                )
+
+                # 確保保留下來的最新版本仍是 active。
+                try:
+                    keep_ref = (
+                        db.collection(
+                            PROPERTY_LIBRARY_COLLECTION
+                        )
+                        .document(
+                            keep_doc_id
+                        )
+                    )
+
+                    batch.set(
+                        keep_ref,
+                        {
+                            "active": True,
+                            "duplicate_keep_latest": True,
+                            "duplicate_cleaned_at": now_iso,
+                            "updated_at": now_iso,
+                        },
+                        merge=True,
+                    )
+
+                    batch_count += 1
+                    commit_if_needed()
+
+                except Exception as exc:
+                    result["errors"].append(
+                        f"標記保留版本失敗 {keep_doc_id}：{exc}"
+                    )
+
                 for duplicate in duplicates:
                     doc_id = duplicate.get(
                         "doc_id"
                     )
+
+                    if not doc_id:
+                        continue
 
                     ref = (
                         db.collection(
@@ -26941,31 +27004,23 @@ def cleanup_duplicate_properties_keep_latest(
                         )
                     )
 
-                    batch.update(
-                        ref,
-                        {
-                            "active": False,
-                            "duplicate_archived": True,
-                            "duplicate_of": (
-                                keep.get(
-                                    "doc_id"
-                                )
-                            ),
-                            "duplicate_key": (
-                                identity_key
-                            ),
-                            "duplicate_archived_at": (
-                                now_iso
-                            ),
-                            "duplicate_archive_reason": (
-                                "keep_latest_version"
-                            ),
-                            "updated_at": now_iso,
-                        },
+                    batch.delete(
+                        ref
                     )
 
                     batch_count += 1
-                    type_archived += 1
+                    type_deleted += 1
+
+                    result[
+                        "deleted_doc_ids"
+                    ].append(
+                        {
+                            "deal_type": deal,
+                            "duplicate_key": identity_key,
+                            "doc_id": doc_id,
+                            "kept_doc_id": keep_doc_id,
+                        }
+                    )
 
                     commit_if_needed()
 
@@ -26976,7 +27031,7 @@ def cleanup_duplicate_properties_keep_latest(
             result["by_type"][deal] = {
                 "groups": type_groups,
                 "kept": type_kept,
-                "archived": type_archived,
+                "deleted": type_deleted,
             }
 
             result["processed_groups"] += (
@@ -26984,8 +27039,8 @@ def cleanup_duplicate_properties_keep_latest(
             )
 
             result["kept_docs"] += type_kept
-            result["archived_docs"] += (
-                type_archived
+            result["deleted_docs"] += (
+                type_deleted
             )
 
         try:
@@ -27002,7 +27057,7 @@ def cleanup_duplicate_properties_keep_latest(
             ).add(
                 {
                     "action": (
-                        "archive_duplicates_keep_latest"
+                        "delete_duplicates_keep_latest"
                     ),
                     "result": result,
                     "created_at": now_iso,
@@ -27021,7 +27076,7 @@ def cleanup_duplicate_properties_keep_latest(
 
         except Exception as exc:
             result["errors"].append(
-                f"寫入清理紀錄失敗：{exc}"
+                f"寫入刪除紀錄失敗：{exc}"
             )
 
     except Exception as exc:
@@ -27042,7 +27097,7 @@ _PROPERTY_LIBRARY_STATUS_CARD = """
           <div class="d-flex justify-content-between align-items-start gap-3 flex-wrap">
             <div>
               <h5 class="mb-1">Firebase 物件庫狀態</h5>
-              <div class="hint">統計 Firestore <span class="code">properties</span> 出售 / 出租 active 資料，並偵測重複物件。清理時只停用舊版，不會硬刪文件。</div>
+              <div class="hint">統計 Firestore <span class="code">properties</span> 出售 / 出租 active 資料，並偵測重複物件。清理時會直接刪除重複舊版，只保留最新版本文件。</div>
             </div>
             <div class="text-end small text-muted">
               更新時間<br>{{ property_status.generated_at or "-" }}
@@ -27065,7 +27120,7 @@ _PROPERTY_LIBRARY_STATUS_CARD = """
                       <div class="col-6"><div class="text-muted">Active 筆數</div><div class="fs-5 fw-bold">{{ s.active_count }}</div></div>
                       <div class="col-6"><div class="text-muted">總文件數</div><div class="fs-5 fw-bold">{{ s.total_count }}</div></div>
                       <div class="col-6"><div class="text-muted">重複組數</div><div class="fs-5 fw-bold">{{ s.duplicate_groups }}</div></div>
-                      <div class="col-6"><div class="text-muted">可停用舊版</div><div class="fs-5 fw-bold">{{ s.duplicate_old_active_count }}</div></div>
+                      <div class="col-6"><div class="text-muted">可刪除舊版</div><div class="fs-5 fw-bold">{{ s.duplicate_old_active_count }}</div></div>
                     </div>
                     <div class="mt-3 small">
                       <div class="text-muted">最新物件更新</div>
@@ -27091,7 +27146,7 @@ _PROPERTY_LIBRARY_STATUS_CARD = """
 
           <div class="d-flex gap-2 mt-3 flex-wrap">
             <button class="btn btn-outline-secondary" type="submit" name="_property_maintenance_action" value="refresh_property_status">重新整理統計</button>
-            <button class="btn btn-warning" type="submit" name="_property_maintenance_action" value="archive_duplicate_properties" onclick="return confirm('確定要停用重複舊版物件？系統會只保留每組最新版本 active=True，舊版會改成 active=False，不會硬刪。')">停用重複舊版，只保留最新</button>
+            <button class="btn btn-warning" type="submit" name="_property_maintenance_action" value="archive_duplicate_properties" onclick="return confirm('確定要刪除重複舊版物件？系統會只保留每組最新版本，其餘舊版 Firestore 文件會直接刪除，這個動作不可復原。')">刪除重複舊版，只保留最新</button>
           </div>
           <div class="hint mt-2">
             重複判斷優先順序：物件編號＋分店代碼 → 物件網址 → 案名＋地址＋價格。保留版本依 updated_at / imported_at / created_at 最新者。
@@ -27192,7 +27247,7 @@ def line_card_settings_center_with_property_library_status():
                 flash(
                     "物件庫重複清理完成："
                     f"處理 {result.get('processed_groups', 0)} 組，"
-                    f"停用舊版 {result.get('archived_docs', 0)} 筆。",
+                    f"刪除舊版 {result.get('deleted_docs', 0)} 筆。",
                     "success",
                 )
 
