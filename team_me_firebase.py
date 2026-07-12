@@ -23860,6 +23860,11 @@ def process_line_property_csv_file_event(event):
     try:
         content = _line_download_message_content(msg.get("id", ""))
         result = _property_csv_import_bytes(content, filename, line_event=event)
+        auto_cleanup_result = _property_import_auto_cleanup_keep_latest(
+            deal_type=result.get("deal_type", ""),
+            import_result=result,
+            source_label="csv_import",
+        )
         label = "出租" if result.get("deal_type") == "rent" else "出售"
         text = (
             f"已更新{label}物件庫\n"
@@ -24082,6 +24087,11 @@ def _aiwu_csv_run_and_push(event, deal_types):
             csv_bytes = exported["csv_bytes"]
             filename = exported["filename"]
             import_result = _property_csv_import_bytes(csv_bytes, filename, line_event=event)
+            auto_cleanup_result = _property_import_auto_cleanup_keep_latest(
+                deal_type=import_result.get("deal_type", ""),
+                import_result=import_result,
+                source_label="csv_import",
+            )
             preview = _aiwu_csv_preview_from_bytes(csv_bytes, filename, deal_type, limit=6)
             ok_any = True
             lines.extend([
@@ -26803,6 +26813,153 @@ def get_property_library_status():
     }
 
 
+
+# TeamME Auto Keep Latest CSV Import Patch v20260712
+def _property_import_auto_cleanup_keep_latest(
+    *,
+    deal_type: str,
+    import_result: dict | None = None,
+    source_label: str = "",
+) -> dict:
+    """
+    CSV 匯入完成後自動執行：
+
+        更新出售 CSV → 只清 sale 舊 CSV 文件
+        更新出租 CSV → 只清 rent 舊 CSV 文件
+
+    清理規則：
+    - 使用 cleanup_duplicate_properties_keep_latest(deal_type)
+    - 該函式目前為 delete_duplicates_keep_latest 版本
+    - 舊版重複/舊批次資料會 batch.delete()
+    - 保留最新版本 active=True
+    """
+    result = {
+        "enabled": True,
+        "deal_type": deal_type,
+        "source_label": source_label,
+        "ok": False,
+        "deleted_docs": 0,
+        "processed_groups": 0,
+        "kept_docs": 0,
+        "errors": [],
+        "raw": {},
+    }
+
+    normalized_deal_type = (
+        "rent"
+        if deal_type == "rent"
+        else "sale"
+    )
+
+    try:
+        cleanup_result = (
+            cleanup_duplicate_properties_keep_latest(
+                normalized_deal_type
+            )
+        )
+
+        if not isinstance(cleanup_result, dict):
+            cleanup_result = {
+                "raw_result": cleanup_result
+            }
+
+        result["raw"] = cleanup_result
+        result["deleted_docs"] = int(
+            cleanup_result.get("deleted_docs")
+            or cleanup_result.get("archived_docs")
+            or 0
+        )
+        result["processed_groups"] = int(
+            cleanup_result.get("processed_groups")
+            or 0
+        )
+        result["kept_docs"] = int(
+            cleanup_result.get("kept_docs")
+            or 0
+        )
+        result["errors"] = list(
+            cleanup_result.get("errors")
+            or []
+        )
+        result["ok"] = not bool(
+            result["errors"]
+        )
+
+    except Exception as exc:
+        result["errors"].append(
+            str(exc)
+        )
+
+    try:
+        if "clear_ai_property_memory_cache" in globals():
+            clear_ai_property_memory_cache("")
+    except Exception as exc:
+        result["errors"].append(
+            f"清除 AI 物件快取失敗：{exc}"
+        )
+
+    try:
+        db.collection(
+            PROPERTY_MAINTENANCE_LOG_COLLECTION
+            if "PROPERTY_MAINTENANCE_LOG_COLLECTION" in globals()
+            else "property_maintenance_logs"
+        ).add(
+            {
+                "action": "auto_keep_latest_after_csv_import",
+                "deal_type": normalized_deal_type,
+                "source_label": source_label,
+                "import_result": import_result or {},
+                "cleanup_result": result,
+                "created_at": now_taipei().isoformat(),
+                "created_by_id": (
+                    session.get("user_id")
+                    if "session" in globals()
+                    else ""
+                ),
+                "created_by_name": (
+                    session.get("user_name")
+                    if "session" in globals()
+                    else ""
+                ),
+            }
+        )
+
+    except Exception as exc:
+        result["errors"].append(
+            f"寫入自動清理紀錄失敗：{exc}"
+        )
+
+    return result
+
+
+def _property_import_format_auto_cleanup_message(
+    *,
+    cleanup_result: dict,
+) -> str:
+    if not cleanup_result:
+        return ""
+
+    deal_label = (
+        "出租"
+        if cleanup_result.get("deal_type") == "rent"
+        else "出售"
+    )
+
+    if cleanup_result.get("errors"):
+        return (
+            f"\n自動清理{deal_label}舊資料："
+            f"已嘗試執行，但有警告："
+            + "；".join(
+                cleanup_result.get("errors", [])[:2]
+            )
+        )
+
+    return (
+        f"\n自動清理{deal_label}舊資料："
+        f"已刪除舊版 {cleanup_result.get('deleted_docs', 0)} 筆，"
+        f"保留最新 {cleanup_result.get('kept_docs', 0)} 組。"
+    )
+
 def cleanup_duplicate_properties_keep_latest(
     deal_type: str = "",
 ) -> dict:
@@ -28548,5 +28705,884 @@ except Exception as exc:
 
 # =============================================================================
 # Firebase 物件庫：最新 CSV 快照模式 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# CRM 追蹤紀錄顯示優化 Patch v20260712
+# - 買方 / 賣方 detail 頁面新增「整理版內部備註」與「日期分組追蹤紀錄」
+# - 保留完整備註內容，不截斷
+# - 按日期分組，內容使用 white-space: pre-wrap 顯示
+# - 不改 Firestore 資料，只改善後台 HTML 顯示
+# =============================================================================
+
+def _crm_display_safe(value):
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
+def _crm_parse_dt_value(value):
+    text = _crm_display_safe(value)
+
+    if not text:
+        return None
+
+    candidates = [
+        text,
+        text.replace("Z", "+00:00"),
+        text.replace("/", "-"),
+    ]
+
+    for candidate in candidates:
+        try:
+            if "T" in candidate:
+                dt = datetime.fromisoformat(candidate)
+
+            elif len(candidate) >= 16:
+                dt = datetime.strptime(
+                    candidate[:16],
+                    "%Y-%m-%d %H:%M",
+                )
+
+            elif len(candidate) >= 10:
+                dt = datetime.strptime(
+                    candidate[:10],
+                    "%Y-%m-%d",
+                )
+
+            else:
+                continue
+
+            return dt
+
+        except Exception:
+            continue
+
+    return None
+
+
+def _crm_display_date_time(value):
+    text = _crm_display_safe(value)
+    dt = _crm_parse_dt_value(text)
+
+    if dt:
+        return (
+            dt.strftime("%Y-%m-%d"),
+            dt.strftime("%H:%M"),
+            dt.strftime("%Y-%m-%d %H:%M"),
+        )
+
+    if len(text) >= 10:
+        return (
+            text[:10],
+            text[11:16] if len(text) >= 16 else "",
+            text,
+        )
+
+    return (
+        "未填日期",
+        "",
+        text or "-",
+    )
+
+
+def _crm_group_items_by_date(items):
+    grouped = []
+
+    current_date = None
+    current_items = []
+
+    for item in items:
+        date_text = item.get("date") or "未填日期"
+
+        if date_text != current_date:
+            if current_items:
+                grouped.append(
+                    {
+                        "date": current_date,
+                        "items": current_items,
+                    }
+                )
+
+            current_date = date_text
+            current_items = []
+
+        current_items.append(item)
+
+    if current_items:
+        grouped.append(
+            {
+                "date": current_date,
+                "items": current_items,
+            }
+        )
+
+    return grouped
+
+
+def _crm_parse_note_blocks(note_text):
+    """
+    解析 append_note_block 格式：
+
+        [2026-07-10 10:35][LINE/某人] 內容
+        [2026-07-10 10:36][LINE/某人] 內容
+
+    即使 HTML 原本擠成同一行，這裡也能依 timestamp 重新切回卡片。
+    """
+    note_text = _crm_display_safe(note_text)
+
+    if not note_text:
+        return []
+
+    pattern = re.compile(
+        r"\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\]"
+        r"\[([^\]]*)\]\s*",
+        re.M,
+    )
+
+    matches = list(
+        pattern.finditer(note_text)
+    )
+
+    if not matches:
+        date_text, time_text, full_time = (
+            _crm_display_date_time("")
+        )
+
+        return [
+            {
+                "date": date_text,
+                "time": time_text,
+                "full_time": full_time,
+                "source": "內部備註",
+                "content": note_text,
+            }
+        ]
+
+    items = []
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(note_text)
+        )
+
+        raw_content = (
+            note_text[start:end]
+            .strip()
+        )
+
+        date_text, time_text, full_time = (
+            _crm_display_date_time(
+                match.group(1)
+            )
+        )
+
+        items.append(
+            {
+                "date": date_text,
+                "time": time_text,
+                "full_time": full_time,
+                "source": (
+                    match.group(2).strip()
+                    or "LINE"
+                ),
+                "content": raw_content,
+            }
+        )
+
+    return items
+
+
+def _crm_prepare_followup_timeline(
+    target_type,
+    customer_id,
+    followups,
+):
+    prepared = []
+
+    for item in followups:
+        item_id = _crm_display_safe(
+            item.get("id")
+        )
+
+        when = (
+            item.get("contact_time")
+            or item.get("created_at")
+            or item.get("updated_at")
+            or ""
+        )
+
+        date_text, time_text, full_time = (
+            _crm_display_date_time(
+                when
+            )
+        )
+
+        channel = (
+            _crm_display_safe(
+                item.get("channel")
+            )
+            or "LINE"
+        )
+
+        content = _crm_display_safe(
+            item.get("content")
+        )
+
+        next_action = _crm_display_safe(
+            item.get("next_action")
+        )
+
+        next_contact_date = _crm_display_safe(
+            item.get("next_contact_date")
+        )
+
+        created_by = _crm_display_safe(
+            item.get("created_by_name")
+        )
+
+        sender = _crm_display_safe(
+            item.get("sender_display_name")
+        )
+
+        labels = item.get("labels") or []
+        if not isinstance(labels, list):
+            labels = [str(labels)]
+
+        if target_type == "buyer":
+            edit_url = url_for(
+                "buyer_followup_edit",
+                buyer_id=customer_id,
+                followup_id=item_id,
+            )
+
+            delete_url = url_for(
+                "buyer_followup_delete",
+                buyer_id=customer_id,
+                followup_id=item_id,
+            )
+
+        else:
+            edit_url = url_for(
+                "seller_followup_edit",
+                seller_id=customer_id,
+                followup_id=item_id,
+            )
+
+            delete_url = url_for(
+                "seller_followup_delete",
+                seller_id=customer_id,
+                followup_id=item_id,
+            )
+
+        prepared.append(
+            {
+                "id": item_id,
+                "date": date_text,
+                "time": time_text,
+                "full_time": full_time,
+                "channel": channel,
+                "content": content,
+                "next_action": next_action,
+                "next_contact_date": next_contact_date,
+                "created_by": created_by,
+                "sender": sender,
+                "labels": labels,
+                "edit_url": edit_url,
+                "delete_url": delete_url,
+            }
+        )
+
+    prepared.sort(
+        key=lambda item: (
+            item.get("full_time") or "",
+            item.get("id") or "",
+        ),
+        reverse=True,
+    )
+
+    return prepared
+
+
+def _crm_timeline_payload(
+    *,
+    target_type,
+    customer_id,
+    record,
+    followups,
+):
+    note_items = _crm_parse_note_blocks(
+        record.get("note")
+        or ""
+    )
+
+    note_items.sort(
+        key=lambda item: (
+            item.get("full_time") or "",
+            item.get("content") or "",
+        ),
+        reverse=True,
+    )
+
+    followup_items = (
+        _crm_prepare_followup_timeline(
+            target_type,
+            customer_id,
+            followups,
+        )
+    )
+
+    return {
+        "target_type": target_type,
+        "customer_id": customer_id,
+        "note_groups": _crm_group_items_by_date(
+            note_items
+        ),
+        "followup_groups": _crm_group_items_by_date(
+            followup_items
+        ),
+        "note_total": len(note_items),
+        "followup_total": len(followup_items),
+    }
+
+
+def _crm_timeline_enhancer_html(payload):
+    payload_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+    )
+
+    return f"""
+<style>
+.teamme-crm-timeline-v3 {{
+  margin: 18px 0 24px 0;
+}}
+.teamme-crm-timeline-v3 .tm-section {{
+  border: 1px solid #dee2e6;
+  border-radius: 14px;
+  background: #fff;
+  padding: 16px;
+  margin-bottom: 18px;
+}}
+.teamme-crm-timeline-v3 .tm-section-title {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}}
+.teamme-crm-timeline-v3 .tm-section-title h3,
+.teamme-crm-timeline-v3 .tm-section-title h4 {{
+  margin: 0;
+  font-size: 1.08rem;
+}}
+.teamme-crm-timeline-v3 .tm-total-badge {{
+  display: inline-block;
+  background: #eef2f7;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: #475569;
+  white-space: nowrap;
+}}
+.teamme-crm-timeline-v3 .tm-date-group {{
+  margin-top: 14px;
+}}
+.teamme-crm-timeline-v3 .tm-date-header {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #0f766e;
+  color: #fff;
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 13px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}}
+.teamme-crm-timeline-v3 .tm-entry {{
+  border-left: 4px solid #0f766e;
+  background: #f8fafc;
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 8px 0 12px 0;
+}}
+.teamme-crm-timeline-v3 .tm-entry-head {{
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}}
+.teamme-crm-timeline-v3 .tm-meta {{
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: #334155;
+  font-size: 13px;
+}}
+.teamme-crm-timeline-v3 .tm-time {{
+  font-weight: 800;
+  color: #0f172a;
+}}
+.teamme-crm-timeline-v3 .tm-chip {{
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  background: #e2e8f0;
+  color: #334155;
+}}
+.teamme-crm-timeline-v3 .tm-chip.line {{
+  background: #64748b;
+  color: #fff;
+}}
+.teamme-crm-timeline-v3 .tm-chip.next {{
+  background: #fff7ed;
+  color: #9a3412;
+  border: 1px solid #fed7aa;
+}}
+.teamme-crm-timeline-v3 .tm-content {{
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.75;
+  font-size: 14px;
+  color: #111827;
+}}
+.teamme-crm-timeline-v3 .tm-actions {{
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}}
+.teamme-crm-timeline-v3 .tm-btn {{
+  display: inline-block;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 4px 9px;
+  font-size: 13px;
+  text-decoration: none;
+  background: #fff;
+  color: #334155;
+}}
+.teamme-crm-timeline-v3 .tm-btn.primary {{
+  border-color: #2563eb;
+  color: #2563eb;
+}}
+.teamme-crm-timeline-v3 .tm-btn.danger {{
+  border-color: #dc2626;
+  color: #dc2626;
+}}
+.teamme-crm-timeline-v3 .tm-empty {{
+  color: #64748b;
+  background: #f8fafc;
+  border-radius: 10px;
+  padding: 12px;
+}}
+.teamme-crm-timeline-v3 details.tm-raw-note {{
+  margin-top: 12px;
+}}
+.teamme-crm-timeline-v3 details.tm-raw-note summary {{
+  cursor: pointer;
+  color: #2563eb;
+  font-size: 13px;
+}}
+.teamme-crm-timeline-v3 .tm-hidden-old-note {{
+  display: none !important;
+}}
+</style>
+
+<script>
+(function() {{
+  const payload = {payload_json};
+
+  function esc(value) {{
+    return String(value == null ? "" : value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }}
+
+  function renderNoteGroups(groups, total) {{
+    if (!groups || !groups.length) {{
+      return `
+        <section class="tm-section">
+          <div class="tm-section-title">
+            <h3>整理版內部備註</h3>
+            <span class="tm-total-badge">0 筆</span>
+          </div>
+          <div class="tm-empty">目前沒有內部備註</div>
+        </section>
+      `;
+    }}
+
+    const dateBlocks = groups.map(group => {{
+      const entries = (group.items || []).map(item => `
+        <article class="tm-entry">
+          <div class="tm-entry-head">
+            <div class="tm-meta">
+              <span class="tm-time">${{esc(item.time || item.full_time || "")}}</span>
+              <span class="tm-chip line">${{esc(item.source || "LINE")}}</span>
+            </div>
+          </div>
+          <div class="tm-content">${{esc(item.content || "-")}}</div>
+        </article>
+      `).join("");
+
+      return `
+        <div class="tm-date-group">
+          <div class="tm-date-header">📅 ${{esc(group.date || "未填日期")}}</div>
+          ${{entries}}
+        </div>
+      `;
+    }}).join("");
+
+    return `
+      <section class="tm-section">
+        <div class="tm-section-title">
+          <h3>整理版內部備註</h3>
+          <span class="tm-total-badge">${{Number(total || 0)}} 筆</span>
+        </div>
+        ${{dateBlocks}}
+      </section>
+    `;
+  }}
+
+  function renderFollowupGroups(groups, total) {{
+    if (!groups || !groups.length) {{
+      return `
+        <section class="tm-section">
+          <div class="tm-section-title">
+            <h3>日期分組追蹤紀錄</h3>
+            <span class="tm-total-badge">0 筆</span>
+          </div>
+          <div class="tm-empty">目前沒有追蹤紀錄</div>
+        </section>
+      `;
+    }}
+
+    const dateBlocks = groups.map(group => {{
+      const entries = (group.items || []).map(item => {{
+        const labels = (item.labels || []).filter(Boolean).map(label =>
+          `<span class="tm-chip">${{esc(label)}}</span>`
+        ).join("");
+
+        const nextAction = item.next_action
+          ? `<span class="tm-chip next">下一步：${{esc(item.next_action)}}</span>`
+          : "";
+
+        const nextDate = item.next_contact_date
+          ? `<span class="tm-chip next">下次：${{esc(item.next_contact_date)}}</span>`
+          : "";
+
+        const sender = item.sender
+          ? `<span class="tm-chip">留言者：${{esc(item.sender)}}</span>`
+          : "";
+
+        const createdBy = item.created_by
+          ? `<span class="tm-chip">建立者：${{esc(item.created_by)}}</span>`
+          : "";
+
+        return `
+          <article class="tm-entry">
+            <div class="tm-entry-head">
+              <div class="tm-meta">
+                <span class="tm-time">${{esc(item.time || item.full_time || "")}}</span>
+                <span class="tm-chip line">${{esc(item.channel || "LINE")}}</span>
+                ${{sender}}
+                ${{createdBy}}
+                ${{labels}}
+                ${{nextAction}}
+                ${{nextDate}}
+              </div>
+              <div class="tm-actions">
+                <a class="tm-btn" href="${{esc(item.edit_url)}}">編輯</a>
+                <form method="post" action="${{esc(item.delete_url)}}" style="display:inline" onsubmit="return confirm('確定刪除這筆追蹤紀錄？')">
+                  <button class="tm-btn danger" type="submit">刪除</button>
+                </form>
+              </div>
+            </div>
+            <div class="tm-content">${{esc(item.content || "-")}}</div>
+          </article>
+        `;
+      }}).join("");
+
+      return `
+        <div class="tm-date-group">
+          <div class="tm-date-header">📅 ${{esc(group.date || "未填日期")}}</div>
+          ${{entries}}
+        </div>
+      `;
+    }}).join("");
+
+    return `
+      <section class="tm-section">
+        <div class="tm-section-title">
+          <h3>日期分組追蹤紀錄</h3>
+          <span class="tm-total-badge">${{Number(total || 0)}} 筆</span>
+        </div>
+        ${{dateBlocks}}
+      </section>
+    `;
+  }}
+
+  function hideOldSqueezedNote() {{
+    const candidates = Array.from(
+      document.querySelectorAll("p, .mb-1, .mb-2, .mb-3, div")
+    );
+
+    for (const el of candidates) {{
+      if (!el || el.closest(".teamme-crm-timeline-v3")) {{
+        continue;
+      }}
+
+      const text = (el.textContent || "").trim();
+
+      if (
+        text.includes("內部備註")
+        && text.includes("[20")
+        && text.length > 180
+        && el.querySelectorAll("input, textarea, select, button, a").length === 0
+      ) {{
+        el.classList.add("tm-hidden-old-note");
+      }}
+    }}
+  }}
+
+  function hideOldFollowupListIfPossible() {{
+    const headings = Array.from(
+      document.querySelectorAll("h1, h2, h3, h4, h5")
+    );
+
+    const oldHeading = headings.find(
+      el => (el.textContent || "").includes("追蹤紀錄列表")
+    );
+
+    if (!oldHeading) {{
+      return;
+    }}
+
+    let node = oldHeading.nextElementSibling;
+    let hiddenCount = 0;
+
+    while (node && hiddenCount < 80) {{
+      if (node.id === "teamme-crm-timeline-v3") {{
+        break;
+      }}
+
+      const tag = (node.tagName || "").toLowerCase();
+      const text = (node.textContent || "").trim();
+
+      if (
+        ["h1", "h2", "h3", "h4", "h5"].includes(tag)
+        && !text.includes("追蹤紀錄")
+      ) {{
+        break;
+      }}
+
+      const next = node.nextElementSibling;
+
+      if (
+        text.includes("內容：")
+        || text.includes("建立者：")
+        || text.includes("LINE")
+      ) {{
+        node.style.display = "none";
+        hiddenCount += 1;
+      }}
+
+      node = next;
+    }}
+
+    oldHeading.style.display = "none";
+  }}
+
+  function mount() {{
+    if (document.getElementById("teamme-crm-timeline-v3")) {{
+      return;
+    }}
+
+    const container = document.createElement("div");
+    container.id = "teamme-crm-timeline-v3";
+    container.className = "teamme-crm-timeline-v3";
+
+    container.innerHTML =
+      renderNoteGroups(payload.note_groups, payload.note_total)
+      + renderFollowupGroups(payload.followup_groups, payload.followup_total);
+
+    const headings = Array.from(
+      document.querySelectorAll("h1, h2, h3, h4, h5")
+    );
+
+    const followHeading = headings.find(
+      el => (el.textContent || "").includes("追蹤紀錄列表")
+    );
+
+    if (followHeading && followHeading.parentNode) {{
+      followHeading.parentNode.insertBefore(container, followHeading);
+    }} else {{
+      const main = document.querySelector("main, .container, .container-fluid, body");
+      main.appendChild(container);
+    }}
+
+    hideOldSqueezedNote();
+    hideOldFollowupListIfPossible();
+  }}
+
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", mount);
+  }} else {{
+    mount();
+  }}
+}})();
+</script>
+"""
+
+
+def _crm_inject_before_body(html, injection):
+    html_text = str(html)
+
+    lower = html_text.lower()
+    index = lower.rfind("</body>")
+
+    if index >= 0:
+        return (
+            html_text[:index]
+            + injection
+            + html_text[index:]
+        )
+
+    return html_text + injection
+
+
+def _buyer_detail_grouped_timeline(buyer_id):
+    doc = db.collection("buyers").document(buyer_id).get()
+
+    if not doc.exists:
+        flash("找不到這位買方", "danger")
+        return redirect(url_for("buyers"))
+
+    buyer = doc_to_dict(doc)
+
+    followups_ref = (
+        db.collection("buyer_followups")
+        .where("buyer_id", "==", buyer_id)
+    )
+
+    followups = [
+        doc_to_dict(f)
+        for f in followups_ref.stream()
+    ]
+
+    followups.sort(
+        key=lambda x: (
+            x.get("contact_time")
+            or x.get("created_at")
+            or ""
+        ),
+        reverse=True,
+    )
+
+    html = render_template(
+        "buyer_detail.html",
+        buyer=buyer,
+        followups=followups,
+    )
+
+    payload = _crm_timeline_payload(
+        target_type="buyer",
+        customer_id=buyer_id,
+        record=buyer,
+        followups=followups,
+    )
+
+    return _crm_inject_before_body(
+        html,
+        _crm_timeline_enhancer_html(
+            payload
+        ),
+    )
+
+
+def _seller_detail_grouped_timeline(seller_id):
+    doc = db.collection("sellers").document(seller_id).get()
+
+    if not doc.exists:
+        flash("找不到這位賣方", "danger")
+        return redirect(url_for("sellers"))
+
+    seller = doc_to_dict(doc)
+
+    followups_ref = (
+        db.collection("seller_followups")
+        .where("seller_id", "==", seller_id)
+    )
+
+    followups = [
+        doc_to_dict(f)
+        for f in followups_ref.stream()
+    ]
+
+    followups.sort(
+        key=lambda x: (
+            x.get("contact_time")
+            or x.get("created_at")
+            or ""
+        ),
+        reverse=True,
+    )
+
+    html = render_template(
+        "seller_detail.html",
+        seller=seller,
+        followups=followups,
+    )
+
+    payload = _crm_timeline_payload(
+        target_type="seller",
+        customer_id=seller_id,
+        record=seller,
+        followups=followups,
+    )
+
+    return _crm_inject_before_body(
+        html,
+        _crm_timeline_enhancer_html(
+            payload
+        ),
+    )
+
+
+try:
+    app.view_functions["buyer_detail"] = login_required(
+        _buyer_detail_grouped_timeline
+    )
+
+    app.view_functions["seller_detail"] = login_required(
+        _seller_detail_grouped_timeline
+    )
+
+    print(
+        "✅ 買方/賣方詳細頁已加入日期分組追蹤紀錄顯示"
+    )
+
+except Exception as exc:
+    print(
+        "⚠️ CRM 日期分組追蹤紀錄套用失敗：",
+        exc,
+    )
+
+# =============================================================================
+# CRM 追蹤紀錄顯示優化 Patch End
 # =============================================================================
 
