@@ -27392,3 +27392,1161 @@ except Exception as exc:
 # Firebase 物件庫狀態 / 重複清理 Patch End
 # =============================================================================
 
+
+# =============================================================================
+# Firebase 物件庫：最新 CSV 快照模式 Patch v20260712
+# - 設定頁預設不再每次全量掃描 properties，改讀快取 / 最新匯入紀錄
+# - 清理改成「只保留最新 CSV 匯入批次」，其餘同 deal_type 舊文件直接刪除
+# - 出售最新 CSV 匯入 991 筆 → 清理後就只保留該批次約 991 筆
+# - 出租最新 CSV 匯入 221 筆 → 清理後就只保留該批次約 221 筆
+# =============================================================================
+
+PROPERTY_MAINTENANCE_STATUS_COLLECTION = os.environ.get(
+    "PROPERTY_MAINTENANCE_STATUS_COLLECTION",
+    "property_maintenance_status",
+)
+
+PROPERTY_MAINTENANCE_STATUS_DOC_ID = os.environ.get(
+    "PROPERTY_MAINTENANCE_STATUS_DOC_ID",
+    "property_library_status",
+)
+
+PROPERTY_LATEST_CSV_MATCH_TOLERANCE_SEC = int(
+    os.environ.get(
+        "PROPERTY_LATEST_CSV_MATCH_TOLERANCE_SEC",
+        "600",
+    )
+    or 600
+)
+
+PROPERTY_LATEST_CSV_MIN_MATCH_RATIO = float(
+    os.environ.get(
+        "PROPERTY_LATEST_CSV_MIN_MATCH_RATIO",
+        "0.80",
+    )
+    or 0.80
+)
+
+
+def _property_maintenance_status_ref():
+    return (
+        db.collection(
+            PROPERTY_MAINTENANCE_STATUS_COLLECTION
+        )
+        .document(
+            PROPERTY_MAINTENANCE_STATUS_DOC_ID
+        )
+    )
+
+
+def _property_maintenance_load_cached_status():
+    try:
+        snap = (
+            _property_maintenance_status_ref()
+            .get()
+        )
+
+        if snap.exists:
+            data = snap.to_dict() or {}
+
+            if data:
+                data.setdefault(
+                    "from_cache",
+                    True,
+                )
+
+                return data
+
+    except Exception:
+        pass
+
+    return None
+
+
+def _property_maintenance_save_status_cache(
+    status: dict,
+):
+    try:
+        payload = dict(
+            status or {}
+        )
+
+        payload["cached_at"] = (
+            now_taipei().isoformat()
+        )
+
+        _property_maintenance_status_ref().set(
+            payload,
+            merge=True,
+        )
+
+    except Exception as exc:
+        print(
+            "⚠️ 寫入 property library status cache 失敗：",
+            exc,
+        )
+
+
+def _property_maintenance_fast_deal_status_from_latest_csv(
+    deal_type: str,
+) -> dict:
+    deal_type = (
+        "rent"
+        if deal_type == "rent"
+        else "sale"
+    )
+
+    latest_import_log = (
+        _property_maintenance_latest_import_log(
+            deal_type
+        )
+    )
+
+    expected = int(
+        latest_import_log.get(
+            "imported_count"
+        )
+        or 0
+    )
+
+    return {
+        "deal_type": deal_type,
+        "label": (
+            "出租"
+            if deal_type == "rent"
+            else "出售"
+        ),
+        # 設定頁預設顯示「最新 CSV 應保留筆數」，
+        # 不再每次進頁面就全量掃 Firestore。
+        "total_count": expected,
+        "active_count": expected,
+        "inactive_count": 0,
+        "duplicate_groups": 0,
+        "duplicate_old_active_count": 0,
+        "latest_doc": {},
+        "latest_updated_at": (
+            latest_import_log.get(
+                "created_at"
+            )
+            or ""
+        ),
+        "latest_import_log": (
+            latest_import_log
+        ),
+        "truncated": False,
+        "error": "",
+        "fast_mode": True,
+        "note": (
+            "快速模式：目前顯示最新 CSV 匯入筆數；"
+            "按「重新整理統計」才會全量掃描 Firestore。"
+        ),
+    }
+
+
+def _property_maintenance_latest_log_timestamp(
+    latest_import_log: dict,
+) -> float:
+    return max(
+        _property_maintenance_datetime_key(
+            latest_import_log.get(
+                "created_at"
+            )
+        ),
+        _property_maintenance_datetime_key(
+            latest_import_log.get(
+                "imported_at"
+            )
+        ),
+        _property_maintenance_datetime_key(
+            latest_import_log.get(
+                "uploaded_at"
+            )
+        ),
+    )
+
+
+def _property_maintenance_doc_import_timestamp(
+    data: dict,
+) -> float:
+    return max(
+        _property_maintenance_datetime_key(
+            data.get(
+                "imported_at"
+            )
+        ),
+        _property_maintenance_datetime_key(
+            data.get(
+                "created_at"
+            )
+        ),
+    )
+
+
+def _property_maintenance_is_latest_csv_doc(
+    data: dict,
+    *,
+    latest_import_log: dict,
+) -> bool:
+    latest_file = (
+        _property_maintenance_safe_text(
+            latest_import_log.get(
+                "file_name"
+            )
+        )
+    )
+
+    latest_ts = (
+        _property_maintenance_latest_log_timestamp(
+            latest_import_log
+        )
+    )
+
+    if (
+        not latest_file
+        or latest_ts <= 0
+    ):
+        return False
+
+    source_file = (
+        _property_maintenance_safe_text(
+            data.get(
+                "source_file"
+            )
+        )
+    )
+
+    if source_file != latest_file:
+        return False
+
+    imported_ts = (
+        _property_maintenance_doc_import_timestamp(
+            data
+        )
+    )
+
+    if imported_ts <= 0:
+        return False
+
+    return (
+        imported_ts
+        >= (
+            latest_ts
+            - PROPERTY_LATEST_CSV_MATCH_TOLERANCE_SEC
+        )
+    )
+
+
+def _property_maintenance_scan_deal_type_latest_csv_snapshot(
+    deal_type: str,
+) -> dict:
+    deal_type = (
+        "rent"
+        if deal_type == "rent"
+        else "sale"
+    )
+
+    latest_import_log = (
+        _property_maintenance_latest_import_log(
+            deal_type
+        )
+    )
+
+    total_count = 0
+    latest_csv_count = 0
+    old_csv_count = 0
+    latest_doc = {}
+    latest_key = 0.0
+    truncated = False
+
+    try:
+        for doc in (
+            db.collection(
+                PROPERTY_LIBRARY_COLLECTION
+            )
+            .where(
+                "deal_type",
+                "==",
+                deal_type,
+            )
+            .limit(
+                PROPERTY_MAINTENANCE_MAX_DOCS
+            )
+            .stream()
+        ):
+            total_count += 1
+
+            data = doc.to_dict() or {}
+
+            if _property_maintenance_is_latest_csv_doc(
+                data,
+                latest_import_log=latest_import_log,
+            ):
+                latest_csv_count += 1
+
+                latest_text = (
+                    _property_maintenance_latest_time(
+                        data
+                    )
+                )
+
+                latest_time_key = (
+                    _property_maintenance_datetime_key(
+                        latest_text
+                    )
+                )
+
+                if latest_time_key >= latest_key:
+                    latest_key = latest_time_key
+                    latest_doc = (
+                        _property_maintenance_doc_brief(
+                            doc.id,
+                            data,
+                        )
+                    )
+
+            else:
+                old_csv_count += 1
+
+        if total_count >= PROPERTY_MAINTENANCE_MAX_DOCS:
+            truncated = True
+
+    except Exception as exc:
+        return {
+            "deal_type": deal_type,
+            "label": (
+                "出租"
+                if deal_type == "rent"
+                else "出售"
+            ),
+            "error": str(exc),
+            "total_count": 0,
+            "active_count": 0,
+            "inactive_count": 0,
+            "duplicate_groups": 0,
+            "duplicate_old_active_count": 0,
+            "latest_doc": {},
+            "latest_updated_at": "",
+            "latest_import_log": latest_import_log,
+            "truncated": False,
+            "fast_mode": False,
+        }
+
+    return {
+        "deal_type": deal_type,
+        "label": (
+            "出租"
+            if deal_type == "rent"
+            else "出售"
+        ),
+        "total_count": total_count,
+        "active_count": latest_csv_count,
+        "inactive_count": 0,
+        "duplicate_groups": (
+            1
+            if old_csv_count
+            else 0
+        ),
+        "duplicate_old_active_count": old_csv_count,
+        "latest_doc": latest_doc,
+        "latest_updated_at": (
+            latest_doc.get(
+                "updated_at"
+            )
+            or latest_import_log.get(
+                "created_at"
+            )
+            or ""
+        ),
+        "latest_import_log": latest_import_log,
+        "truncated": truncated,
+        "error": "",
+        "fast_mode": False,
+        "note": (
+            "完整掃描：目前保留筆數為最新 CSV 批次文件數；"
+            "可刪除舊版為不屬於最新 CSV 的文件數。"
+        ),
+    }
+
+
+def refresh_property_library_status_cache() -> dict:
+    generated_at = (
+        now_taipei().isoformat()
+    )
+
+    sale = (
+        _property_maintenance_scan_deal_type_latest_csv_snapshot(
+            "sale"
+        )
+    )
+
+    rent = (
+        _property_maintenance_scan_deal_type_latest_csv_snapshot(
+            "rent"
+        )
+    )
+
+    status = {
+        "generated_at": generated_at,
+        "sale": sale,
+        "rent": rent,
+        "total_active": (
+            int(
+                sale.get(
+                    "active_count"
+                )
+                or 0
+            )
+            + int(
+                rent.get(
+                    "active_count"
+                )
+                or 0
+            )
+        ),
+        "total_duplicates": (
+            int(
+                sale.get(
+                    "duplicate_old_active_count"
+                )
+                or 0
+            )
+            + int(
+                rent.get(
+                    "duplicate_old_active_count"
+                )
+                or 0
+            )
+        ),
+        "from_cache": False,
+        "scan_mode": (
+            "latest_csv_snapshot"
+        ),
+    }
+
+    _property_maintenance_save_status_cache(
+        status
+    )
+
+    return status
+
+
+def get_property_library_status():
+    """
+    設定中心預設不全量掃描 Firestore。
+
+    優先順序：
+    1. 讀取上次重新整理 / 清理後寫入的快取
+    2. 若沒有快取，直接用最新 property_import_logs 顯示最新 CSV 筆數
+
+    只有按「重新整理統計」或「刪除舊版」時才會掃 properties。
+    """
+    cached = (
+        _property_maintenance_load_cached_status()
+    )
+
+    if cached:
+        return cached
+
+    generated_at = (
+        now_taipei().isoformat()
+    )
+
+    sale = (
+        _property_maintenance_fast_deal_status_from_latest_csv(
+            "sale"
+        )
+    )
+
+    rent = (
+        _property_maintenance_fast_deal_status_from_latest_csv(
+            "rent"
+        )
+    )
+
+    return {
+        "generated_at": generated_at,
+        "sale": sale,
+        "rent": rent,
+        "total_active": (
+            int(
+                sale.get(
+                    "active_count"
+                )
+                or 0
+            )
+            + int(
+                rent.get(
+                    "active_count"
+                )
+                or 0
+            )
+        ),
+        "total_duplicates": 0,
+        "from_cache": False,
+        "scan_mode": (
+            "fast_latest_import_log"
+        ),
+    }
+
+
+def cleanup_duplicate_properties_keep_latest(
+    deal_type: str = "",
+) -> dict:
+    """
+    最新 CSV 快照模式：
+
+    對每個 deal_type：
+    - 找最新 property_import_logs
+    - 保留 source_file 等於最新 CSV，且 imported_at 屬於該批次的文件
+    - 其餘同 deal_type properties 文件直接 batch.delete()
+
+    這不是單純刪重複，而是「只保留最新 CSV 清單」。
+    """
+    target_deal_types = (
+        [
+            "sale",
+            "rent",
+        ]
+        if not deal_type
+        else [
+            (
+                "rent"
+                if deal_type == "rent"
+                else "sale"
+            )
+        ]
+    )
+
+    now_iso = (
+        now_taipei().isoformat()
+    )
+
+    result = {
+        "action": (
+            "delete_old_csv_docs_keep_latest_csv_snapshot"
+        ),
+        "processed_types": 0,
+        "deleted_docs": 0,
+        "kept_docs": 0,
+        "by_type": {},
+        "deleted_doc_ids": [],
+        "kept_doc_ids_sample": [],
+        "errors": [],
+        "ran_at": now_iso,
+        "safety": {
+            "min_match_ratio": (
+                PROPERTY_LATEST_CSV_MIN_MATCH_RATIO
+            ),
+            "match_tolerance_sec": (
+                PROPERTY_LATEST_CSV_MATCH_TOLERANCE_SEC
+            ),
+        },
+    }
+
+    batch = db.batch()
+    batch_count = 0
+
+    def commit_if_needed(
+        *,
+        force=False,
+    ):
+        nonlocal batch
+        nonlocal batch_count
+
+        if batch_count and (
+            force
+            or batch_count >= 400
+        ):
+            batch.commit()
+            batch = db.batch()
+            batch_count = 0
+
+    try:
+        for deal in target_deal_types:
+            latest_log = (
+                _property_maintenance_latest_import_log(
+                    deal
+                )
+            )
+
+            expected = int(
+                latest_log.get(
+                    "imported_count"
+                )
+                or 0
+            )
+
+            latest_file = (
+                _property_maintenance_safe_text(
+                    latest_log.get(
+                        "file_name"
+                    )
+                )
+            )
+
+            latest_ts = (
+                _property_maintenance_latest_log_timestamp(
+                    latest_log
+                )
+            )
+
+            if (
+                not latest_file
+                or latest_ts <= 0
+            ):
+                result["errors"].append(
+                    f"{deal} 找不到最新 CSV 匯入紀錄，已略過。"
+                )
+
+                continue
+
+            keep_docs = []
+            delete_docs = []
+
+            for doc in (
+                db.collection(
+                    PROPERTY_LIBRARY_COLLECTION
+                )
+                .where(
+                    "deal_type",
+                    "==",
+                    deal,
+                )
+                .limit(
+                    PROPERTY_MAINTENANCE_MAX_DOCS
+                )
+                .stream()
+            ):
+                data = doc.to_dict() or {}
+
+                if _property_maintenance_is_latest_csv_doc(
+                    data,
+                    latest_import_log=latest_log,
+                ):
+                    keep_docs.append(
+                        doc.id
+                    )
+
+                else:
+                    delete_docs.append(
+                        doc.id
+                    )
+
+            matched = len(
+                keep_docs
+            )
+
+            if expected > 0:
+                ratio = (
+                    matched / expected
+                    if expected
+                    else 0
+                )
+
+                if (
+                    matched == 0
+                    or ratio
+                    < PROPERTY_LATEST_CSV_MIN_MATCH_RATIO
+                ):
+                    result[
+                        "errors"
+                    ].append(
+                        f"{deal} 安全中止："
+                        f"最新 CSV 預期 {expected} 筆，"
+                        f"但只比對到 {matched} 筆 "
+                        f"({ratio:.0%})。"
+                        "為避免誤刪，未刪除此類型。"
+                    )
+
+                    result["by_type"][
+                        deal
+                    ] = {
+                        "expected_latest_csv_count": expected,
+                        "matched_latest_csv_docs": matched,
+                        "deleted": 0,
+                        "kept": matched,
+                        "latest_file": latest_file,
+                        "skipped_by_safety": True,
+                    }
+
+                    continue
+
+            for doc_id in keep_docs:
+                try:
+                    ref = (
+                        db.collection(
+                            PROPERTY_LIBRARY_COLLECTION
+                        )
+                        .document(
+                            doc_id
+                        )
+                    )
+
+                    batch.set(
+                        ref,
+                        {
+                            "active": True,
+                        },
+                        merge=True,
+                    )
+
+                    batch_count += 1
+
+                    if (
+                        len(
+                            result[
+                                "kept_doc_ids_sample"
+                            ]
+                        )
+                        < 30
+                    ):
+                        result[
+                            "kept_doc_ids_sample"
+                        ].append(
+                            {
+                                "deal_type": deal,
+                                "doc_id": doc_id,
+                            }
+                        )
+
+                    commit_if_needed()
+
+                except Exception as exc:
+                    result[
+                        "errors"
+                    ].append(
+                        f"{deal} 標記保留文件失敗 {doc_id}：{exc}"
+                    )
+
+            deleted = 0
+
+            for doc_id in delete_docs:
+                ref = (
+                    db.collection(
+                        PROPERTY_LIBRARY_COLLECTION
+                    )
+                    .document(
+                        doc_id
+                    )
+                )
+
+                batch.delete(
+                    ref
+                )
+
+                batch_count += 1
+                deleted += 1
+
+                result[
+                    "deleted_doc_ids"
+                ].append(
+                    {
+                        "deal_type": deal,
+                        "doc_id": doc_id,
+                        "reason": (
+                            "not_in_latest_csv_snapshot"
+                        ),
+                        "latest_file": latest_file,
+                    }
+                )
+
+                commit_if_needed()
+
+            commit_if_needed(
+                force=True
+            )
+
+            result["processed_types"] += 1
+            result["kept_docs"] += matched
+            result["deleted_docs"] += deleted
+
+            result["by_type"][
+                deal
+            ] = {
+                "expected_latest_csv_count": expected,
+                "matched_latest_csv_docs": matched,
+                "deleted": deleted,
+                "kept": matched,
+                "latest_file": latest_file,
+                "latest_import_time": (
+                    latest_log.get(
+                        "created_at"
+                    )
+                    or ""
+                ),
+                "skipped_by_safety": False,
+            }
+
+        try:
+            if "clear_ai_property_memory_cache" in globals():
+                clear_ai_property_memory_cache("")
+        except Exception as exc:
+            result["errors"].append(
+                f"清除 AI 物件快取失敗：{exc}"
+            )
+
+        try:
+            db.collection(
+                PROPERTY_MAINTENANCE_LOG_COLLECTION
+            ).add(
+                {
+                    "action": (
+                        "delete_old_csv_docs_keep_latest_csv_snapshot"
+                    ),
+                    "result": result,
+                    "created_at": now_iso,
+                    "created_by_id": (
+                        session.get(
+                            "user_id"
+                        )
+                        if "session" in globals()
+                        else ""
+                    ),
+                    "created_by_name": (
+                        session.get(
+                            "user_name"
+                        )
+                        if "session" in globals()
+                        else ""
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            result["errors"].append(
+                f"寫入刪除紀錄失敗：{exc}"
+            )
+
+        try:
+            # 刪除後重新掃描一次並寫入快取，
+            # 下次打開設定頁直接讀快取，不會再慢。
+            refreshed = (
+                refresh_property_library_status_cache()
+            )
+
+            result[
+                "status_after_cleanup"
+            ] = {
+                "sale_active": (
+                    refreshed.get(
+                        "sale",
+                        {}
+                    ).get(
+                        "active_count"
+                    )
+                ),
+                "rent_active": (
+                    refreshed.get(
+                        "rent",
+                        {}
+                    ).get(
+                        "active_count"
+                    )
+                ),
+                "sale_old": (
+                    refreshed.get(
+                        "sale",
+                        {}
+                    ).get(
+                        "duplicate_old_active_count"
+                    )
+                ),
+                "rent_old": (
+                    refreshed.get(
+                        "rent",
+                        {}
+                    ).get(
+                        "duplicate_old_active_count"
+                    )
+                ),
+            }
+
+        except Exception as exc:
+            result["errors"].append(
+                f"刪除後重新整理統計失敗：{exc}"
+            )
+
+    except Exception as exc:
+        result["errors"].append(
+            str(exc)
+        )
+
+    return result
+
+
+# 更新設定中心區塊文案。
+try:
+    LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX = (
+        LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX
+        .replace(
+            "統計 Firestore <span class=\"code\">properties</span> 出售 / 出租 active 資料，並偵測重複物件。清理時會直接刪除重複舊版，只保留最新版本文件。",
+            "顯示最新 CSV 匯入批次的應保留筆數。設定頁預設讀快取，不再每次全量掃描 Firestore；按重新整理或刪除時才會掃描。"
+        )
+        .replace(
+            "Active 筆數",
+            "最新CSV筆數"
+        )
+        .replace(
+            "總文件數",
+            "目前文件數"
+        )
+        .replace(
+            "重複組數",
+            "舊CSV組數"
+        )
+        .replace(
+            "可刪除舊版",
+            "可刪除舊CSV"
+        )
+        .replace(
+            "重複判斷優先順序：物件編號＋分店代碼 → 物件網址 → 案名＋地址＋價格。保留版本依 updated_at / imported_at / created_at 最新者。",
+            "最新 CSV 快照模式：只保留最新 property_import_logs 對應的 CSV 批次文件，其餘同類型舊 CSV 文件會刪除。設定頁開啟預設讀快取；重新整理統計才會全量掃描。"
+        )
+        .replace(
+            "刪除重複舊版，只保留最新",
+            "刪除舊CSV資料，只保留最新CSV"
+        )
+        .replace(
+            "確定要刪除重複舊版物件？系統會只保留每組最新版本，其餘舊版 Firestore 文件會直接刪除，這個動作不可復原。",
+            "確定要刪除舊 CSV 留下的物件？系統會只保留最新 CSV 匯入批次的文件，其餘同類型舊文件會直接刪除，這個動作不可復原。"
+        )
+    )
+
+except Exception as exc:
+    print(
+        "⚠️ 更新物件庫狀態文案失敗：",
+        exc,
+    )
+
+
+def line_card_settings_center_with_property_library_status_v3():
+    if request.method == "POST" and request.form.get("admin_login") == "1":
+        if _settings_admin_password_ok(
+            request.form.get(
+                "admin_password",
+                "",
+            )
+        ):
+            session[
+                LINE_SETTINGS_ADMIN_SESSION_KEY
+            ] = True
+
+            flash(
+                "已進入設定中心",
+                "success",
+            )
+
+            return redirect(
+                url_for(
+                    "line_card_settings"
+                )
+            )
+
+        flash(
+            "管理員密碼錯誤",
+            "danger",
+        )
+
+        return render_template_string(
+            LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE
+        )
+
+    if not session.get(
+        LINE_SETTINGS_ADMIN_SESSION_KEY
+    ):
+        return render_template_string(
+            LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE
+        )
+
+    if request.method == "POST":
+        action = request.form.get(
+            "_property_maintenance_action",
+            "",
+        )
+
+        if action == "refresh_property_status":
+            status = (
+                refresh_property_library_status_cache()
+            )
+
+            flash(
+                "已完成完整掃描並更新快取："
+                f"出售最新CSV {status.get('sale', {}).get('active_count', 0)} 筆，"
+                f"出租最新CSV {status.get('rent', {}).get('active_count', 0)} 筆。",
+                "info",
+            )
+
+            return redirect(
+                url_for(
+                    "line_card_settings"
+                )
+            )
+
+        if action == "archive_duplicate_properties":
+            result = (
+                cleanup_duplicate_properties_keep_latest()
+            )
+
+            if result.get("errors"):
+                flash(
+                    "最新 CSV 清理完成，但有警告："
+                    + "；".join(
+                        result.get(
+                            "errors"
+                        )
+                        [:3]
+                    ),
+                    "warning",
+                )
+
+            else:
+                flash(
+                    "最新 CSV 清理完成："
+                    f"保留 {result.get('kept_docs', 0)} 筆，"
+                    f"刪除舊 CSV {result.get('deleted_docs', 0)} 筆。",
+                    "success",
+                )
+
+            return redirect(
+                url_for(
+                    "line_card_settings"
+                )
+            )
+
+        try:
+            save_line_settings_center_from_form(
+                request.form
+            )
+
+            flash(
+                "設定已更新",
+                "success",
+            )
+
+        except Exception as exc:
+            flash(
+                f"設定儲存失敗：{exc}",
+                "danger",
+            )
+
+        return redirect(
+            url_for(
+                "line_card_settings"
+            )
+        )
+
+    settings = get_line_card_settings()
+
+    group_rows = list(
+        get_line_group_settings()
+    )
+
+    while len(group_rows) < 8:
+        group_rows.append(
+            {
+                "enabled": False,
+                "name": "",
+                "target_id": "",
+                "receive_types": [],
+                "command_types": [],
+                "view_types": [
+                    "buyer",
+                    "seller",
+                    "development",
+                    "calendar",
+                    "todo",
+                ],
+                "visibility_scope": (
+                    "public_only"
+                ),
+                "note": "",
+            }
+        )
+
+    personal_user_rows = list(
+        get_line_personal_users(
+            include_disabled=True
+        )
+    )
+
+    while len(personal_user_rows) < max(
+        10,
+        LINE_PERSONAL_USER_COUNT_DEFAULT
+        if "LINE_PERSONAL_USER_COUNT_DEFAULT" in globals()
+        else 8,
+    ):
+        personal_user_rows.append(
+            {
+                "enabled": False,
+                "name": "",
+                "user_id": "",
+                "receive_types": [
+                    "calendar"
+                ],
+                "command_types": [
+                    "calendar",
+                    "todo",
+                    "followup",
+                ],
+                "view_types": [
+                    "buyer",
+                    "seller",
+                    "development",
+                    "calendar",
+                    "todo",
+                ],
+                "visibility_scope": (
+                    "public_and_own"
+                ),
+                "note": "",
+            }
+        )
+
+    property_status = (
+        get_property_library_status()
+    )
+
+    return render_template_string(
+        LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX,
+        settings=settings,
+        group_rows=group_rows,
+        personal_user_rows=personal_user_rows,
+        receive_options=LINE_RECEIVE_TYPE_OPTIONS,
+        command_options=LINE_COMMAND_TYPE_OPTIONS,
+        view_options=LINE_VIEW_TYPE_OPTIONS,
+        visibility_scope_options=LINE_VISIBILITY_SCOPE_OPTIONS,
+        quick_actions_text="\n".join(
+            settings.get(
+                "quick_actions"
+            )
+            or []
+        ),
+        calendar_categories_text="\n".join(
+            get_calendar_category_options()
+        ),
+        property_status=property_status,
+        PROPERTY_MAINTENANCE_MAX_DOCS=(
+            PROPERTY_MAINTENANCE_MAX_DOCS
+        ),
+    )
+
+
+try:
+    app.view_functions["line_card_settings"] = login_required(
+        line_card_settings_center_with_property_library_status_v3
+    )
+
+    print(
+        "✅ 設定中心已改為最新 CSV 快照模式，預設讀快取不全量掃描"
+    )
+
+except Exception as exc:
+    print(
+        "⚠️ 最新 CSV 快照模式套用失敗：",
+        exc,
+    )
+
+# =============================================================================
+# Firebase 物件庫：最新 CSV 快照模式 Patch End
+# =============================================================================
+
