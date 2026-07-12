@@ -29586,3 +29586,1605 @@ except Exception as exc:
 # CRM 追蹤紀錄顯示優化 Patch End
 # =============================================================================
 
+
+# =============================================================================
+# CRM 備註 / 追蹤紀錄簡化顯示 Patch v20260712-v4
+# - 只改善顯示，不修改 Firestore 原始資料
+# - 相同內容自動合併，避免 LINE 重複寫入造成畫面大量重複
+# - 內部備註改成簡潔區塊，不再每分鐘攤成一堆卡片
+# - 舊版擠成一整串的內部備註加強隱藏
+# =============================================================================
+
+def _crm_v4_safe(value):
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
+def _crm_v4_parse_dt(value):
+    text = _crm_v4_safe(value)
+
+    if not text:
+        return None
+
+    candidates = [
+        text,
+        text.replace("Z", "+00:00"),
+        text.replace("/", "-"),
+    ]
+
+    for candidate in candidates:
+        try:
+            if "T" in candidate:
+                return datetime.fromisoformat(candidate)
+
+            if len(candidate) >= 16:
+                return datetime.strptime(
+                    candidate[:16],
+                    "%Y-%m-%d %H:%M",
+                )
+
+            if len(candidate) >= 10:
+                return datetime.strptime(
+                    candidate[:10],
+                    "%Y-%m-%d",
+                )
+
+        except Exception:
+            continue
+
+    return None
+
+
+def _crm_v4_display_time(value):
+    text = _crm_v4_safe(value)
+    dt = _crm_v4_parse_dt(text)
+
+    if dt:
+        return (
+            dt.strftime("%Y-%m-%d"),
+            dt.strftime("%H:%M"),
+            dt.strftime("%Y-%m-%d %H:%M"),
+        )
+
+    if len(text) >= 10:
+        return (
+            text[:10],
+            text[11:16] if len(text) >= 16 else "",
+            text,
+        )
+
+    return (
+        "未填日期",
+        "",
+        text or "-",
+    )
+
+
+def _crm_v4_normalize_content(value):
+    text = _crm_v4_safe(value)
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    text = re.sub(
+        r"^[^：:]{1,30}[：:]\s*",
+        "",
+        text,
+    ).strip()
+
+    return text
+
+
+def _crm_v4_parse_note_blocks(note_text):
+    note_text = _crm_v4_safe(note_text)
+
+    if not note_text:
+        return []
+
+    pattern = re.compile(
+        r"\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\]"
+        r"\[([^\]]*)\]\s*",
+        re.M,
+    )
+
+    matches = list(pattern.finditer(note_text))
+
+    if not matches:
+        date_text, time_text, full_time = _crm_v4_display_time("")
+
+        return [
+            {
+                "date": date_text,
+                "time": time_text,
+                "full_time": full_time,
+                "source": "內部備註",
+                "content": note_text,
+                "kind": "note",
+            }
+        ]
+
+    items = []
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(note_text)
+        )
+
+        content = note_text[start:end].strip()
+
+        if not content:
+            continue
+
+        date_text, time_text, full_time = _crm_v4_display_time(
+            match.group(1)
+        )
+
+        items.append(
+            {
+                "date": date_text,
+                "time": time_text,
+                "full_time": full_time,
+                "source": match.group(2).strip() or "LINE",
+                "content": content,
+                "kind": "note",
+            }
+        )
+
+    return items
+
+
+def _crm_v4_dedupe_items(items):
+    by_key = {}
+
+    for item in items:
+        content = _crm_v4_safe(item.get("content"))
+
+        if not content:
+            continue
+
+        dedupe_key = _crm_v4_normalize_content(content)
+
+        if not dedupe_key:
+            continue
+
+        current = by_key.get(dedupe_key)
+
+        if current is None:
+            new_item = dict(item)
+            new_item["count"] = 1
+            new_item["first_time"] = item.get("full_time") or ""
+            new_item["last_time"] = item.get("full_time") or ""
+            by_key[dedupe_key] = new_item
+            continue
+
+        current["count"] = int(current.get("count") or 1) + 1
+
+        item_time = item.get("full_time") or ""
+        current_time = current.get("full_time") or ""
+
+        if item_time >= current_time:
+            keep_count = current.get("count")
+            first_time = current.get("first_time")
+            last_time = current.get("last_time")
+            current.update(item)
+            current["count"] = keep_count
+            current["first_time"] = first_time
+            current["last_time"] = last_time
+
+        if item_time:
+            current["first_time"] = min(
+                current.get("first_time") or item_time,
+                item_time,
+            )
+            current["last_time"] = max(
+                current.get("last_time") or item_time,
+                item_time,
+            )
+
+    result = list(by_key.values())
+
+    result.sort(
+        key=lambda item: (
+            item.get("full_time") or "",
+            item.get("content") or "",
+        ),
+        reverse=True,
+    )
+
+    return result
+
+
+def _crm_v4_group_by_date(items):
+    grouped = []
+    current_date = None
+    current_items = []
+
+    for item in items:
+        date_text = item.get("date") or "未填日期"
+
+        if date_text != current_date:
+            if current_items:
+                grouped.append(
+                    {
+                        "date": current_date,
+                        "items": current_items,
+                    }
+                )
+
+            current_date = date_text
+            current_items = []
+
+        current_items.append(item)
+
+    if current_items:
+        grouped.append(
+            {
+                "date": current_date,
+                "items": current_items,
+            }
+        )
+
+    return grouped
+
+
+def _crm_v4_followup_items(target_type, customer_id, followups):
+    items = []
+
+    for item in followups:
+        item_id = _crm_v4_safe(item.get("id"))
+
+        when = (
+            item.get("contact_time")
+            or item.get("created_at")
+            or item.get("updated_at")
+            or ""
+        )
+
+        date_text, time_text, full_time = _crm_v4_display_time(when)
+
+        if target_type == "buyer":
+            edit_url = url_for(
+                "buyer_followup_edit",
+                buyer_id=customer_id,
+                followup_id=item_id,
+            )
+
+            delete_url = url_for(
+                "buyer_followup_delete",
+                buyer_id=customer_id,
+                followup_id=item_id,
+            )
+        else:
+            edit_url = url_for(
+                "seller_followup_edit",
+                seller_id=customer_id,
+                followup_id=item_id,
+            )
+
+            delete_url = url_for(
+                "seller_followup_delete",
+                seller_id=customer_id,
+                followup_id=item_id,
+            )
+
+        items.append(
+            {
+                "id": item_id,
+                "date": date_text,
+                "time": time_text,
+                "full_time": full_time,
+                "source": _crm_v4_safe(item.get("channel")) or "LINE",
+                "content": _crm_v4_safe(item.get("content")),
+                "created_by": _crm_v4_safe(item.get("created_by_name")),
+                "sender": _crm_v4_safe(item.get("sender_display_name")),
+                "next_action": _crm_v4_safe(item.get("next_action")),
+                "next_contact_date": _crm_v4_safe(item.get("next_contact_date")),
+                "edit_url": edit_url,
+                "delete_url": delete_url,
+                "kind": "followup",
+            }
+        )
+
+    items = [item for item in items if item.get("content")]
+
+    return _crm_v4_dedupe_items(items)
+
+
+def _crm_v4_payload(*, target_type, customer_id, record, followups):
+    note_raw_items = _crm_v4_parse_note_blocks(record.get("note") or "")
+    note_items = _crm_v4_dedupe_items(note_raw_items)
+    followup_items = _crm_v4_followup_items(target_type, customer_id, followups)
+
+    return {
+        "target_type": target_type,
+        "customer_id": customer_id,
+        "note_groups": _crm_v4_group_by_date(note_items),
+        "followup_groups": _crm_v4_group_by_date(followup_items),
+        "note_total": len(note_items),
+        "note_raw_total": len(note_raw_items),
+        "followup_total": len(followup_items),
+        "followup_raw_total": len(followups),
+    }
+
+
+def _crm_v4_html(payload):
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
+    return f"""
+<style>
+.teamme-crm-v4 {{
+  margin: 18px 0 24px 0;
+}}
+.teamme-crm-v4 .tm-card {{
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  background: #fff;
+  padding: 14px;
+  margin-bottom: 14px;
+}}
+.teamme-crm-v4 .tm-head {{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}}
+.teamme-crm-v4 .tm-head h3 {{
+  margin: 0;
+  font-size: 1.05rem;
+}}
+.teamme-crm-v4 .tm-muted {{
+  color: #64748b;
+  font-size: 12px;
+}}
+.teamme-crm-v4 .tm-date {{
+  margin: 10px 0 8px 0;
+  font-weight: 700;
+  color: #0f766e;
+  font-size: 14px;
+}}
+.teamme-crm-v4 .tm-item {{
+  border-left: 3px solid #0f766e;
+  background: #f8fafc;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 8px 0;
+}}
+.teamme-crm-v4 .tm-meta {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: #475569;
+}}
+.teamme-crm-v4 .tm-time {{
+  color: #0f172a;
+  font-weight: 800;
+}}
+.teamme-crm-v4 .tm-chip {{
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  color: #334155;
+  font-size: 12px;
+}}
+.teamme-crm-v4 .tm-chip.warn {{
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  color: #9a3412;
+}}
+.teamme-crm-v4 .tm-content {{
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.7;
+  font-size: 14px;
+  color: #111827;
+}}
+.teamme-crm-v4 .tm-actions {{
+  margin-top: 8px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}}
+.teamme-crm-v4 .tm-btn {{
+  display: inline-block;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 12px;
+  text-decoration: none;
+  color: #334155;
+}}
+.teamme-crm-v4 .tm-btn.danger {{
+  border-color: #dc2626;
+  color: #dc2626;
+}}
+.teamme-crm-v4 .tm-empty {{
+  background: #f8fafc;
+  border-radius: 10px;
+  padding: 10px;
+  color: #64748b;
+}}
+.teamme-crm-v4-old-hidden {{
+  display: none !important;
+}}
+</style>
+<script>
+(function() {{
+  const payload = {payload_json};
+
+  function esc(value) {{
+    return String(value == null ? "" : value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }}
+
+  function renderGroups(title, groups, total, rawTotal, kind) {{
+    const mergedText = rawTotal && rawTotal > total
+      ? `｜已合併 ${{rawTotal - total}} 筆重複`
+      : "";
+
+    if (!groups || !groups.length) {{
+      return `
+        <section class="tm-card">
+          <div class="tm-head">
+            <h3>${{esc(title)}}</h3>
+            <span class="tm-muted">0 筆</span>
+          </div>
+          <div class="tm-empty">目前沒有資料</div>
+        </section>
+      `;
+    }}
+
+    const html = groups.map(group => {{
+      const items = (group.items || []).map(item => {{
+        const repeat = Number(item.count || 1) > 1
+          ? `<span class="tm-chip warn">重複 ${{Number(item.count)}} 次已合併</span>`
+          : "";
+
+        const sender = item.sender
+          ? `<span class="tm-chip">留言者：${{esc(item.sender)}}</span>`
+          : "";
+
+        const createdBy = item.created_by
+          ? `<span class="tm-chip">建立者：${{esc(item.created_by)}}</span>`
+          : "";
+
+        const nextAction = item.next_action
+          ? `<span class="tm-chip">下一步：${{esc(item.next_action)}}</span>`
+          : "";
+
+        const nextDate = item.next_contact_date
+          ? `<span class="tm-chip">下次：${{esc(item.next_contact_date)}}</span>`
+          : "";
+
+        const actions = kind === "followup"
+          ? `
+            <div class="tm-actions">
+              <a class="tm-btn" href="${{esc(item.edit_url)}}">編輯</a>
+              <form method="post" action="${{esc(item.delete_url)}}" style="display:inline" onsubmit="return confirm('確定刪除這筆追蹤紀錄？')">
+                <button class="tm-btn danger" type="submit">刪除</button>
+              </form>
+            </div>
+          `
+          : "";
+
+        return `
+          <article class="tm-item">
+            <div class="tm-meta">
+              <span class="tm-time">${{esc(item.time || "")}}</span>
+              <span class="tm-chip">${{esc(item.source || "LINE")}}</span>
+              ${{sender}}
+              ${{createdBy}}
+              ${{nextAction}}
+              ${{nextDate}}
+              ${{repeat}}
+            </div>
+            <div class="tm-content">${{esc(item.content || "-")}}</div>
+            ${{actions}}
+          </article>
+        `;
+      }}).join("");
+
+      return `
+        <div>
+          <div class="tm-date">📅 ${{esc(group.date || "未填日期")}}</div>
+          ${{items}}
+        </div>
+      `;
+    }}).join("");
+
+    return `
+      <section class="tm-card">
+        <div class="tm-head">
+          <h3>${{esc(title)}}</h3>
+          <span class="tm-muted">${{Number(total || 0)}} 筆${{mergedText}}</span>
+        </div>
+        ${{html}}
+      </section>
+    `;
+  }}
+
+  function deepestMatchingElements(predicate) {{
+    const all = Array.from(document.querySelectorAll("body *"));
+    return all.filter(el => {{
+      if (!predicate(el)) return false;
+      return !Array.from(el.children || []).some(child => predicate(child));
+    }});
+  }}
+
+  function hideOldLongNote() {{
+    const matches = deepestMatchingElements(el => {{
+      if (!el || el.closest(".teamme-crm-v4")) return false;
+      const text = (el.innerText || el.textContent || "").trim();
+      return text.length > 100
+        && text.includes("[20")
+        && text.includes("LINE/");
+    }});
+
+    for (const el of matches) {{
+      el.classList.add("teamme-crm-v4-old-hidden");
+    }}
+
+    const possibleLabels = deepestMatchingElements(el => {{
+      if (!el || el.closest(".teamme-crm-v4")) return false;
+      const text = (el.innerText || el.textContent || "").trim();
+      return text === "內部備註：" || text === "內部備註";
+    }});
+
+    for (const label of possibleLabels) {{
+      let parent = label.parentElement;
+      for (let i = 0; i < 3 && parent; i++) {{
+        const t = (parent.innerText || parent.textContent || "").trim();
+        if (t.includes("內部備註") && t.length < 80) {{
+          parent.classList.add("teamme-crm-v4-old-hidden");
+          break;
+        }}
+        parent = parent.parentElement;
+      }}
+    }}
+  }}
+
+  function hideOldFollowupList() {{
+    const headings = Array.from(
+      document.querySelectorAll("h1, h2, h3, h4, h5")
+    );
+
+    const heading = headings.find(el =>
+      (el.textContent || "").includes("追蹤紀錄列表")
+    );
+
+    if (!heading) return;
+
+    let node = heading.nextElementSibling;
+    let guard = 0;
+
+    while (node && guard < 120) {{
+      if (node.id === "teamme-crm-v4") break;
+
+      const tag = (node.tagName || "").toLowerCase();
+      const text = (node.innerText || node.textContent || "").trim();
+
+      if (
+        ["h1", "h2", "h3", "h4", "h5"].includes(tag)
+        && !text.includes("追蹤紀錄")
+      ) {{
+        break;
+      }}
+
+      const next = node.nextElementSibling;
+
+      if (
+        text.includes("內容：")
+        || text.includes("建立者：")
+        || text.includes("LINE")
+        || text.includes("編輯")
+      ) {{
+        node.classList.add("teamme-crm-v4-old-hidden");
+      }}
+
+      node = next;
+      guard += 1;
+    }}
+
+    heading.classList.add("teamme-crm-v4-old-hidden");
+  }}
+
+  function mount() {{
+    if (document.getElementById("teamme-crm-v4")) return;
+
+    const container = document.createElement("div");
+    container.id = "teamme-crm-v4";
+    container.className = "teamme-crm-v4";
+    container.innerHTML =
+      renderGroups(
+        "內部備註",
+        payload.note_groups,
+        payload.note_total,
+        payload.note_raw_total,
+        "note"
+      )
+      + renderGroups(
+        "追蹤紀錄",
+        payload.followup_groups,
+        payload.followup_total,
+        payload.followup_raw_total,
+        "followup"
+      );
+
+    const headings = Array.from(
+      document.querySelectorAll("h1, h2, h3, h4, h5")
+    );
+
+    const followHeading = headings.find(el =>
+      (el.textContent || "").includes("追蹤紀錄列表")
+    );
+
+    if (followHeading && followHeading.parentNode) {{
+      followHeading.parentNode.insertBefore(container, followHeading);
+    }} else {{
+      const main = document.querySelector("main, .container, .container-fluid, body");
+      main.appendChild(container);
+    }}
+
+    hideOldLongNote();
+    hideOldFollowupList();
+  }}
+
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", mount);
+  }} else {{
+    mount();
+  }}
+}})();
+</script>
+"""
+
+
+def _crm_v4_inject(html, injection):
+    html_text = str(html)
+    index = html_text.lower().rfind("</body>")
+
+    if index >= 0:
+        return html_text[:index] + injection + html_text[index:]
+
+    return html_text + injection
+
+
+def _buyer_detail_simplified_timeline_v4(buyer_id):
+    doc = db.collection("buyers").document(buyer_id).get()
+
+    if not doc.exists:
+        flash("找不到這位買方", "danger")
+        return redirect(url_for("buyers"))
+
+    buyer = doc_to_dict(doc)
+
+    followups = [
+        doc_to_dict(f)
+        for f in (
+            db.collection("buyer_followups")
+            .where("buyer_id", "==", buyer_id)
+            .stream()
+        )
+    ]
+
+    followups.sort(
+        key=lambda x: (
+            x.get("contact_time")
+            or x.get("created_at")
+            or ""
+        ),
+        reverse=True,
+    )
+
+    html = render_template(
+        "buyer_detail.html",
+        buyer=buyer,
+        followups=followups,
+    )
+
+    payload = _crm_v4_payload(
+        target_type="buyer",
+        customer_id=buyer_id,
+        record=buyer,
+        followups=followups,
+    )
+
+    return _crm_v4_inject(html, _crm_v4_html(payload))
+
+
+def _seller_detail_simplified_timeline_v4(seller_id):
+    doc = db.collection("sellers").document(seller_id).get()
+
+    if not doc.exists:
+        flash("找不到這位賣方", "danger")
+        return redirect(url_for("sellers"))
+
+    seller = doc_to_dict(doc)
+
+    followups = [
+        doc_to_dict(f)
+        for f in (
+            db.collection("seller_followups")
+            .where("seller_id", "==", seller_id)
+            .stream()
+        )
+    ]
+
+    followups.sort(
+        key=lambda x: (
+            x.get("contact_time")
+            or x.get("created_at")
+            or ""
+        ),
+        reverse=True,
+    )
+
+    html = render_template(
+        "seller_detail.html",
+        seller=seller,
+        followups=followups,
+    )
+
+    payload = _crm_v4_payload(
+        target_type="seller",
+        customer_id=seller_id,
+        record=seller,
+        followups=followups,
+    )
+
+    return _crm_v4_inject(html, _crm_v4_html(payload))
+
+
+try:
+    app.view_functions["buyer_detail"] = login_required(
+        _buyer_detail_simplified_timeline_v4
+    )
+
+    app.view_functions["seller_detail"] = login_required(
+        _seller_detail_simplified_timeline_v4
+    )
+
+    print("✅ CRM 備註 / 追蹤紀錄已改為簡化合併顯示 v4")
+
+except Exception as exc:
+    print("⚠️ CRM v4 簡化合併顯示套用失敗：", exc)
+
+# =============================================================================
+# CRM 備註 / 追蹤紀錄簡化顯示 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# LINE 客戶備註 / 追蹤防重複寫入 Patch v20260712-v5
+# - 防 LINE webhook 重送造成同一事件重複寫入
+# - 防同一客戶短時間相同內容重複 append note
+# - 防同一客戶短時間相同內容重複新增 followup
+# - 只阻擋新增重複紀錄；欄位更新 / 標籤 / 進度仍可正常更新
+# =============================================================================
+
+LINE_PROCESSED_EVENTS_COLLECTION = os.environ.get(
+    "LINE_PROCESSED_EVENTS_COLLECTION",
+    "line_processed_events",
+)
+
+LINE_CUSTOMER_NOTE_DEDUPE_MINUTES = int(
+    os.environ.get(
+        "LINE_CUSTOMER_NOTE_DEDUPE_MINUTES",
+        "10",
+    )
+    or 10
+)
+
+
+def _line_v5_safe(value):
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
+def _line_v5_event_key_safe(value):
+    raw = _line_v5_safe(value)
+
+    if not raw:
+        return ""
+
+    return re.sub(
+        r"[^A-Za-z0-9_.:-]+",
+        "_",
+        raw,
+    )[:450]
+
+
+def _line_v5_content_hash(value):
+    normalized = _line_v5_normalize_content(
+        value
+    )
+
+    return hashlib.sha256(
+        normalized.encode("utf-8")
+    ).hexdigest()
+
+
+def _line_v5_normalize_content(value):
+    text = _line_v5_safe(value)
+
+    # 統一換行 / 空白，避免同內容因格式不同被當成不同。
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+
+    # 常見格式：
+    # 黃曜昀 Ellen：新增客需
+    # 陳子玲｜太平洋房屋：新增客需
+    # 比對時移除開頭姓名，避免同內容因發話者前綴不同而失效。
+    compare_text = re.sub(
+        r"^[^：:\n]{1,40}[：:]\s*",
+        "",
+        text,
+    ).strip()
+
+    compare_text = re.sub(
+        r"\s+",
+        " ",
+        compare_text,
+    ).strip()
+
+    return compare_text
+
+
+def _line_v5_parse_dt(value):
+    text = _line_v5_safe(value)
+
+    if not text:
+        return None
+
+    candidates = [
+        text,
+        text.replace("Z", "+00:00"),
+        text.replace("/", "-"),
+    ]
+
+    for candidate in candidates:
+        try:
+            if "T" in candidate:
+                return datetime.fromisoformat(candidate)
+
+            if len(candidate) >= 16:
+                return datetime.strptime(
+                    candidate[:16],
+                    "%Y-%m-%d %H:%M",
+                )
+
+            if len(candidate) >= 10:
+                return datetime.strptime(
+                    candidate[:10],
+                    "%Y-%m-%d",
+                )
+
+        except Exception:
+            continue
+
+    return None
+
+
+def _line_v5_minutes_between_now(value):
+    dt = _line_v5_parse_dt(value)
+
+    if not dt:
+        return None
+
+    now = now_taipei()
+
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=TAIPEI_TZ
+            )
+
+        delta = now - dt.astimezone(
+            TAIPEI_TZ
+        )
+
+    except Exception:
+        try:
+            delta = now.replace(
+                tzinfo=None
+            ) - dt.replace(
+                tzinfo=None
+            )
+
+        except Exception:
+            return None
+
+    return abs(
+        delta.total_seconds()
+    ) / 60.0
+
+
+def _line_v5_collection_for_target(
+    target_type: str,
+):
+    if target_type == "buyer":
+        return (
+            "buyer_followups",
+            "buyer_id",
+        )
+
+    if target_type == "seller":
+        return (
+            "seller_followups",
+            "seller_id",
+        )
+
+    if target_type == "development":
+        return (
+            "development_followups",
+            "development_id",
+        )
+
+    return (
+        "",
+        "",
+    )
+
+
+def _line_v5_recent_same_followup_exists(
+    *,
+    target_type: str,
+    customer_id: str,
+    content: str,
+    window_minutes: int | None = None,
+) -> bool:
+    window = int(
+        window_minutes
+        or LINE_CUSTOMER_NOTE_DEDUPE_MINUTES
+    )
+
+    normalized = _line_v5_normalize_content(
+        content
+    )
+
+    if not (
+        target_type
+        and customer_id
+        and normalized
+    ):
+        return False
+
+    collection_name, key_name = (
+        _line_v5_collection_for_target(
+            target_type
+        )
+    )
+
+    if not collection_name:
+        return False
+
+    try:
+        docs = (
+            db.collection(
+                collection_name
+            )
+            .where(
+                key_name,
+                "==",
+                customer_id,
+            )
+            .limit(80)
+            .stream()
+        )
+
+        for doc in docs:
+            data = doc.to_dict() or {}
+
+            existing = (
+                data.get("content")
+                or ""
+            )
+
+            if (
+                _line_v5_normalize_content(
+                    existing
+                )
+                != normalized
+            ):
+                continue
+
+            when = (
+                data.get("contact_time")
+                or data.get("created_at")
+                or data.get("updated_at")
+                or ""
+            )
+
+            minutes = (
+                _line_v5_minutes_between_now(
+                    when
+                )
+            )
+
+            if (
+                minutes is not None
+                and minutes <= window
+            ):
+                return True
+
+    except Exception as exc:
+        print(
+            "⚠️ LINE followup 防重複查詢失敗：",
+            exc,
+        )
+
+    return False
+
+
+def _line_v5_recent_same_note_exists(
+    *,
+    note_text: str,
+    content: str,
+    window_minutes: int | None = None,
+) -> bool:
+    window = int(
+        window_minutes
+        or LINE_CUSTOMER_NOTE_DEDUPE_MINUTES
+    )
+
+    normalized = _line_v5_normalize_content(
+        content
+    )
+
+    if not normalized:
+        return False
+
+    note_text = _line_v5_safe(
+        note_text
+    )
+
+    if not note_text:
+        return False
+
+    pattern = re.compile(
+        r"\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\]"
+        r"\[([^\]]*)\]\s*",
+        re.M,
+    )
+
+    matches = list(
+        pattern.finditer(
+            note_text
+        )
+    )
+
+    if not matches:
+        return (
+            _line_v5_normalize_content(
+                note_text
+            )
+            == normalized
+        )
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(note_text)
+        )
+
+        existing_content = (
+            note_text[start:end]
+            .strip()
+        )
+
+        if (
+            _line_v5_normalize_content(
+                existing_content
+            )
+            != normalized
+        ):
+            continue
+
+        minutes = (
+            _line_v5_minutes_between_now(
+                match.group(1)
+            )
+        )
+
+        if (
+            minutes is not None
+            and minutes <= window
+        ):
+            return True
+
+    return False
+
+
+def _line_v5_event_keys(event) -> list[str]:
+    event = event or {}
+    message = event.get("message") or {}
+    source = event.get("source") or {}
+
+    raw_keys = []
+
+    webhook_event_id = _line_v5_safe(
+        event.get("webhookEventId")
+    )
+
+    if webhook_event_id:
+        raw_keys.append(
+            "webhook:"
+            + webhook_event_id
+        )
+
+    message_id = _line_v5_safe(
+        message.get("id")
+    )
+
+    if message_id:
+        raw_keys.append(
+            "message:"
+            + message_id
+        )
+
+    # 極少數情況沒有 webhookEventId / message.id，
+    # 用來源 + 文字 + 時間戳做低強度 dedupe。
+    if not raw_keys:
+        raw_text = _line_v5_safe(
+            message.get("text")
+        )
+
+        source_key = "|".join(
+            [
+                _line_v5_safe(
+                    source.get("groupId")
+                ),
+                _line_v5_safe(
+                    source.get("roomId")
+                ),
+                _line_v5_safe(
+                    source.get("userId")
+                ),
+                raw_text,
+            ]
+        )
+
+        if source_key.strip("|"):
+            raw_keys.append(
+                "fallback:"
+                + hashlib.sha256(
+                    source_key.encode("utf-8")
+                ).hexdigest()
+            )
+
+    result = []
+
+    for key in raw_keys:
+        safe_key = _line_v5_event_key_safe(
+            key
+        )
+
+        if (
+            safe_key
+            and safe_key not in result
+        ):
+            result.append(
+                safe_key
+            )
+
+    return result
+
+
+def _line_v5_try_reserve_event(event) -> tuple[bool, str]:
+    keys = _line_v5_event_keys(
+        event
+    )
+
+    if not keys:
+        return (
+            True,
+            "",
+        )
+
+    collection = db.collection(
+        LINE_PROCESSED_EVENTS_COLLECTION
+    )
+
+    for key in keys:
+        try:
+            if collection.document(key).get().exists:
+                return (
+                    False,
+                    key,
+                )
+
+        except Exception as exc:
+            print(
+                "⚠️ LINE event 防重複讀取失敗：",
+                key,
+                exc,
+            )
+
+    now_iso = now_taipei().isoformat()
+
+    message = (
+        (event or {}).get("message")
+        or {}
+    )
+
+    source = (
+        (event or {}).get("source")
+        or {}
+    )
+
+    data = {
+        "status": "processing",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "webhook_event_id": (
+            event or {}
+        ).get("webhookEventId", ""),
+        "message_id": message.get("id", ""),
+        "message_type": message.get("type", ""),
+        "text_hash": _line_v5_content_hash(
+            message.get("text", "")
+        )
+        if message.get("text")
+        else "",
+        "line_group_id": source.get("groupId", ""),
+        "line_room_id": source.get("roomId", ""),
+        "line_user_id": source.get("userId", ""),
+        "keys": keys,
+    }
+
+    for key in keys:
+        doc_ref = collection.document(
+            key
+        )
+
+        try:
+            doc_ref.create(
+                data
+            )
+
+        except Exception as exc:
+            # create() 如果遇到已存在，代表其他程序已先處理。
+            try:
+                if doc_ref.get().exists:
+                    return (
+                        False,
+                        key,
+                    )
+
+            except Exception:
+                pass
+
+            print(
+                "⚠️ LINE event 防重複建立紀錄失敗，仍繼續處理：",
+                key,
+                exc,
+            )
+
+    return (
+        True,
+        keys[0],
+    )
+
+
+def _line_v5_mark_event_result(
+    event,
+    *,
+    status: str,
+    result: dict | None = None,
+    skipped_reason: str = "",
+):
+    keys = _line_v5_event_keys(
+        event
+    )
+
+    if not keys:
+        return
+
+    now_iso = now_taipei().isoformat()
+
+    result = result or {}
+
+    update = {
+        "status": status,
+        "updated_at": now_iso,
+        "ok": bool(
+            result.get("ok")
+        )
+        if result
+        else False,
+        "handled": bool(
+            result.get("handled")
+        )
+        if result
+        else False,
+        "target_type": result.get(
+            "target_type",
+            "",
+        )
+        if result
+        else "",
+        "target_id": result.get(
+            "target_id",
+            "",
+        )
+        if result
+        else "",
+        "parsed_tag": result.get(
+            "parsed_tag",
+            "",
+        )
+        if result
+        else "",
+        "skipped_reason": skipped_reason,
+    }
+
+    for key in keys:
+        try:
+            db.collection(
+                LINE_PROCESSED_EVENTS_COLLECTION
+            ).document(key).set(
+                update,
+                merge=True,
+            )
+
+        except Exception as exc:
+            print(
+                "⚠️ LINE event 防重複狀態更新失敗：",
+                key,
+                exc,
+            )
+
+
+try:
+    _ORIGINAL_UPDATE_CUSTOMER_NOTE_AND_LABELS_V5 = (
+        update_customer_note_and_labels
+    )
+
+    def update_customer_note_and_labels(
+        target_type: str,
+        doc_ref,
+        content: str,
+        labels=None,
+        stage="",
+        source="LINE",
+        event=None,
+        registered_address="",
+        extra_updates=None,
+    ):
+        content_to_write = content
+
+        try:
+            snapshot = doc_ref.get()
+            current = snapshot.to_dict() or {}
+            customer_id = getattr(
+                doc_ref,
+                "id",
+                "",
+            )
+
+            duplicate_by_note = (
+                bool(content)
+                and _line_v5_recent_same_note_exists(
+                    note_text=current.get("note", ""),
+                    content=content,
+                )
+            )
+
+            duplicate_by_followup = (
+                bool(content)
+                and _line_v5_recent_same_followup_exists(
+                    target_type=target_type,
+                    customer_id=customer_id,
+                    content=content,
+                )
+            )
+
+            if duplicate_by_note or duplicate_by_followup:
+                content_to_write = ""
+
+                print(
+                    "ℹ️ 已略過重複內部備註 append：",
+                    target_type,
+                    customer_id,
+                    _line_v5_normalize_content(content)[:80],
+                )
+
+        except Exception as exc:
+            print(
+                "⚠️ 內部備註防重複檢查失敗，仍照原流程寫入：",
+                exc,
+            )
+
+        return _ORIGINAL_UPDATE_CUSTOMER_NOTE_AND_LABELS_V5(
+            target_type=target_type,
+            doc_ref=doc_ref,
+            content=content_to_write,
+            labels=labels,
+            stage=stage,
+            source=source,
+            event=event,
+            registered_address=registered_address,
+            extra_updates=extra_updates,
+        )
+
+    print(
+        "✅ LINE 客戶內部備註防重複寫入已啟用"
+    )
+
+except Exception as exc:
+    print(
+        "⚠️ LINE 客戶內部備註防重複 wrapper 套用失敗：",
+        exc,
+    )
+
+
+try:
+    _ORIGINAL_ADD_CUSTOMER_FOLLOWUP_V5 = (
+        add_customer_followup
+    )
+
+    def add_customer_followup(
+        target_type: str,
+        customer_id: str,
+        content: str,
+        next_action="",
+        next_contact_date="",
+        labels=None,
+        line_event=None,
+        stage="",
+        registered_address="",
+        **kwargs,
+    ):
+        try:
+            if _line_v5_recent_same_followup_exists(
+                target_type=target_type,
+                customer_id=customer_id,
+                content=content,
+            ):
+                print(
+                    "ℹ️ 已略過重複追蹤紀錄新增：",
+                    target_type,
+                    customer_id,
+                    _line_v5_normalize_content(content)[:80],
+                )
+
+                return None
+
+        except Exception as exc:
+            print(
+                "⚠️ 追蹤紀錄防重複檢查失敗，仍照原流程新增：",
+                exc,
+            )
+
+        return _ORIGINAL_ADD_CUSTOMER_FOLLOWUP_V5(
+            target_type=target_type,
+            customer_id=customer_id,
+            content=content,
+            next_action=next_action,
+            next_contact_date=next_contact_date,
+            labels=labels,
+            line_event=line_event,
+            stage=stage,
+            registered_address=registered_address,
+            **kwargs,
+        )
+
+    print(
+        "✅ LINE 客戶追蹤紀錄防重複寫入已啟用"
+    )
+
+except Exception as exc:
+    print(
+        "⚠️ LINE 客戶追蹤紀錄防重複 wrapper 套用失敗：",
+        exc,
+    )
+
+
+try:
+    _ORIGINAL_PROCESS_LINE_MESSAGE_EVENT_V5 = (
+        process_line_message_event
+    )
+
+    def process_line_message_event(event):
+        should_process, duplicate_key = (
+            _line_v5_try_reserve_event(
+                event
+            )
+        )
+
+        if not should_process:
+            result = {
+                "handled": True,
+                "ok": True,
+                "reply_text": (
+                    "已略過重複 LINE 訊息，"
+                    "不重複寫入客戶紀錄。"
+                ),
+                "skipped_duplicate": True,
+                "duplicate_key": duplicate_key,
+            }
+
+            _line_v5_mark_event_result(
+                event,
+                status="skipped_duplicate",
+                result=result,
+                skipped_reason="event_already_processed",
+            )
+
+            print(
+                "ℹ️ 已略過重複 LINE event：",
+                duplicate_key,
+            )
+
+            return result
+
+        try:
+            result = (
+                _ORIGINAL_PROCESS_LINE_MESSAGE_EVENT_V5(
+                    event
+                )
+            )
+
+            _line_v5_mark_event_result(
+                event,
+                status=(
+                    "processed"
+                    if result.get("handled")
+                    else "ignored"
+                ),
+                result=result,
+            )
+
+            return result
+
+        except Exception as exc:
+            _line_v5_mark_event_result(
+                event,
+                status="error",
+                result={
+                    "handled": True,
+                    "ok": False,
+                },
+                skipped_reason=str(exc),
+            )
+
+            raise
+
+    print(
+        "✅ LINE webhookEventId / message.id 防重複處理已啟用"
+    )
+
+except Exception as exc:
+    print(
+        "⚠️ LINE event 防重複 wrapper 套用失敗：",
+        exc,
+    )
+
+# =============================================================================
+# LINE 客戶備註 / 追蹤防重複寫入 Patch End
+# =============================================================================
+
