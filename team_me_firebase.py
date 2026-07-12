@@ -24817,7 +24817,7 @@ def _automation_find_active_duplicate(task_type: str, target_worker: str, source
     return None
 
 
-def _automation_create_task(task_type: str, event, target_worker: str = "", command_text: str = "", extra_data=None):
+def _automation_create_task(task_type: str, event, target_worker: str = "", command_text: str = ""):
     """
     建立 automation task，具備兩層防重複：
     1. webhookEventId / LINE message id 使用固定 Firestore document id，Webhook 重送不會重建。
@@ -24853,9 +24853,6 @@ def _automation_create_task(task_type: str, event, target_worker: str = "", comm
         "dedupe_key": event_key,
     }
     data.update(source_ids)
-
-    if isinstance(extra_data, dict):
-        data.update(extra_data)
 
     if event_key:
         # 同一 webhook/message 無論被 LINE 重送幾次，都命中同一份文件。
@@ -24951,216 +24948,29 @@ def process_line_automation_task_event(event):
         }
 
     if body_no_space.startswith("更新樂屋"):
-        # 新版格式：
-        # #更新樂屋
-        # AA6316787
-        # AA6352131
-        #
-        # 亦支援：
-        # #更新樂屋 @ELLEN-PC
-        # AA6316787
-
-        def _normalize_rakuya_object_no(value):
-            value = str(value or "").strip().upper()
-            value = value.translate(
-                str.maketrans(
-                    "０１２３４５６７８９",
-                    "0123456789",
-                )
-            )
-            return re.sub(
-                r"[^A-Z0-9]",
-                "",
-                value,
-            )
-
-        def _looks_like_rakuya_object_no(value):
-            value = _normalize_rakuya_object_no(value)
-            return (
-                5 <= len(value) <= 24
-                and bool(re.search(r"[A-Z]", value))
-                and bool(re.search(r"\d", value))
-            )
-
+        # 指定主機：#更新樂屋 @ELLEN-PC 或 #更新樂屋 ELLEN-PC
         target_worker = DEFAULT_AUTOMATION_WORKER_ID
-        object_ids = []
-        duplicate_object_ids = []
-        seen_object_ids = set()
-
-        raw_lines = [
-            line.strip()
-            for line in raw_text.replace(
-                "\r\n",
-                "\n",
-            ).split("\n")
-            if line.strip()
-        ]
-
-        for line_index, line in enumerate(raw_lines):
-            cleaned_line = (
-                line.replace("＃", "#").strip()
-            )
-
-            if line_index == 0:
-                if cleaned_line.startswith("#"):
-                    cleaned_line = cleaned_line[1:].strip()
-
-                cleaned_line = re.sub(
-                    r"^(更新樂屋|樂屋更新)",
-                    "",
-                    cleaned_line,
-                    flags=re.I,
-                ).strip()
-
-            for token in re.split(
-                r"[\s,，、;；|]+",
-                cleaned_line,
-            ):
-                token = token.strip()
-
-                if not token:
-                    continue
-
-                if token.startswith("@"):
-                    target_worker = (
-                        token[1:].strip()
-                        or target_worker
-                    )
-                    continue
-
-                object_no = _normalize_rakuya_object_no(
-                    token
-                )
-
-                if not _looks_like_rakuya_object_no(
-                    object_no
-                ):
-                    continue
-
-                if object_no in seen_object_ids:
-                    duplicate_object_ids.append(
-                        object_no
-                    )
-                    continue
-
-                seen_object_ids.add(object_no)
-                object_ids.append(object_no)
-
-        if not object_ids:
-            return {
-                "handled": True,
-                "ok": False,
-                "reply_text": (
-                    "❌ #更新樂屋 現在必須提供要直接上架的物件編號。\n\n"
-                    "格式：\n"
-                    "#更新樂屋\n"
-                    "AA6316787\n"
-                    "AA6352131\n"
-                    "AA6334831"
-                ),
-                "parsed_tag": "更新樂屋",
-            }
+        parts = body.split()
+        if len(parts) >= 2:
+            target_worker = parts[1].strip().lstrip("@").strip() or DEFAULT_AUTOMATION_WORKER_ID
 
         task_id, data = _automation_create_task(
             task_type="rakuya_inventory_cycle",
             event=event,
             target_worker=target_worker,
             command_text=raw_text,
-            extra_data={
-                "rakuya_object_ids": object_ids,
-                "rakuya_object_count": len(
-                    object_ids
-                ),
-                "rakuya_duplicate_object_ids": (
-                    duplicate_object_ids
-                ),
-                "task_scope": (
-                    "rakuya_direct_publish:"
-                    + ",".join(object_ids)
-                ),
-            },
         )
-
-        deduplicated = bool(
-            (data or {}).get("_deduplicated")
-        )
-
-        first_line_text = (
-            "♻️ 樂屋更新任務已存在，未重複建立"
-            if deduplicated
-            else "✅ 已建立樂屋指定物件更新任務"
-        )
-
-        task_object_ids = (
-            (data or {}).get("rakuya_object_ids")
-            or object_ids
-        )
-
-        preview = "\n".join(
-            f"{index}. {object_no}"
-            for index, object_no in enumerate(
-                task_object_ids[:30],
-                start=1,
-            )
-        )
-
-        if len(task_object_ids) > 30:
-            preview += (
-                f"\n…另有 "
-                f"{len(task_object_ids) - 30} 筆"
-            )
-
-        duplicate_note = ""
-
-        if (
-            duplicate_object_ids
-            and not deduplicated
-        ):
-            duplicate_note = (
-                "\n\n已自動移除重複編號："
-                + "、".join(
-                    duplicate_object_ids
-                )
-            )
-
-        reply_text = (
-            f"{first_line_text}\n"
-            f"任務ID：{task_id}\n"
-            f"指定主機：{target_worker}\n"
-            f"指定上架：{len(task_object_ids)} 筆\n\n"
-            f"{preview}"
-            f"{duplicate_note}\n\n"
-            "流程：曝光全選關閉 → 停售全選刪除並確認 → "
-            "依上述編號直接上架，不走可售庫存。"
-        )
-
-        result = {
+        return {
             "handled": True,
             "ok": True,
-            "reply_text": reply_text,
+            "reply_text": (
+                "✅ 已建立樂屋更新任務\n"
+                f"任務ID：{task_id}\n"
+                f"指定主機：{target_worker}\n\n"
+                "請確認該主機已啟動 automation_agent.py。"
+            ),
             "parsed_tag": "更新樂屋",
         }
-
-        try:
-            status_text = _automation_live_status_text(
-                target_worker,
-                focus_task_id=task_id,
-                compact=True,
-            )
-            result["reply_messages"] = [
-                {
-                    "type": "text",
-                    "text": reply_text[:4900],
-                },
-                {
-                    "type": "text",
-                    "text": status_text[:4900],
-                },
-            ]
-        except Exception:
-            pass
-
-        return result
 
     if body_no_space.startswith("指定主機"):
         parts = body.split()
@@ -25229,12 +25039,12 @@ DEFAULT_AUTOMATION_ALIASES = {
     "更新樂屋": {
         "task_type": "rakuya_inventory_cycle",
         "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "依 LINE 指定物件編號重建樂屋曝光上架，不走可售庫存",
+        "description": "樂屋庫存輪替上架",
     },
     "樂屋更新": {
         "task_type": "rakuya_inventory_cycle",
         "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "依 LINE 指定物件編號重建樂屋曝光上架，不走可售庫存",
+        "description": "樂屋庫存輪替上架",
     },
     "更新出售CSV": {
         "task_type": "aiwu_sell_csv",
@@ -25250,36 +25060,6 @@ DEFAULT_AUTOMATION_ALIASES = {
         "task_type": "aiwu_all_csv",
         "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
         "description": "愛屋出售＋出租 CSV 下載並同步 Firebase",
-    },
-    "上架臉書Marketplace出售新物件": {
-        "task_type": "fb_marketplace_sell_new_listings",
-        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "篩選未上架出售新物件並發佈 Facebook Marketplace",
-    },
-    "上架FB出售新物件": {
-        "task_type": "fb_marketplace_sell_new_listings",
-        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "篩選未上架出售新物件並發佈 Facebook Marketplace",
-    },
-    "上架Marketplace出售新物件": {
-        "task_type": "fb_marketplace_sell_new_listings",
-        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "篩選未上架出售新物件並發佈 Facebook Marketplace",
-    },
-    "上架臉書Marketplace出租新物件": {
-        "task_type": "fb_marketplace_rent_new_listings",
-        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "篩選未上架出租新物件並發佈 Facebook Marketplace",
-    },
-    "上架FB出租新物件": {
-        "task_type": "fb_marketplace_rent_new_listings",
-        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "篩選未上架出租新物件並發佈 Facebook Marketplace",
-    },
-    "上架Marketplace出租新物件": {
-        "task_type": "fb_marketplace_rent_new_listings",
-        "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-        "description": "篩選未上架出租新物件並發佈 Facebook Marketplace",
     },
 }
 
@@ -26019,7 +25799,7 @@ try:
         "更新樂屋": {
             "task_type": "rakuya_inventory_cycle",
             "target_worker": DEFAULT_AUTOMATION_WORKER_ID,
-            "description": "依 LINE 指定物件編號重建樂屋曝光上架，不走可售庫存",
+            "description": "樂屋庫存輪替上架",
         },
     })
 except Exception as e:
@@ -26358,1030 +26138,1202 @@ print("✅ TeamME automation_tasks source id 已整合至 _automation_create_tas
 
 
 # =============================================================================
-# Team M.E Automation Test Group Control Fix 20260706D
-# 目的：
-# 1. 固定 test 群組不只接收 Agent push，也可直接下 automation 指令。
-# 2. 只放行 automation，不額外開放 buyer / seller / todo 等 CRM 指令。
-# 3. 加入清楚的 Render log，方便確認 LINE 指令是否有進 webhook。
+# Firebase 物件庫狀態 / 重複清理 Patch v20260712
+# - 設定中心顯示 properties 出售 / 出租筆數與最新更新時間
+# - 偵測 sale/rent 重複資料
+# - 一鍵停用舊版重複資料，只保留最新 active 版本
 # =============================================================================
-AUTOMATION_TEST_GROUP_ID = (
-    os.environ.get("AUTOMATION_TEST_GROUP_ID", "").strip()
-    or "Ccc41ded5cf9764c5742fee75013c5e0e"
+
+PROPERTY_LIBRARY_COLLECTION = os.environ.get(
+    "PROPERTY_LIBRARY_COLLECTION",
+    "properties",
 )
 
-try:
-    _line_access_gate_before_automation_test_group = line_access_gate
+PROPERTY_IMPORT_LOG_COLLECTION = os.environ.get(
+    "PROPERTY_IMPORT_LOG_COLLECTION",
+    "property_import_logs",
+)
 
-    def line_access_gate(event):
-        kind, target_id = line_event_source_kind_and_id(event)
-        message = (event or {}).get("message") or {}
-        raw_text = (message.get("text") or "").strip() if message.get("type") == "text" else ""
+PROPERTY_MAINTENANCE_LOG_COLLECTION = os.environ.get(
+    "PROPERTY_MAINTENANCE_LOG_COLLECTION",
+    "property_maintenance_logs",
+)
 
-        # test 群組只特別放行 automation 指令。
-        if kind == "group" and target_id == AUTOMATION_TEST_GROUP_ID and raw_text:
-            try:
-                cmd_type = detect_line_command_type(raw_text, event=event)
-            except TypeError:
-                cmd_type = detect_line_command_type(raw_text)
-            except Exception as e:
-                print("⚠️ test 群組 automation 指令辨識失敗：", e, flush=True)
-                cmd_type = ""
-
-            if cmd_type == "automation":
-                print(
-                    f"🤖 test 群組 automation 指令已放行 target={target_id} text={raw_text.splitlines()[0][:120]}",
-                    flush=True,
-                )
-                return True, "automation", {
-                    "name": "Team M.E test 群組",
-                    "target_id": target_id,
-                    "enabled": True,
-                    "command_types": ["automation"],
-                    "receive_types": [],
-                    "view_types": [],
-                    "automation_test_group": True,
-                }
-
-        return _line_access_gate_before_automation_test_group(event)
-
-    print(f"✅ automation test 群組已開放 automation 指令：{AUTOMATION_TEST_GROUP_ID}", flush=True)
-except Exception as e:
-    print("⚠️ automation test 群組權限 patch 失敗：", e, flush=True)
+PROPERTY_MAINTENANCE_MAX_DOCS = int(
+    os.environ.get(
+        "PROPERTY_MAINTENANCE_MAX_DOCS",
+        "12000",
+    )
+    or 12000
+)
 
 
-# 預設 alias 在本檔前段已於啟動時補齊。之後每次 LINE 指令辨識不再重複寫 5 組預設文件，
-# 避免 webhook 為了辨識一個指令做大量 Firestore set，造成回覆變慢或 LINE 重送事件。
-try:
-    _ensure_default_automation_aliases_before_runtime_cache = ensure_default_automation_aliases
-    _AUTOMATION_DEFAULT_ALIASES_READY = True
-
-    def ensure_default_automation_aliases(force: bool = False):
-        global _AUTOMATION_DEFAULT_ALIASES_READY
-        if _AUTOMATION_DEFAULT_ALIASES_READY and not force:
-            return
-        _ensure_default_automation_aliases_before_runtime_cache()
-        _AUTOMATION_DEFAULT_ALIASES_READY = True
-
-    print("✅ automation 預設指令已改為啟動補齊，LINE webhook 不再每次重複寫入", flush=True)
-except Exception as e:
-    print("⚠️ automation alias runtime cache patch 失敗：", e, flush=True)
-
-
-# Webhook 入口增加 automation 指令接收紀錄；不改原本實際處理流程。
-try:
-    _line_webhook_before_automation_receive_log = app.view_functions.get("line_webhook")
-
-    def line_webhook_with_automation_receive_log():
-        try:
-            raw_preview = request.get_data(cache=True, as_text=False)
-            payload_preview = json.loads(raw_preview.decode("utf-8")) if raw_preview else {}
-            for event in payload_preview.get("events", []):
-                message = (event or {}).get("message") or {}
-                if message.get("type") != "text":
-                    continue
-                text = (message.get("text") or "").strip()
-                if not text.startswith(("#", "＃")):
-                    continue
-                kind, target_id = line_event_source_kind_and_id(event)
-                print(
-                    f"📨 LINE 指令收到 kind={kind} target={target_id or '-'} text={text.splitlines()[0][:120]}",
-                    flush=True,
-                )
-        except Exception as e:
-            print("⚠️ LINE 指令接收 log 解析失敗：", e, flush=True)
-
-        return _line_webhook_before_automation_receive_log()
-
-    if _line_webhook_before_automation_receive_log:
-        app.view_functions["line_webhook"] = line_webhook_with_automation_receive_log
-        print("✅ LINE webhook 已加入 automation 指令接收 log", flush=True)
-except Exception as e:
-    print("⚠️ LINE webhook 指令接收 log patch 失敗：", e, flush=True)
-
-print("✅ Team M.E Automation Test Group Control Fix 20260706D 載入完成", flush=True)
-# =============================================================================
-# Team M.E Automation Test Group Control Fix End
-# =============================================================================
-
-
-# =============================================================================
-# Team M.E Automation Live Status Patch 20260706E
-# 功能：
-# 1. LINE 新增 #狀態 / #任務狀態 / #目前狀態 / #Agent狀態。
-# 2. 每次建立 automation 任務後，以第二則 LINE 訊息回覆即時狀態。
-# 3. 狀態清楚區分：任務等待中 / 執行中 / 完成整理中 / 待命中 / Agent 離線。
-# 4. 偵測 Firebase task 與 automation_workers 心跳不一致，直接顯示「疑似卡住」。
-# =============================================================================
-
-AUTOMATION_STATUS_COMMAND_NAMES = {
-    "狀態", "任務狀態", "目前狀態", "現階段狀態", "自動化狀態",
-    "agent狀態", "Agent狀態", "主機狀態", "自動化主機狀態",
-}
-AUTOMATION_WORKER_ONLINE_SECONDS = int(os.environ.get("AUTOMATION_WORKER_ONLINE_SECONDS", "90") or 90)
-AUTOMATION_WAITING_WARN_SECONDS = int(os.environ.get("AUTOMATION_WAITING_WARN_SECONDS", "60") or 60)
-
-
-def _automation_status_parse_dt(value):
-    raw = str(value or "").strip()
-    if not raw:
-        return None
+def _property_maintenance_safe_text(value):
     try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TAIPEI_TZ)
-        return dt.astimezone(TAIPEI_TZ)
+        if value is None:
+            return ""
+
+        text = str(
+            value
+        ).strip()
+
+        if text.lower() in {
+            "nan",
+            "none",
+            "null",
+        }:
+            return ""
+
+        return text
+
     except Exception:
-        return None
+        return ""
 
 
-def _automation_status_age_seconds(value):
-    dt = _automation_status_parse_dt(value)
-    if not dt:
-        return None
-    try:
-        return max(0.0, (now_taipei() - dt).total_seconds())
-    except Exception:
-        return None
-
-
-def _automation_status_duration_text(seconds):
-    if seconds is None:
-        return "-"
-    try:
-        seconds = max(0, int(seconds))
-    except Exception:
-        return "-"
-    if seconds < 60:
-        return f"{seconds} 秒"
-    minutes, sec = divmod(seconds, 60)
-    if minutes < 60:
-        return f"{minutes} 分 {sec} 秒"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours} 小時 {minutes} 分"
-
-
-def _automation_status_task_name(data):
-    data = data or {}
-    command = str(data.get("command_text") or data.get("command") or "").strip()
-    if command:
-        first = command.splitlines()[0].strip().replace("＃", "#")
-        return first.lstrip("#").strip() or (data.get("type") or data.get("task_type") or "-")
-    return str(data.get("type") or data.get("task_type") or "-")
-
-
-def _automation_status_worker_info(worker_id):
-    info = {
-        "worker_id": worker_id,
-        "exists": False,
-        "online": False,
-        "status": "unknown",
-        "current_task_id": "",
-        "current_task_type": "",
-        "last_seen": "",
-        "last_seen_age": None,
-        "phase_message": "",
-        "agent_pid": "",
-        "agent_session_id": "",
-    }
-    try:
-        snap = db.collection(AUTOMATION_WORKER_COLLECTION).document(worker_id).get()
-        if not snap.exists:
-            return info
-        data = snap.to_dict() or {}
-        info.update({
-            "exists": True,
-            "status": str(data.get("status") or "unknown"),
-            "current_task_id": str(data.get("current_task_id") or ""),
-            "current_task_type": str(data.get("current_task_type") or ""),
-            "last_seen": str(data.get("last_seen") or ""),
-            "phase_message": str(data.get("phase_message") or ""),
-            "agent_pid": str(data.get("agent_pid") or ""),
-            "agent_session_id": str(data.get("agent_session_id") or ""),
-        })
-        age = _automation_status_age_seconds(info["last_seen"])
-        info["last_seen_age"] = age
-        info["online"] = age is not None and age <= AUTOMATION_WORKER_ONLINE_SECONDS
-    except Exception as e:
-        info["error"] = str(e)
-    return info
-
-
-def _automation_status_tasks(worker_id, statuses=("running", "waiting"), limit=100):
-    rows = []
-    for status in statuses:
-        try:
-            docs = list(
-                db.collection(AUTOMATION_TASK_COLLECTION)
-                .where("target_worker", "==", worker_id)
-                .where("status", "==", status)
-                .limit(limit)
-                .stream()
-            )
-        except Exception as e:
-            print(f"⚠️ automation status task query failed worker={worker_id} status={status}: {e}", flush=True)
-            continue
-        for doc in docs:
-            data = doc.to_dict() or {}
-            rows.append({"id": doc.id, "data": data, "status": str(data.get("status") or status)})
-    rows.sort(key=lambda item: str((item.get("data") or {}).get("created_at") or ""))
-    return rows
-
-
-def _automation_status_find_task(task_id):
-    if not task_id:
-        return None
-    try:
-        snap = db.collection(AUTOMATION_TASK_COLLECTION).document(task_id).get()
-        if snap.exists:
-            data = snap.to_dict() or {}
-            return {"id": snap.id, "data": data, "status": str(data.get("status") or "")}
-    except Exception as e:
-        print(f"⚠️ automation status read task failed task={task_id}: {e}", flush=True)
-    return None
-
-
-def _automation_worker_phase_label(worker_info):
-    worker_info = worker_info or {}
-    if not worker_info.get("online"):
-        return "🔴 Agent 離線"
-    status = str(worker_info.get("status") or "").lower()
-    if status == "running":
-        return "🟠 執行中"
-    if status == "finalizing":
-        return "🔵 完成整理中"
-    if status in ("claiming", "starting"):
-        return "🟣 正在領取任務"
-    if status in ("idle", "standby", "waiting"):
-        return "🟢 待命中"
-    if status == "error":
-        return "🔴 Agent 異常"
-    return f"⚪ {status or '狀態未知'}"
-
-
-def _automation_task_phase_label(task_status):
-    status = str(task_status or "").lower()
-    return {
-        "waiting": "🟡 任務等待中",
-        "running": "🟠 任務執行中",
-        "done": "✅ 任務已完成",
-        "failed": "❌ 任務失敗",
-        "timeout": "⏱️ 任務逾時停止",
-        "cancelled": "⚪ 任務已取消",
-    }.get(status, f"⚪ 任務狀態：{status or '未知'}")
-
-
-def _automation_live_status_text(worker_id=None, focus_task_id="", compact=False):
-    worker_id = (worker_id or DEFAULT_AUTOMATION_WORKER_ID).strip()
-    worker = _automation_status_worker_info(worker_id)
-    active_tasks = _automation_status_tasks(worker_id, statuses=("running", "waiting"), limit=100)
-    running = [x for x in active_tasks if x.get("status") == "running"]
-    waiting = [x for x in active_tasks if x.get("status") == "waiting"]
-    focus = _automation_status_find_task(focus_task_id) if focus_task_id else None
-
-    lines = ["🤖 Team M.E 現階段狀態", f"主機：{worker_id}"]
-    lines.append(f"Agent：{_automation_worker_phase_label(worker)}")
-
-    if worker.get("last_seen"):
-        age_text = _automation_status_duration_text(worker.get("last_seen_age"))
-        lines.append(f"最後心跳：{age_text}前")
-    else:
-        lines.append("最後心跳：尚未回報")
-
-    warning_lines = []
-
-    if focus:
-        data = focus.get("data") or {}
-        status = focus.get("status") or data.get("status") or ""
-        lines += [
-            "",
-            f"目前指令：{_automation_status_task_name(data)}",
-            f"任務狀態：{_automation_task_phase_label(status)}",
-            f"任務ID：{focus.get('id')}",
-        ]
-
-        if status == "waiting":
-            queue_ids = [x.get("id") for x in waiting]
-            try:
-                position = queue_ids.index(focus.get("id")) + 1
-                lines.append(f"排隊順位：第 {position} 筆")
-            except ValueError:
-                pass
-            age = _automation_status_age_seconds(data.get("created_at") or data.get("updated_at"))
-            lines.append(f"已等待：{_automation_status_duration_text(age)}")
-
-            if worker.get("online") and str(worker.get("status") or "").lower() in ("idle", "standby", "waiting"):
-                if age is not None and age >= AUTOMATION_WAITING_WARN_SECONDS:
-                    warning_lines.append("⚠️ Agent 顯示待命，但這筆 waiting 任務超過 60 秒仍未被領取。")
-                    warning_lines.append("判斷：Agent 輪詢可能卡住，或本機仍在執行舊版 automation_agent.py。")
-            elif worker.get("online") and str(worker.get("status") or "").lower() in ("running", "finalizing"):
-                current_type = worker.get("current_task_type") or "-"
-                lines.append(f"主機目前正在處理：{current_type}")
-            elif not worker.get("online"):
-                warning_lines.append("⚠️ 任務已排入 waiting，但 Agent 沒有在線心跳，因此終端機不會領取。")
-
-        elif status == "running":
-            started_age = _automation_status_age_seconds(data.get("started_at") or data.get("updated_at"))
-            lines.append(f"已執行：{_automation_status_duration_text(started_age)}")
-            current_task_id = str(worker.get("current_task_id") or "")
-            worker_status = str(worker.get("status") or "").lower()
-            if not worker.get("online"):
-                warning_lines.append("⚠️ Firebase 任務仍是 running，但 Agent 已離線；這很可能是舊任務狀態沒有清乾淨。")
-            elif current_task_id != focus.get("id") or worker_status not in ("running", "finalizing"):
-                warning_lines.append("⚠️ Firebase 任務顯示 running，但 Agent 心跳沒有執行這個任務。")
-                warning_lines.append("判斷：舊任務狀態疑似卡住，這也會讓新指令顯示『任務已存在』。")
-
-        elif status in ("done", "failed", "timeout", "cancelled"):
-            finished_age = _automation_status_age_seconds(data.get("finished_at") or data.get("updated_at"))
-            lines.append(f"最後更新：{_automation_status_duration_text(finished_age)}前")
-
-    else:
-        worker_status = str(worker.get("status") or "").lower()
-        if worker.get("online") and worker_status in ("running", "finalizing"):
-            current_id = worker.get("current_task_id") or ""
-            current = _automation_status_find_task(current_id) if current_id else None
-            current_data = (current or {}).get("data") or {}
-            lines += [
-                "",
-                f"現階段：{_automation_worker_phase_label(worker)}",
-                f"目前任務：{_automation_status_task_name(current_data) if current_data else (worker.get('current_task_type') or '-')}",
-                f"任務ID：{current_id or '-'}",
-            ]
-        elif worker.get("online"):
-            lines += ["", "現階段：🟢 待命中", "目前任務：無"]
-        else:
-            lines += ["", "現階段：🔴 Agent 離線", "目前任務：無法確認"]
-
-    lines.append(f"等待任務：{len(waiting)} 筆")
-    if waiting:
-        next_task = waiting[0]
-        next_data = next_task.get("data") or {}
-        lines.append(f"下一筆：{_automation_status_task_name(next_data)}")
-        lines.append(f"下一筆ID：{next_task.get('id')}")
-
-    # 額外檢查：Firebase 還有 running，但 worker 說自己 idle / offline。
-    if running:
-        worker_status = str(worker.get("status") or "").lower()
-        worker_current = str(worker.get("current_task_id") or "")
-        mismatched = [x for x in running if x.get("id") != worker_current]
-        if (not worker.get("online") or worker_status in ("idle", "standby", "waiting")) and running:
-            warning_lines.append(f"⚠️ Firebase 尚有 {len(running)} 筆 running 任務，但 Agent 並未回報執行中。")
-        elif mismatched:
-            warning_lines.append(f"⚠️ 另有 {len(mismatched)} 筆 running 任務與 Agent 目前任務不一致。")
-
-    if warning_lines:
-        lines += ["", "【狀態判斷】"]
-        seen = set()
-        for item in warning_lines:
-            if item not in seen:
-                seen.add(item)
-                lines.append(item)
-    elif focus and focus.get("status") == "waiting":
-        lines += ["", "判斷：任務已排隊，Agent 會依序領取。"]
-    elif worker.get("online") and str(worker.get("status") or "").lower() in ("idle", "standby", "waiting"):
-        lines += ["", "判斷：Agent 已恢復待機，可以接下一個任務。"]
-
-    if not compact:
-        lines += ["", "查詢指令：#狀態"]
-    return "\n".join(lines).strip()[:4900]
-
-
-def _automation_worker_status_text(limit=8):
-    """新版主機狀態：顯示 Agent 心跳、目前任務與 waiting 佇列。"""
-    try:
-        worker_docs = list(db.collection(AUTOMATION_WORKER_COLLECTION).stream())
-    except Exception:
-        worker_docs = []
-
-    worker_ids = []
-    for doc in worker_docs:
-        data = doc.to_dict() or {}
-        worker_id = str(data.get("worker_id") or doc.id or "").strip()
-        if worker_id and worker_id not in worker_ids:
-            worker_ids.append(worker_id)
-    if DEFAULT_AUTOMATION_WORKER_ID not in worker_ids:
-        worker_ids.insert(0, DEFAULT_AUTOMATION_WORKER_ID)
-    worker_ids = worker_ids[:limit]
-
-    blocks = [_automation_live_status_text(worker_id, compact=True) for worker_id in worker_ids]
-    return "\n\n──────────\n\n".join(blocks)[:5000]
-
-
-# 讓 #狀態 在 test 群組權限 gate 中被辨識為 automation。
-try:
-    _detect_line_command_type_before_live_status = detect_line_command_type
-
-    def detect_line_command_type(text: str, event=None):
-        raw = str(text or "").strip().replace("＃", "#")
-        first = raw.splitlines()[0].strip() if raw else ""
-        body = first[1:].strip() if first.startswith("#") else first
-        body_no_space = re.sub(r"\s+", "", body)
-        status_names = {re.sub(r"\s+", "", x) for x in AUTOMATION_STATUS_COMMAND_NAMES}
-        if body_no_space in status_names or any(body_no_space.startswith(x + "@") for x in status_names):
-            return "automation"
-        try:
-            return _detect_line_command_type_before_live_status(text, event=event)
-        except TypeError:
-            return _detect_line_command_type_before_live_status(text)
-
-    print("✅ automation live status：#狀態 已納入 automation 權限辨識", flush=True)
-except Exception as e:
-    print("⚠️ automation live status detect patch 失敗：", e, flush=True)
-
-
-# automation 指令處理：
-# - #狀態 直接查詢
-# - 任務建立/命中去重後，追加第二則 LINE 訊息顯示即時狀態
-try:
-    _process_line_dynamic_command_event_before_live_status = process_line_dynamic_command_event
-
-    def process_line_dynamic_command_event(event):
-        message = (event or {}).get("message") or {}
-        raw_text = (message.get("text") or "").strip() if message.get("type") == "text" else ""
-        first = raw_text.splitlines()[0].strip().replace("＃", "#") if raw_text else ""
-        body = first[1:].strip() if first.startswith("#") else first
-        body_no_space = re.sub(r"\s+", "", body)
-        status_names = {re.sub(r"\s+", "", x) for x in AUTOMATION_STATUS_COMMAND_NAMES}
-
-        if body_no_space in status_names or any(body_no_space.startswith(x + "@") for x in status_names):
-            target_worker = DEFAULT_AUTOMATION_WORKER_ID
-            parts = body.split()
-            if len(parts) >= 2:
-                target_worker = parts[1].strip().lstrip("@").strip() or DEFAULT_AUTOMATION_WORKER_ID
-            return {
-                "handled": True,
-                "ok": True,
-                "reply_text": _automation_live_status_text(target_worker),
-                "parsed_tag": "狀態",
-            }
-
-        result = _process_line_dynamic_command_event_before_live_status(event)
-        if not result or not result.get("handled"):
-            return result
-
-        # 所有 automation 任務建立回覆，只要文字中有任務ID，就補第二則「現階段狀態」。
-        if not result.get("reply_messages"):
-            reply_text = str(result.get("reply_text") or "")
-            task_match = re.search(r"任務ID[：:]\s*([^\s]+)", reply_text)
-            if task_match:
-                task_id = task_match.group(1).strip()
-                task_item = _automation_status_find_task(task_id)
-                target_worker = DEFAULT_AUTOMATION_WORKER_ID
-                if task_item:
-                    target_worker = str((task_item.get("data") or {}).get("target_worker") or target_worker).strip()
-                status_text = _automation_live_status_text(target_worker, focus_task_id=task_id, compact=True)
-                result = dict(result)
-                result["reply_messages"] = [
-                    {"type": "text", "text": reply_text[:4900]},
-                    {"type": "text", "text": status_text[:4900]},
-                ]
-        return result
-
-    print("✅ automation live status：任務建立後會回覆第二則現階段狀態", flush=True)
-except Exception as e:
-    print("⚠️ automation live status process patch 失敗：", e, flush=True)
-
-
-print("✅ Team M.E Automation Live Status Patch 20260706E 載入完成", flush=True)
-# =============================================================================
-# Team M.E Automation Live Status Patch End
-# =============================================================================
-
-
-# =============================================================================
-# Team M.E LINE Quoted Reply Context Fix 20260707F
-# 目的：
-# 1. LINE「回覆該則訊息」不再要求 # 指令。
-# 2. quotedMessageId 若已存在 line_message_links，直接依 target_type 找 buyer / seller / development。
-# 3. 權限支援 followup，並相容舊設定只勾 buyer / seller / development 的群組。
-# 4. 真正的儲存流程仍交給既有 process_quote_context_message：
-#    - 更新客戶 note
-#    - 加入 LINE紀錄 / 群組回覆註記 labels
-#    - 新增 buyer_followups / seller_followups / development_followups
-#    - 解析進度、下一步、下次聯絡日、地址、電話、姓名、網址、來源等欄位
-# 5. automation / #狀態 / test 群組 ACL 全部保留原邏輯。
-# =============================================================================
-
-TEAMME_QUOTED_REPLY_PERMISSION_KEY = "followup"
-TEAMME_QUOTED_REPLY_TARGET_PERMISSION_MAP = {
-    "buyer": "buyer",
-    "seller": "seller",
-    "development": "development",
-}
-
-
-def _teamme_quoted_reply_source_config(event):
-    """取得 LINE 來源與設定中心 ACL 設定。"""
-    kind, target_id = line_event_source_kind_and_id(event)
-    source_cfg = None
-
-    if kind in ("group", "room"):
-        try:
-            source_cfg = find_line_group_by_target_id(target_id)
-        except Exception as e:
-            print(f"⚠️ 回覆追蹤：讀取群組 ACL 失敗 target={target_id}: {e}", flush=True)
-            source_cfg = None
-
-    elif kind == "user":
-        finder = globals().get("find_line_personal_user_by_user_id")
-        if callable(finder):
-            try:
-                source_cfg = finder(target_id)
-            except Exception as e:
-                print(f"⚠️ 回覆追蹤：讀取個人 LINE ACL 失敗 target={target_id}: {e}", flush=True)
-                source_cfg = None
-
-    return kind, target_id, source_cfg
-
-
-def _teamme_quoted_reply_acl_allowed(event):
-    """
-    專門判斷「回覆該則訊息」。
-
-    回傳：
-    (is_quoted_reply, allowed, reason_or_command_type, source_cfg)
-    """
-    message = (event or {}).get("message") or {}
-    if message.get("type") != "text":
-        return False, False, "", None
-
-    raw_text = str(message.get("text") or "").strip()
-    quoted_message_id = str(message.get("quotedMessageId") or "").strip()
-
-    if not quoted_message_id or not raw_text:
-        return False, False, "", None
-
-    kind, target_id, source_cfg = _teamme_quoted_reply_source_config(event)
-
-    print(
-        f"📎 LINE 回覆訊息收到 kind={kind} target={target_id or '-'} "
-        f"quoted={quoted_message_id} text={raw_text.splitlines()[0][:120]}",
-        flush=True,
+def _property_maintenance_float(value):
+    text = (
+        _property_maintenance_safe_text(
+            value
+        )
+        .replace(",", "")
+        .replace("萬", "")
+        .replace("元", "")
     )
 
-    if not source_cfg:
-        return (
-            True,
-            False,
-            f"未授權：此 LINE 來源尚未在後台設定。\nID：{target_id or '-'}",
-            None,
+    if not text:
+        return None
+
+    match = re.search(
+        r"-?\d+(?:\.\d+)?",
+        text,
+    )
+
+    if not match:
+        return None
+
+    try:
+        return float(
+            match.group(0)
         )
 
-    if not bool(source_cfg.get("enabled", True)):
-        return True, False, "此 LINE 來源目前已停用。", source_cfg
+    except Exception:
+        return None
 
-    allowed_types = set(source_cfg.get("command_types") or [])
-    link = None
+
+def _property_maintenance_pick(
+    data: dict,
+    *keys,
+):
+    raw = data.get("raw")
+
+    if not isinstance(
+        raw,
+        dict,
+    ):
+        raw = {}
+
+    for key in keys:
+        value = _property_maintenance_safe_text(
+            data.get(key)
+        )
+
+        if value:
+            return value
+
+        value = _property_maintenance_safe_text(
+            raw.get(key)
+        )
+
+        if value:
+            return value
+
+    return ""
+
+
+def _property_maintenance_normalize_url(url: str) -> str:
+    url = _property_maintenance_safe_text(
+        url
+    )
+
+    if not url:
+        return ""
+
     try:
-        link = get_line_message_link(quoted_message_id)
-    except Exception as e:
-        print(f"⚠️ 回覆追蹤：讀取 line_message_links 失敗 quoted={quoted_message_id}: {e}", flush=True)
+        from urllib.parse import (
+            urlsplit,
+            urlunsplit,
+            parse_qsl,
+            urlencode,
+        )
 
-    # 有 link：可精準依客戶類型驗權。
-    if link:
-        target_type = str(link.get("target_type") or "").strip()
-        required_permission = TEAMME_QUOTED_REPLY_TARGET_PERMISSION_MAP.get(target_type, "")
+        parsed = urlsplit(
+            url
+        )
+
+        scheme = (
+            parsed.scheme
+            or "https"
+        ).lower()
+
+        netloc = (
+            parsed.netloc
+            .lower()
+        )
+
+        path = parsed.path.rstrip(
+            "/"
+        )
+
+        host = netloc.lower()
 
         if (
-            "all" in allowed_types
-            or TEAMME_QUOTED_REPLY_PERMISSION_KEY in allowed_types
-            or (required_permission and required_permission in allowed_types)
+            "sale.591.com.tw"
+            in host
+            and "/home/house/detail/"
+            in path
         ):
-            print(
-                f"✅ LINE 回覆追蹤已放行 quoted={quoted_message_id} "
-                f"target_type={target_type or '-'} permission={required_permission or TEAMME_QUOTED_REPLY_PERMISSION_KEY}",
-                flush=True,
+            return urlunsplit(
+                (
+                    scheme,
+                    netloc,
+                    path,
+                    "",
+                    "",
+                )
             )
-            return True, True, TEAMME_QUOTED_REPLY_PERMISSION_KEY, source_cfg
 
-        label = {
-            "buyer": "客需",
-            "seller": "委託",
-            "development": "開發",
-        }.get(target_type, "回覆追蹤")
+        # 樂屋 ehid 是必要識別，保留 ehid，其它 tracking 去掉。
+        if "rakuya.com.tw" in host:
+            query_pairs = parse_qsl(
+                parsed.query,
+                keep_blank_values=False,
+            )
 
-        return (
-            True,
-            False,
-            f"此群組未開放「{label}回覆追蹤」權限。"
-            f"\n請到設定中心勾選「卡片回覆追蹤」"
-            f"{f'或「{required_permission}」類指令' if required_permission else ''}。",
-            source_cfg,
+            keep_pairs = [
+                (
+                    key,
+                    value,
+                )
+                for key, value in query_pairs
+                if key.lower()
+                in {
+                    "ehid",
+                }
+            ]
+
+            return urlunsplit(
+                (
+                    scheme,
+                    netloc,
+                    path,
+                    urlencode(
+                        keep_pairs
+                    ),
+                    "",
+                )
+            )
+
+        return urlunsplit(
+            (
+                scheme,
+                netloc,
+                path,
+                parsed.query,
+                "",
+            )
         )
 
-    # 沒有 link：
-    # 只要來源原本有 followup / buyer / seller / development / all，
-    # 就放行進既有 process_quote_context_message，
-    # 讓 Bot 回覆「找不到對標資料」，而不是被誤判成 unknown #指令。
-    fallback_permissions = {
-        "all",
-        TEAMME_QUOTED_REPLY_PERMISSION_KEY,
-        "buyer",
-        "seller",
-        "development",
-    }
-    if allowed_types.intersection(fallback_permissions):
-        print(
-            f"⚠️ LINE 回覆訊息找不到 link，仍放行至 quoted handler 回覆明確錯誤 "
-            f"quoted={quoted_message_id}",
-            flush=True,
-        )
-        return True, True, TEAMME_QUOTED_REPLY_PERMISSION_KEY, source_cfg
+    except Exception:
+        return url
 
-    return (
-        True,
-        False,
-        "此群組未開放「卡片回覆追蹤」權限，請到設定中心勾選「卡片回覆追蹤」。",
-        source_cfg,
+
+def _property_maintenance_datetime_key(value):
+    text = _property_maintenance_safe_text(
+        value
     )
 
-
-try:
-    _line_access_gate_before_quoted_reply_fix = line_access_gate
-
-    def line_access_gate(event):
-        is_quoted, allowed, reason_or_cmd, source_cfg = _teamme_quoted_reply_acl_allowed(event)
-        if is_quoted:
-            return allowed, reason_or_cmd, source_cfg
-        return _line_access_gate_before_quoted_reply_fix(event)
-
-    print(
-        "✅ LINE 回覆追蹤 ACL 已修正：quotedMessageId 優先，不再要求 # 指令",
-        flush=True,
-    )
-except Exception as e:
-    print("⚠️ LINE 回覆追蹤 ACL 修正失敗：", e, flush=True)
-
-
-print("✅ Team M.E LINE Quoted Reply Context Fix 20260707F 載入完成", flush=True)
-# =============================================================================
-# Team M.E LINE Quoted Reply Context Fix End
-# =============================================================================
-
-
-# =============================================================================
-# Team M.E Facebook Marketplace Multi-Account Command Patch 20260707G
-# =============================================================================
-
-FB_MARKETPLACE_UPLOAD_COMMANDS = {
-    "上架FB出售新物件": "fb_marketplace_sell_new_listings",
-    "上架臉書Marketplace出售新物件": "fb_marketplace_sell_new_listings",
-    "上架Marketplace出售新物件": "fb_marketplace_sell_new_listings",
-    "上架FB出租新物件": "fb_marketplace_rent_new_listings",
-    "上架臉書Marketplace出租新物件": "fb_marketplace_rent_new_listings",
-    "上架Marketplace出租新物件": "fb_marketplace_rent_new_listings",
-}
-
-FB_MARKETPLACE_ACCOUNT_STATUS_COMMANDS = {
-    "FB帳號",
-    "FB帳號列表",
-    "Marketplace帳號",
-    "臉書帳號",
-}
-FB_MARKETPLACE_LOGIN_COMMANDS = {
-    "登入FB帳號",
-    "登入Marketplace帳號",
-    "登入臉書帳號",
-}
-FB_MARKETPLACE_RESET_COMMANDS = {
-    "重設FB帳號",
-    "重置FB帳號",
-    "重設Marketplace帳號",
-}
-
-
-def _fb_marketplace_command_body(raw_text: str) -> str:
-    first = str(raw_text or "").strip().splitlines()[0].strip().replace("＃", "#")
-    if first.startswith("#"):
-        first = first[1:].strip()
-    return first
-
-
-def _fb_marketplace_match_prefix(body: str, names):
-    body = str(body or "").strip()
-    for name in sorted(names, key=len, reverse=True):
-        if body == name:
-            return name, ""
-        if body.startswith(name + " "):
-            return name, body[len(name):].strip()
-    return "", ""
-
-
-def _fb_marketplace_parse_tail(tail: str):
-    account_key = ""
-    target_worker = DEFAULT_AUTOMATION_WORKER_ID
-    for token in str(tail or "").split():
-        token = token.strip()
-        if not token:
-            continue
-        if token.startswith("@"):
-            target_worker = token[1:].strip() or target_worker
-        elif not account_key and re.match(r"^[A-Za-z0-9_\-]+$", token):
-            account_key = token.lower()
-    return account_key, target_worker
-
-
-def _fb_marketplace_task_source_target(data):
-    return (
-        data.get("source_group_id")
-        or data.get("line_group_id")
-        or data.get("source_room_id")
-        or data.get("line_room_id")
-        or data.get("line_target_id")
-        or data.get("source_user_id")
-        or data.get("line_user_id")
-        or ""
-    )
-
-
-def _fb_marketplace_find_active_duplicate(task_type, target_worker, source_target_id, account_key):
-    scope = str(account_key or "").strip().lower()
-    for status in ("waiting", "running"):
-        try:
-            docs = list(
-                db.collection(AUTOMATION_TASK_COLLECTION)
-                .where("target_worker", "==", target_worker)
-                .where("status", "==", status)
-                .limit(100)
-                .stream()
-            )
-        except Exception as e:
-            print(f"⚠️ FB Marketplace duplicate 查詢失敗 status={status}: {e}", flush=True)
-            continue
-
-        for doc in docs:
-            data = doc.to_dict() or {}
-            existing_type = data.get("type") or data.get("task_type") or ""
-            if existing_type != task_type:
-                continue
-            if _fb_marketplace_task_source_target(data) != source_target_id:
-                continue
-            existing_account = str(data.get("fb_account_key") or "").strip().lower()
-            if existing_account != scope:
-                continue
-            found = dict(data)
-            found["_deduplicated"] = True
-            found["_dedupe_reason"] = f"active_{status}_fb_account"
-            return doc.id, found
-    return None
-
-
-def _fb_marketplace_create_task(task_type, event, target_worker, command_text, account_key=""):
-    task_type = str(task_type or "").strip()
-    target_worker = str(target_worker or DEFAULT_AUTOMATION_WORKER_ID).strip()
-    account_key = str(account_key or "").strip().lower()
-    sender_name = _automation_sender_name(event)
-    now_iso = now_taipei().isoformat()
-    source_ids = _automation_task_source_ids(event)
-    source_target_id = source_ids.get("line_target_id", "")
-    event_key = _automation_event_dedupe_key(event)
-
-    active = _fb_marketplace_find_active_duplicate(
-        task_type,
-        target_worker,
-        source_target_id,
-        account_key,
-    )
-    if active:
-        return active
-
-    data = {
-        "type": task_type,
-        "task_type": task_type,
-        "status": "waiting",
-        "target_worker": target_worker,
-        "command_text": command_text,
-        "fb_account_key": account_key,
-        "task_scope": f"fb_account:{account_key or '__default__'}",
-        "created_at": now_iso,
-        "updated_at": now_iso,
-        "created_by": sender_name,
-        "webhook_event_id": (event or {}).get("webhookEventId", ""),
-        "line_message_id": ((event or {}).get("message") or {}).get("id", ""),
-        "result_message": "",
-        "error_message": "",
-        "attempt_count": 0,
-        "dedupe_key": event_key,
-    }
-    data.update(source_ids)
-
-    if event_key:
-        doc_id = "line_" + hashlib.sha256(event_key.encode("utf-8")).hexdigest()[:40]
-        doc_ref = db.collection(AUTOMATION_TASK_COLLECTION).document(doc_id)
-
-        @firestore.transactional
-        def txn_create(transaction):
-            fresh = doc_ref.get(transaction=transaction)
-            if fresh.exists:
-                existing = fresh.to_dict() or {}
-                existing["_deduplicated"] = True
-                existing["_dedupe_reason"] = "same_line_event"
-                return existing
-            transaction.set(doc_ref, data)
-            return dict(data)
-
-        returned = txn_create(db.transaction())
-        return doc_ref.id, returned
-
-    doc_ref = db.collection(AUTOMATION_TASK_COLLECTION).document()
-    doc_ref.set(data)
-    return doc_ref.id, data
-
-
-def _fb_marketplace_task_reply(task_id, task_data, title, task_type, target_worker, account_key):
-    deduplicated = bool((task_data or {}).get("_deduplicated"))
-    first_line = (
-        f"♻️ 任務已存在，未重複建立：{title}"
-        if deduplicated
-        else f"✅ 已建立任務：{title}"
-    )
-    account_text = account_key or "本機預設帳號"
-    reply_text = (
-        f"{first_line}\n"
-        f"任務ID：{task_id}\n"
-        f"任務代號：{task_type}\n"
-        f"發文帳號：{account_text}\n"
-        f"指定主機：{target_worker}\n\n"
-        "完成後會由主機 Agent 回傳結果並同步到 test 群組。"
-    )
-
-    result = {
-        "handled": True,
-        "ok": True,
-        "reply_text": reply_text,
-        "parsed_tag": title,
-    }
+    if not text:
+        return 0.0
 
     try:
-        status_text = _automation_live_status_text(
-            target_worker,
-            focus_task_id=task_id,
-            compact=True,
+        normalized = text.replace(
+            "Z",
+            "+00:00",
         )
-        result["reply_messages"] = [
-            {"type": "text", "text": reply_text[:4900]},
-            {"type": "text", "text": status_text[:4900]},
-        ]
+
+        dt = datetime.fromisoformat(
+            normalized
+        )
+
+        return dt.timestamp()
+
     except Exception:
         pass
+
+    try:
+        return float(
+            value
+        )
+
+    except Exception:
+        return 0.0
+
+
+def _property_maintenance_latest_time(data: dict) -> str:
+    candidates = [
+        data.get("updated_at"),
+        data.get("imported_at"),
+        data.get("created_at"),
+    ]
+
+    best = ""
+
+    best_key = 0.0
+
+    for candidate in candidates:
+        key = _property_maintenance_datetime_key(
+            candidate
+        )
+
+        if key >= best_key:
+            best_key = key
+            best = (
+                _property_maintenance_safe_text(
+                    candidate
+                )
+            )
+
+    return best
+
+
+def _property_maintenance_identity_key(
+    data: dict,
+    *,
+    doc_id: str,
+    deal_type: str,
+) -> str:
+    deal_type = (
+        "rent"
+        if deal_type == "rent"
+        else "sale"
+    )
+
+    case_no = _property_maintenance_pick(
+        data,
+        "source_case_no",
+        "raw_物件編號",
+        "物件編號",
+        "編號",
+        "case_id",
+        "id",
+    )
+
+    branch = _property_maintenance_pick(
+        data,
+        "source_branch",
+        "raw_分店代碼",
+        "分店代碼",
+        "branch",
+    )
+
+    if case_no:
+        return "|".join(
+            [
+                deal_type,
+                "case",
+                branch,
+                case_no,
+            ]
+        )
+
+    url = _property_maintenance_normalize_url(
+        _property_maintenance_pick(
+            data,
+            "url",
+            "rakuya_刊登來源網址",
+            "raw_型錄網址",
+            "網址",
+            "連結",
+            "source_url",
+        )
+    )
+
+    if url:
+        return "|".join(
+            [
+                deal_type,
+                "url",
+                url,
+            ]
+        )
+
+    title = _property_maintenance_safe_text(
+        data.get("title")
+        or data.get("案名")
+        or data.get("物件名稱")
+    )
+
+    address = _property_maintenance_safe_text(
+        data.get("address")
+        or data.get("地址")
+    )
+
+    price = (
+        data.get("price_wan")
+        if deal_type == "sale"
+        else data.get("rent_price")
+    )
+
+    price_text = _property_maintenance_safe_text(
+        price
+    )
+
+    if (
+        title
+        and address
+    ):
+        return "|".join(
+            [
+                deal_type,
+                "title_address_price",
+                title,
+                address,
+                price_text,
+            ]
+        )
+
+    # 真的完全沒有足夠識別資訊時，不把不同 doc_id 硬分成同一組。
+    return "|".join(
+        [
+            deal_type,
+            "doc",
+            doc_id,
+        ]
+    )
+
+
+def _property_maintenance_doc_brief(
+    doc_id: str,
+    data: dict,
+) -> dict:
+    return {
+        "id": doc_id,
+        "title": (
+            _property_maintenance_safe_text(
+                data.get("title")
+            )
+            or _property_maintenance_safe_text(
+                data.get("address")
+            )
+            or doc_id
+        ),
+        "area": _property_maintenance_safe_text(
+            data.get("area")
+        ),
+        "updated_at": _property_maintenance_latest_time(
+            data
+        ),
+        "source_file": _property_maintenance_safe_text(
+            data.get("source_file")
+        ),
+        "source_case_no": _property_maintenance_safe_text(
+            data.get("source_case_no")
+        ),
+        "url": _property_maintenance_safe_text(
+            data.get("url")
+        ),
+    }
+
+
+def _property_maintenance_latest_import_log(
+    deal_type: str,
+) -> dict:
+    deal_type = (
+        "rent"
+        if deal_type == "rent"
+        else "sale"
+    )
+
+    logs = []
+
+    try:
+        for doc in (
+            db.collection(
+                PROPERTY_IMPORT_LOG_COLLECTION
+            )
+            .where(
+                "deal_type",
+                "==",
+                deal_type,
+            )
+            .limit(80)
+            .stream()
+        ):
+            data = doc.to_dict() or {}
+            data["id"] = doc.id
+            logs.append(
+                data
+            )
+
+    except Exception:
+        return {}
+
+    if not logs:
+        return {}
+
+    def key(item):
+        return max(
+            _property_maintenance_datetime_key(
+                item.get("created_at")
+            ),
+            _property_maintenance_datetime_key(
+                item.get("imported_at")
+            ),
+            _property_maintenance_datetime_key(
+                item.get("uploaded_at")
+            ),
+        )
+
+    logs.sort(
+        key=key,
+        reverse=True,
+    )
+
+    latest = logs[0]
+
+    return {
+        "id": latest.get("id") or "",
+        "file_name": latest.get("file_name") or "",
+        "imported_count": latest.get("imported_count") or 0,
+        "total_count": latest.get("total_count") or 0,
+        "skipped_count": latest.get("skipped_count") or 0,
+        "created_at": (
+            latest.get("created_at")
+            or latest.get("imported_at")
+            or latest.get("uploaded_at")
+            or ""
+        ),
+    }
+
+
+def _property_maintenance_scan_deal_type(
+    deal_type: str,
+) -> dict:
+    deal_type = (
+        "rent"
+        if deal_type == "rent"
+        else "sale"
+    )
+
+    total_count = 0
+    active_count = 0
+    inactive_count = 0
+    latest_doc = {}
+    latest_key = 0.0
+    duplicate_groups = 0
+    duplicate_old_active_count = 0
+    groups = {}
+    truncated = False
+
+    try:
+        stream = (
+            db.collection(
+                PROPERTY_LIBRARY_COLLECTION
+            )
+            .where(
+                "deal_type",
+                "==",
+                deal_type,
+            )
+            .limit(
+                PROPERTY_MAINTENANCE_MAX_DOCS
+            )
+            .stream()
+        )
+
+        for doc in stream:
+            total_count += 1
+
+            data = doc.to_dict() or {}
+
+            is_active = (
+                data.get("active")
+                is not False
+            )
+
+            if is_active:
+                active_count += 1
+
+            else:
+                inactive_count += 1
+
+            latest_text = _property_maintenance_latest_time(
+                data
+            )
+
+            latest_time_key = (
+                _property_maintenance_datetime_key(
+                    latest_text
+                )
+            )
+
+            if latest_time_key >= latest_key:
+                latest_key = latest_time_key
+                latest_doc = _property_maintenance_doc_brief(
+                    doc.id,
+                    data,
+                )
+
+            if is_active:
+                identity_key = (
+                    _property_maintenance_identity_key(
+                        data,
+                        doc_id=doc.id,
+                        deal_type=deal_type,
+                    )
+                )
+
+                groups.setdefault(
+                    identity_key,
+                    []
+                ).append(
+                    {
+                        "doc_id": doc.id,
+                        "data": data,
+                        "latest_key": latest_time_key,
+                    }
+                )
+
+        if total_count >= PROPERTY_MAINTENANCE_MAX_DOCS:
+            truncated = True
+
+    except Exception as exc:
+        return {
+            "deal_type": deal_type,
+            "error": str(exc),
+            "total_count": 0,
+            "active_count": 0,
+            "inactive_count": 0,
+            "duplicate_groups": 0,
+            "duplicate_old_active_count": 0,
+            "latest_doc": {},
+            "latest_import_log": {},
+            "truncated": False,
+        }
+
+    for group_items in groups.values():
+        if len(group_items) > 1:
+            duplicate_groups += 1
+            duplicate_old_active_count += (
+                len(group_items)
+                - 1
+            )
+
+    latest_import_log = (
+        _property_maintenance_latest_import_log(
+            deal_type
+        )
+    )
+
+    return {
+        "deal_type": deal_type,
+        "label": (
+            "出租"
+            if deal_type == "rent"
+            else "出售"
+        ),
+        "total_count": total_count,
+        "active_count": active_count,
+        "inactive_count": inactive_count,
+        "duplicate_groups": duplicate_groups,
+        "duplicate_old_active_count": (
+            duplicate_old_active_count
+        ),
+        "latest_doc": latest_doc,
+        "latest_updated_at": (
+            latest_doc.get("updated_at")
+            or latest_import_log.get("created_at")
+            or ""
+        ),
+        "latest_import_log": (
+            latest_import_log
+        ),
+        "truncated": truncated,
+        "error": "",
+    }
+
+
+def get_property_library_status():
+    generated_at = now_taipei().isoformat()
+
+    sale = (
+        _property_maintenance_scan_deal_type(
+            "sale"
+        )
+    )
+
+    rent = (
+        _property_maintenance_scan_deal_type(
+            "rent"
+        )
+    )
+
+    return {
+        "generated_at": generated_at,
+        "sale": sale,
+        "rent": rent,
+        "total_active": (
+            int(sale.get("active_count") or 0)
+            + int(rent.get("active_count") or 0)
+        ),
+        "total_duplicates": (
+            int(
+                sale.get(
+                    "duplicate_old_active_count"
+                )
+                or 0
+            )
+            + int(
+                rent.get(
+                    "duplicate_old_active_count"
+                )
+                or 0
+            )
+        ),
+    }
+
+
+def cleanup_duplicate_properties_keep_latest(
+    deal_type: str = "",
+) -> dict:
+    target_deal_types = (
+        [
+            "sale",
+            "rent",
+        ]
+        if not deal_type
+        else [
+            (
+                "rent"
+                if deal_type == "rent"
+                else "sale"
+            )
+        ]
+    )
+
+    now_iso = now_taipei().isoformat()
+
+    result = {
+        "processed_groups": 0,
+        "archived_docs": 0,
+        "kept_docs": 0,
+        "by_type": {},
+        "errors": [],
+        "ran_at": now_iso,
+    }
+
+    batch = db.batch()
+
+    batch_count = 0
+
+    def commit_if_needed(
+        *,
+        force=False,
+    ):
+        nonlocal batch
+        nonlocal batch_count
+
+        if batch_count and (
+            force
+            or batch_count >= 400
+        ):
+            batch.commit()
+            batch = db.batch()
+            batch_count = 0
+
+    try:
+        for deal in target_deal_types:
+            groups = {}
+
+            for doc in (
+                db.collection(
+                    PROPERTY_LIBRARY_COLLECTION
+                )
+                .where(
+                    "deal_type",
+                    "==",
+                    deal,
+                )
+                .limit(
+                    PROPERTY_MAINTENANCE_MAX_DOCS
+                )
+                .stream()
+            ):
+                data = doc.to_dict() or {}
+
+                if data.get("active") is False:
+                    continue
+
+                identity_key = (
+                    _property_maintenance_identity_key(
+                        data,
+                        doc_id=doc.id,
+                        deal_type=deal,
+                    )
+                )
+
+                groups.setdefault(
+                    identity_key,
+                    []
+                ).append(
+                    {
+                        "doc_id": doc.id,
+                        "data": data,
+                        "latest_key": (
+                            _property_maintenance_datetime_key(
+                                _property_maintenance_latest_time(
+                                    data
+                                )
+                            )
+                        ),
+                    }
+                )
+
+            type_archived = 0
+            type_groups = 0
+            type_kept = 0
+
+            for identity_key, items in groups.items():
+                if len(items) <= 1:
+                    continue
+
+                items.sort(
+                    key=lambda item: (
+                        item.get(
+                            "latest_key"
+                        )
+                        or 0,
+                        item.get(
+                            "doc_id"
+                        )
+                        or "",
+                    ),
+                    reverse=True,
+                )
+
+                keep = items[0]
+                duplicates = items[1:]
+
+                type_groups += 1
+                type_kept += 1
+
+                for duplicate in duplicates:
+                    doc_id = duplicate.get(
+                        "doc_id"
+                    )
+
+                    ref = (
+                        db.collection(
+                            PROPERTY_LIBRARY_COLLECTION
+                        )
+                        .document(
+                            doc_id
+                        )
+                    )
+
+                    batch.update(
+                        ref,
+                        {
+                            "active": False,
+                            "duplicate_archived": True,
+                            "duplicate_of": (
+                                keep.get(
+                                    "doc_id"
+                                )
+                            ),
+                            "duplicate_key": (
+                                identity_key
+                            ),
+                            "duplicate_archived_at": (
+                                now_iso
+                            ),
+                            "duplicate_archive_reason": (
+                                "keep_latest_version"
+                            ),
+                            "updated_at": now_iso,
+                        },
+                    )
+
+                    batch_count += 1
+                    type_archived += 1
+
+                    commit_if_needed()
+
+            commit_if_needed(
+                force=True
+            )
+
+            result["by_type"][deal] = {
+                "groups": type_groups,
+                "kept": type_kept,
+                "archived": type_archived,
+            }
+
+            result["processed_groups"] += (
+                type_groups
+            )
+
+            result["kept_docs"] += type_kept
+            result["archived_docs"] += (
+                type_archived
+            )
+
+        try:
+            if "clear_ai_property_memory_cache" in globals():
+                clear_ai_property_memory_cache("")
+        except Exception as exc:
+            result["errors"].append(
+                f"清除 AI 物件快取失敗：{exc}"
+            )
+
+        try:
+            db.collection(
+                PROPERTY_MAINTENANCE_LOG_COLLECTION
+            ).add(
+                {
+                    "action": (
+                        "archive_duplicates_keep_latest"
+                    ),
+                    "result": result,
+                    "created_at": now_iso,
+                    "created_by_id": (
+                        session.get("user_id")
+                        if "session" in globals()
+                        else ""
+                    ),
+                    "created_by_name": (
+                        session.get("user_name")
+                        if "session" in globals()
+                        else ""
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            result["errors"].append(
+                f"寫入清理紀錄失敗：{exc}"
+            )
+
+    except Exception as exc:
+        result["errors"].append(
+            str(exc)
+        )
+
     return result
 
 
-def process_fb_marketplace_multi_account_command(event):
-    message = (event or {}).get("message") or {}
-    if message.get("type") != "text":
-        return {"handled": False}
+_PROPERTY_LIBRARY_STATUS_NAV = (
+    '<a class="list-group-item list-group-item-action" '
+    'href="#property-library">物件庫狀態</a>'
+)
 
-    raw_text = str(message.get("text") or "").strip()
-    if not raw_text:
-        return {"handled": False}
+_PROPERTY_LIBRARY_STATUS_CARD = """
+        <div id="property-library" class="setting-card p-4 mb-4">
+          <div class="d-flex justify-content-between align-items-start gap-3 flex-wrap">
+            <div>
+              <h5 class="mb-1">Firebase 物件庫狀態</h5>
+              <div class="hint">統計 Firestore <span class="code">properties</span> 出售 / 出租 active 資料，並偵測重複物件。清理時只停用舊版，不會硬刪文件。</div>
+            </div>
+            <div class="text-end small text-muted">
+              更新時間<br>{{ property_status.generated_at or "-" }}
+            </div>
+          </div>
 
-    body = _fb_marketplace_command_body(raw_text)
+          <div class="row g-3 mt-2">
+            {% for key in ["sale", "rent"] %}
+              {% set s = property_status[key] %}
+              <div class="col-md-6">
+                <div class="border rounded-4 p-3 bg-light h-100">
+                  <div class="d-flex justify-content-between align-items-center">
+                    <h6 class="mb-0">{{ s.label }}</h6>
+                    {% if s.error %}<span class="badge text-bg-danger">讀取失敗</span>{% elif s.duplicate_old_active_count %}<span class="badge text-bg-warning">有重複</span>{% else %}<span class="badge text-bg-success">正常</span>{% endif %}
+                  </div>
+                  {% if s.error %}
+                    <div class="text-danger small mt-2">{{ s.error }}</div>
+                  {% else %}
+                    <div class="row g-2 mt-2 small">
+                      <div class="col-6"><div class="text-muted">Active 筆數</div><div class="fs-5 fw-bold">{{ s.active_count }}</div></div>
+                      <div class="col-6"><div class="text-muted">總文件數</div><div class="fs-5 fw-bold">{{ s.total_count }}</div></div>
+                      <div class="col-6"><div class="text-muted">重複組數</div><div class="fs-5 fw-bold">{{ s.duplicate_groups }}</div></div>
+                      <div class="col-6"><div class="text-muted">可停用舊版</div><div class="fs-5 fw-bold">{{ s.duplicate_old_active_count }}</div></div>
+                    </div>
+                    <div class="mt-3 small">
+                      <div class="text-muted">最新物件更新</div>
+                      <div class="fw-bold">{{ s.latest_updated_at or "-" }}</div>
+                      <div class="text-truncate">{{ s.latest_doc.title or "-" }}</div>
+                    </div>
+                    <div class="mt-2 small">
+                      <div class="text-muted">最新 CSV 匯入</div>
+                      <div>{{ s.latest_import_log.created_at or "-" }}</div>
+                      <div class="text-truncate">{{ s.latest_import_log.file_name or "-" }}</div>
+                      {% if s.latest_import_log.imported_count is defined %}
+                        <div class="text-muted">匯入/更新 {{ s.latest_import_log.imported_count or 0 }} 筆｜CSV {{ s.latest_import_log.total_count or 0 }} 列</div>
+                      {% endif %}
+                    </div>
+                    {% if s.truncated %}
+                      <div class="alert alert-warning py-1 px-2 small mt-2 mb-0">資料超過 {{ PROPERTY_MAINTENANCE_MAX_DOCS }} 筆，統計可能只包含前段資料。</div>
+                    {% endif %}
+                  {% endif %}
+                </div>
+              </div>
+            {% endfor %}
+          </div>
 
-    command, tail = _fb_marketplace_match_prefix(
-        body,
-        FB_MARKETPLACE_ACCOUNT_STATUS_COMMANDS,
-    )
-    if command:
-        account_key, target_worker = _fb_marketplace_parse_tail(tail)
-        task_id, task_data = _fb_marketplace_create_task(
-            "fb_marketplace_accounts_status",
-            event,
-            target_worker,
-            raw_text,
-            account_key="",
+          <div class="d-flex gap-2 mt-3 flex-wrap">
+            <button class="btn btn-outline-secondary" type="submit" name="_property_maintenance_action" value="refresh_property_status">重新整理統計</button>
+            <button class="btn btn-warning" type="submit" name="_property_maintenance_action" value="archive_duplicate_properties" onclick="return confirm('確定要停用重複舊版物件？系統會只保留每組最新版本 active=True，舊版會改成 active=False，不會硬刪。')">停用重複舊版，只保留最新</button>
+          </div>
+          <div class="hint mt-2">
+            重複判斷優先順序：物件編號＋分店代碼 → 物件網址 → 案名＋地址＋價格。保留版本依 updated_at / imported_at / created_at 最新者。
+          </div>
+        </div>
+"""
+
+try:
+    if _PROPERTY_LIBRARY_STATUS_NAV not in LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX:
+        LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX = LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX.replace(
+            '<a class="list-group-item list-group-item-action" href="#rules">權限規則</a>',
+            _PROPERTY_LIBRARY_STATUS_NAV + '\n        <a class="list-group-item list-group-item-action" href="#rules">權限規則</a>',
         )
-        return _fb_marketplace_task_reply(
-            task_id,
-            task_data,
-            "查詢 Facebook Marketplace 帳號",
-            "fb_marketplace_accounts_status",
-            target_worker,
+
+    if 'id="property-library"' not in LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX:
+        LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX = LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX.replace(
+            '        <div id="rules" class="setting-card p-4 mb-4">',
+            _PROPERTY_LIBRARY_STATUS_CARD + '\n        <div id="rules" class="setting-card p-4 mb-4">',
+        )
+
+except Exception as exc:
+    print("⚠️ 設定中心加入物件庫狀態區塊失敗：", exc)
+
+
+def line_card_settings_center_with_property_library_status():
+    if request.method == "POST" and request.form.get("admin_login") == "1":
+        if _settings_admin_password_ok(
+            request.form.get(
+                "admin_password",
+                "",
+            )
+        ):
+            session[
+                LINE_SETTINGS_ADMIN_SESSION_KEY
+            ] = True
+            flash(
+                "已進入設定中心",
+                "success",
+            )
+            return redirect(
+                url_for(
+                    "line_card_settings"
+                )
+            )
+
+        flash(
+            "管理員密碼錯誤",
+            "danger",
+        )
+
+        return render_template_string(
+            LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE
+        )
+
+    if not session.get(
+        LINE_SETTINGS_ADMIN_SESSION_KEY
+    ):
+        return render_template_string(
+            LINE_SETTINGS_ADMIN_LOGIN_TEMPLATE
+        )
+
+    if request.method == "POST":
+        action = request.form.get(
+            "_property_maintenance_action",
             "",
         )
 
-    command, tail = _fb_marketplace_match_prefix(
-        body,
-        FB_MARKETPLACE_LOGIN_COMMANDS,
-    )
-    if command:
-        account_key, target_worker = _fb_marketplace_parse_tail(tail)
-        task_id, task_data = _fb_marketplace_create_task(
-            "fb_marketplace_login_account",
-            event,
-            target_worker,
-            raw_text,
-            account_key=account_key,
-        )
-        return _fb_marketplace_task_reply(
-            task_id,
-            task_data,
-            "登入 Facebook Marketplace 帳號",
-            "fb_marketplace_login_account",
-            target_worker,
-            account_key,
-        )
-
-    command, tail = _fb_marketplace_match_prefix(
-        body,
-        FB_MARKETPLACE_RESET_COMMANDS,
-    )
-    if command:
-        account_key, target_worker = _fb_marketplace_parse_tail(tail)
-        if not account_key:
-            return {
-                "handled": True,
-                "ok": False,
-                "reply_text": "重設帳號必須明確指定代號。\n例如：#重設FB帳號 ellen",
-                "parsed_tag": "重設FB帳號",
-            }
-        task_id, task_data = _fb_marketplace_create_task(
-            "fb_marketplace_reset_account",
-            event,
-            target_worker,
-            raw_text,
-            account_key=account_key,
-        )
-        return _fb_marketplace_task_reply(
-            task_id,
-            task_data,
-            "重設 Facebook Marketplace 帳號",
-            "fb_marketplace_reset_account",
-            target_worker,
-            account_key,
-        )
-
-    command, tail = _fb_marketplace_match_prefix(
-        body,
-        FB_MARKETPLACE_UPLOAD_COMMANDS.keys(),
-    )
-    if command:
-        account_key, target_worker = _fb_marketplace_parse_tail(tail)
-        task_type = FB_MARKETPLACE_UPLOAD_COMMANDS[command]
-        task_id, task_data = _fb_marketplace_create_task(
-            task_type,
-            event,
-            target_worker,
-            raw_text,
-            account_key=account_key,
-        )
-        return _fb_marketplace_task_reply(
-            task_id,
-            task_data,
-            command,
-            task_type,
-            target_worker,
-            account_key,
-        )
-
-    return {"handled": False}
-
-
-try:
-    _detect_line_command_type_before_fb_multi_account = detect_line_command_type
-
-    def detect_line_command_type(text: str, event=None):
-        raw = str(text or "").strip().replace("＃", "#")
-        if raw.startswith("#"):
-            body = _fb_marketplace_command_body(raw)
-            all_names = (
-                set(FB_MARKETPLACE_UPLOAD_COMMANDS.keys())
-                | FB_MARKETPLACE_ACCOUNT_STATUS_COMMANDS
-                | FB_MARKETPLACE_LOGIN_COMMANDS
-                | FB_MARKETPLACE_RESET_COMMANDS
+        if action == "refresh_property_status":
+            flash(
+                "已重新整理物件庫統計",
+                "info",
             )
-            command, _ = _fb_marketplace_match_prefix(body, all_names)
-            if command:
-                return "automation"
-        try:
-            return _detect_line_command_type_before_fb_multi_account(text, event=event)
-        except TypeError:
-            return _detect_line_command_type_before_fb_multi_account(text)
 
-    print("✅ FB Marketplace 多帳號指令已納入 automation 權限辨識", flush=True)
-except Exception as e:
-    print("⚠️ FB Marketplace 多帳號 detect patch 失敗：", e, flush=True)
+            return redirect(
+                url_for(
+                    "line_card_settings"
+                )
+            )
+
+        if action == "archive_duplicate_properties":
+            result = (
+                cleanup_duplicate_properties_keep_latest()
+            )
+
+            if result.get("errors"):
+                flash(
+                    "物件庫重複清理完成，但有部分警告："
+                    + "；".join(
+                        result.get(
+                            "errors"
+                        )
+                        [:3]
+                    ),
+                    "warning",
+                )
+
+            else:
+                flash(
+                    "物件庫重複清理完成："
+                    f"處理 {result.get('processed_groups', 0)} 組，"
+                    f"停用舊版 {result.get('archived_docs', 0)} 筆。",
+                    "success",
+                )
+
+            return redirect(
+                url_for(
+                    "line_card_settings"
+                )
+            )
+
+        try:
+            save_line_settings_center_from_form(
+                request.form
+            )
+
+            flash(
+                "設定已更新",
+                "success",
+            )
+
+        except Exception as exc:
+            flash(
+                f"設定儲存失敗：{exc}",
+                "danger",
+            )
+
+        return redirect(
+            url_for(
+                "line_card_settings"
+            )
+        )
+
+    settings = get_line_card_settings()
+
+    group_rows = list(
+        get_line_group_settings()
+    )
+
+    while len(group_rows) < 8:
+        group_rows.append(
+            {
+                "enabled": False,
+                "name": "",
+                "target_id": "",
+                "receive_types": [],
+                "command_types": [],
+                "view_types": [
+                    "buyer",
+                    "seller",
+                    "development",
+                    "calendar",
+                    "todo",
+                ],
+                "visibility_scope": (
+                    "public_only"
+                ),
+                "note": "",
+            }
+        )
+
+    personal_user_rows = list(
+        get_line_personal_users(
+            include_disabled=True
+        )
+    )
+
+    while len(personal_user_rows) < max(
+        10,
+        LINE_PERSONAL_USER_COUNT_DEFAULT
+        if "LINE_PERSONAL_USER_COUNT_DEFAULT" in globals()
+        else 8,
+    ):
+        personal_user_rows.append(
+            {
+                "enabled": False,
+                "name": "",
+                "user_id": "",
+                "receive_types": [
+                    "calendar"
+                ],
+                "command_types": [
+                    "calendar",
+                    "todo",
+                    "followup",
+                ],
+                "view_types": [
+                    "buyer",
+                    "seller",
+                    "development",
+                    "calendar",
+                    "todo",
+                ],
+                "visibility_scope": (
+                    "public_and_own"
+                ),
+                "note": "",
+            }
+        )
+
+    property_status = (
+        get_property_library_status()
+    )
+
+    return render_template_string(
+        LINE_SETTINGS_CENTER_TEMPLATE_PERMISSION_MATRIX,
+        settings=settings,
+        group_rows=group_rows,
+        personal_user_rows=personal_user_rows,
+        receive_options=LINE_RECEIVE_TYPE_OPTIONS,
+        command_options=LINE_COMMAND_TYPE_OPTIONS,
+        view_options=LINE_VIEW_TYPE_OPTIONS,
+        visibility_scope_options=LINE_VISIBILITY_SCOPE_OPTIONS,
+        quick_actions_text="\n".join(
+            settings.get("quick_actions")
+            or []
+        ),
+        calendar_categories_text="\n".join(
+            get_calendar_category_options()
+        ),
+        property_status=property_status,
+        PROPERTY_MAINTENANCE_MAX_DOCS=(
+            PROPERTY_MAINTENANCE_MAX_DOCS
+        ),
+    )
 
 
 try:
-    _process_line_message_event_before_fb_multi_account = process_line_message_event
-
-    def process_line_message_event(event):
-        fb_result = process_fb_marketplace_multi_account_command(event)
-        if fb_result.get("handled"):
-            return fb_result
-        return _process_line_message_event_before_fb_multi_account(event)
+    app.view_functions["line_card_settings"] = login_required(
+        line_card_settings_center_with_property_library_status
+    )
 
     print(
-        "✅ FB Marketplace 多帳號 LINE 指令已啟用："
-        "#FB帳號 / #登入FB帳號 / #重設FB帳號 / 上架指令+帳號代號",
-        flush=True,
+        "✅ 設定中心已加入 Firebase 物件庫狀態與重複清理"
     )
-except Exception as e:
-    print("⚠️ FB Marketplace 多帳號 process patch 失敗：", e, flush=True)
 
+except Exception as exc:
+    print(
+        "⚠️ 設定中心物件庫狀態套用失敗：",
+        exc,
+    )
 
-print("✅ Team M.E Facebook Marketplace Multi-Account Patch 20260707G 載入完成", flush=True)
 # =============================================================================
-# Team M.E Facebook Marketplace Multi-Account Command Patch End
+# Firebase 物件庫狀態 / 重複清理 Patch End
 # =============================================================================
 
