@@ -22411,11 +22411,7 @@ except Exception as e:
 # =============================================================================
 
 
-if __name__ == "__main__":
-    print("✅ FULL_READY_20260621 已載入")
-    print("✅ /line-card-preview 已註冊：", any(rule.rule == "/line-card-preview" for rule in app.url_map.iter_rules()))
-    print("✅ 可用 /debug/routes 檢查目前所有 route")
-    app.run(debug=True)
+# app.run 已移到檔案最底部，確保後續所有 Patch / Route 都先載入。
 
 
 
@@ -31187,4 +31183,522 @@ except Exception as exc:
 # =============================================================================
 # LINE 客戶備註 / 追蹤防重複寫入 Patch End
 # =============================================================================
+
+# =============================================================================
+# Team M.E LINE 房產助理整合 v5.4
+# 功能：
+# 1. 直接貼樂屋 / 591 網址 -> team_me_line_tasks/url_lookup
+# 2. 直接貼台中市地址 -> team_me_line_tasks/address_lookup
+# 3. #房產狀態 / #更新實價 / #重配座標 / #房產最近 / #房產設定
+# 4. 支援 LINE Flex postback：確認戶別、查本戶歷史、附近行情
+# 5. 設定中心新增「房產查詢」權限；更新資料庫類指令仍要求 automation 權限
+# 6. /result/<token> 顯示完整查詢結果
+# 注意：房產解析與實價資料庫仍在 ELLEN-PC 本機執行，Render 只建立任務。
+# =============================================================================
+
+TEAMME_PROPERTY_TASK_COLLECTION = os.environ.get(
+    "TEAMME_PROPERTY_TASK_COLLECTION",
+    "team_me_line_tasks",
+).strip() or "team_me_line_tasks"
+
+TEAMME_PROPERTY_RESULT_COLLECTION = os.environ.get(
+    "TEAMME_PROPERTY_RESULT_COLLECTION",
+    "team_me_line_results",
+).strip() or "team_me_line_results"
+
+TEAMME_PROPERTY_COMMAND_TYPE = "property_lookup"
+TEAMME_PROPERTY_DEFAULT_WORKER = (
+    os.environ.get("DEFAULT_AUTOMATION_WORKER_ID", "ELLEN-PC").strip()
+    or "ELLEN-PC"
+)
+
+try:
+    if isinstance(LINE_COMMAND_TYPE_OPTIONS, list):
+        if not any(str(item[0]) == TEAMME_PROPERTY_COMMAND_TYPE for item in LINE_COMMAND_TYPE_OPTIONS):
+            LINE_COMMAND_TYPE_OPTIONS.append((
+                TEAMME_PROPERTY_COMMAND_TYPE,
+                "房產查詢：直接貼台中地址、樂屋網址、591網址、#房產狀態",
+            ))
+except Exception as exc:
+    print("⚠️ 房產查詢權限選項加入失敗：", exc)
+
+_TEAMME_PROPERTY_LISTING_URL_RE = re.compile(
+    r"https?://[^\s<>]*(?:rakuya\.com\.tw|591\.com\.tw)[^\s<>]*",
+    re.I,
+)
+
+_TEAMME_PROPERTY_TAICHUNG_ADDRESS_RE = re.compile(
+    r"(?:台|臺)中市"
+    r"(?:中區|東區|南區|西區|北區|西屯區|南屯區|北屯區|豐原區|東勢區|大甲區|清水區|沙鹿區|梧棲區|后里區|神岡區|潭子區|大雅區|新社區|石岡區|外埔區|大安區|烏日區|大肚區|龍井區|霧峰區|太平區|大里區|和平區)"
+    r"[^\n，。；]{1,80}(?:路|街|大道|巷|弄|號)[^\n，。；]{0,40}",
+    re.I,
+)
+
+_TEAMME_PROPERTY_POSTBACK_COMMANDS = {
+    "confirm",
+    "history",
+    "nearby",
+    "more",
+}
+
+
+def _teamme_property_now_iso():
+    try:
+        return now_taipei().isoformat()
+    except Exception:
+        return datetime.now().isoformat()
+
+
+def _teamme_property_parse_text(raw_text):
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+
+    url_match = _TEAMME_PROPERTY_LISTING_URL_RE.search(text)
+    if url_match:
+        return {
+            "command": "url_lookup",
+            "payload": {"url": url_match.group(0).rstrip('.,，。')},
+            "reply_text": "🔎 已收到房產網址，正在由 ELLEN-PC 解析並比對實價候選。",
+            "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+        }
+
+    normalized = text.replace("＃", "#").strip()
+    first_line = normalized.splitlines()[0].strip()
+    body = first_line[1:].strip() if first_line.startswith("#") else first_line
+    compact = re.sub(r"\s+", "", body)
+
+    if compact in {"房產說明", "查房產說明", "查房產", "房產查詢"}:
+        return {
+            "command": "help",
+            "payload": {},
+            "reply_text": "",
+            "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+        }
+    if compact in {"房產狀態", "實價狀態", "資料庫狀態"}:
+        return {
+            "command": "db_status",
+            "payload": {},
+            "reply_text": "📊 正在讀取房產資料庫狀態。",
+            "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+        }
+    if compact in {"更新實價", "更新實價登錄", "更新實價登陸"}:
+        return {
+            "command": "update_database",
+            "payload": {},
+            "reply_text": "🛠 已建立實價資料庫更新任務。",
+            "permission": "automation",
+        }
+    if compact in {"重配座標", "重新配對座標", "更新座標"}:
+        return {
+            "command": "rematch_coordinates",
+            "payload": {},
+            "reply_text": "🧭 已建立成交座標重新配對任務。",
+            "permission": "automation",
+        }
+    if compact in {"房產最近", "最近房產查詢"}:
+        return {
+            "command": "recent",
+            "payload": {},
+            "reply_text": "🕘 正在讀取最近房產查詢。",
+            "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+        }
+
+    setting_match = re.match(
+        r"^#?房產設定\s+(\d+)\s+(\d+)\s+(.+)$",
+        text,
+        re.I,
+    )
+    if setting_match:
+        return {
+            "command": "settings",
+            "payload": {
+                "radius": int(setting_match.group(1)),
+                "years": int(setting_match.group(2)),
+                "category": setting_match.group(3).strip(),
+            },
+            "reply_text": "⚙️ 正在更新房產查詢設定。",
+            "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+        }
+
+    address_match = _TEAMME_PROPERTY_TAICHUNG_ADDRESS_RE.search(text)
+    if address_match:
+        return {
+            "command": "address_lookup",
+            "payload": {"address": address_match.group(0).strip()},
+            "reply_text": "📍 已收到地址，正在查詢本戶成交與附近行情。",
+            "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+        }
+
+    return None
+
+
+def _teamme_property_parse_postback(event):
+    if (event or {}).get("type") != "postback":
+        return None
+    raw = str(((event or {}).get("postback") or {}).get("data") or "").strip()
+    if not raw:
+        return None
+    try:
+        from urllib.parse import parse_qs
+        query = parse_qs(raw, keep_blank_values=True)
+    except Exception:
+        return None
+
+    command = str((query.get("cmd") or [""])[0]).strip()
+    if command not in _TEAMME_PROPERTY_POSTBACK_COMMANDS:
+        return None
+
+    payload = {}
+    for key, values in query.items():
+        if key == "cmd" or not values:
+            continue
+        value = values[0]
+        if key in {"rank", "radius", "years"}:
+            try:
+                value = int(value)
+            except Exception:
+                pass
+        payload[key] = value
+
+    return {
+        "command": command,
+        "payload": payload,
+        "reply_text": "🏠 已收到房產操作，正在處理。",
+        "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+    }
+
+
+def _teamme_property_source(event):
+    source = (event or {}).get("source") or {}
+    group_id = str(source.get("groupId") or "")
+    room_id = str(source.get("roomId") or "")
+    user_id = str(source.get("userId") or "")
+    target_id = group_id or room_id or user_id
+    return {
+        "type": str(source.get("type") or ("group" if group_id else "room" if room_id else "user")),
+        "target_id": target_id,
+        "user_id": user_id,
+        "group_id": group_id,
+        "room_id": room_id,
+    }
+
+
+def _teamme_property_task_id(event, command, payload):
+    event_id = str((event or {}).get("webhookEventId") or "").strip()
+    message_id = str((((event or {}).get("message") or {}).get("id") or "")).strip()
+    postback_data = str((((event or {}).get("postback") or {}).get("data") or "")).strip()
+    seed = event_id or message_id or postback_data or json.dumps(
+        {"command": command, "payload": payload},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return "property_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:40]
+
+
+def _teamme_property_create_task(event, command, payload):
+    task_id = _teamme_property_task_id(event, command, payload)
+    source = _teamme_property_source(event)
+    now_iso = _teamme_property_now_iso()
+    data = {
+        "task_id": task_id,
+        "command": command,
+        "payload": payload or {},
+        "source": source,
+        "target_worker": TEAMME_PROPERTY_DEFAULT_WORKER,
+        "status": "queued",
+        "event": {
+            "type": (event or {}).get("type"),
+            "timestamp": (event or {}).get("timestamp"),
+            "webhookEventId": (event or {}).get("webhookEventId") or "",
+        },
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    ref = db.collection(TEAMME_PROPERTY_TASK_COLLECTION).document(task_id)
+    try:
+        ref.create(data)
+    except Exception as exc:
+        if exc.__class__.__name__ not in {"AlreadyExists", "Conflict"}:
+            raise
+    return task_id
+
+
+def _teamme_property_source_config(event):
+    try:
+        kind, target_id = line_event_source_kind_and_id(event)
+    except Exception:
+        source = _teamme_property_source(event)
+        kind = source.get("type") or "user"
+        target_id = source.get("target_id") or ""
+
+    config = None
+    try:
+        if kind in {"group", "room"}:
+            config = find_line_group_by_target_id(target_id)
+        elif kind == "user" and "find_line_personal_user_by_user_id" in globals():
+            config = find_line_personal_user_by_user_id(target_id)
+    except Exception as exc:
+        print("⚠️ 房產查詢來源權限讀取失敗：", exc)
+        config = None
+    return kind, target_id, config
+
+
+def _teamme_property_access_gate(event, parsed):
+    kind, target_id, config = _teamme_property_source_config(event)
+    if not config or not config.get("enabled"):
+        return False, (
+            "未授權：此 LINE 來源尚未在後台設定。\n"
+            f"ID：{target_id or '-'}\n"
+            "請到設定中心加入此群組／個人帳號，並勾選「房產查詢」。"
+        ), config
+
+    allowed = set(config.get("command_types") or [])
+    required = parsed.get("permission") or TEAMME_PROPERTY_COMMAND_TYPE
+
+    if "all" in allowed:
+        return True, required, config
+
+    if required == "automation":
+        if "automation" in allowed:
+            return True, required, config
+        return False, "此來源未開放自動化任務權限，不能更新實價或重配座標。", config
+
+    # 舊設定若已開 automation，也先允許房產查詢，避免部署後立刻不能使用。
+    if TEAMME_PROPERTY_COMMAND_TYPE in allowed or "automation" in allowed:
+        return True, TEAMME_PROPERTY_COMMAND_TYPE, config
+
+    return False, "此來源未開放「房產查詢」權限，請到設定中心勾選。", config
+
+
+def _teamme_property_help_text():
+    return (
+        "🏠 Team M.E 房產助理\n"
+        "直接貼：\n"
+        "• 台中市完整地址或道路\n"
+        "• 樂屋網址\n"
+        "• 591網址\n\n"
+        "指令：\n"
+        "#房產狀態\n"
+        "#房產最近\n"
+        "#房產設定 500 5 全部\n"
+        "#更新實價（需自動化權限）\n"
+        "#重配座標（需自動化權限）"
+    )
+
+
+def _teamme_property_handle_parsed(event, parsed):
+    command = parsed.get("command") or ""
+    if command == "help":
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": _teamme_property_help_text(),
+            "parsed_tag": "房產說明",
+        }
+
+    task_id = _teamme_property_create_task(
+        event,
+        command,
+        parsed.get("payload") or {},
+    )
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": (
+            f"{parsed.get('reply_text') or '🏠 已建立房產任務。'}\n"
+            f"任務：{task_id[:12]}\n"
+            f"主機：{TEAMME_PROPERTY_DEFAULT_WORKER}"
+        ),
+        "parsed_tag": f"房產/{command}",
+    }
+
+
+# 指令類型辨識：讓設定中心與權限系統知道這是房產查詢。
+try:
+    _TEAMME_PROPERTY_DETECT_BASE = detect_line_command_type
+
+    def detect_line_command_type(text, event=None):
+        parsed = _teamme_property_parse_text(text)
+        if parsed:
+            return parsed.get("permission") or TEAMME_PROPERTY_COMMAND_TYPE
+        return _TEAMME_PROPERTY_DETECT_BASE(text, event=event)
+
+    print("✅ LINE 房產查詢指令辨識已啟用")
+except Exception as exc:
+    print("⚠️ LINE 房產查詢指令辨識套用失敗：", exc)
+
+
+# 權限 Gate：直接網址／地址不以 # 開頭，也必須先於「非 # 訊息靜默忽略」放行。
+try:
+    _TEAMME_PROPERTY_GATE_BASE = line_access_gate
+
+    def line_access_gate(event):
+        parsed = None
+        message = (event or {}).get("message") or {}
+        if message.get("type") == "text":
+            parsed = _teamme_property_parse_text(message.get("text") or "")
+        elif (event or {}).get("type") == "postback":
+            parsed = _teamme_property_parse_postback(event)
+
+        if parsed:
+            return _teamme_property_access_gate(event, parsed)
+        return _TEAMME_PROPERTY_GATE_BASE(event)
+
+    print("✅ LINE 房產查詢權限 Gate 已啟用：網址／地址可直接輸入")
+except Exception as exc:
+    print("⚠️ LINE 房產查詢權限 Gate 套用失敗：", exc)
+
+
+# 文字訊息：插入既有 webhookEventId 防重複 wrapper 的內層，保留原有防重複能力。
+try:
+    if "_ORIGINAL_PROCESS_LINE_MESSAGE_EVENT_V5" in globals():
+        _TEAMME_PROPERTY_MESSAGE_BASE = _ORIGINAL_PROCESS_LINE_MESSAGE_EVENT_V5
+
+        def _teamme_property_message_base(event):
+            message = (event or {}).get("message") or {}
+            if message.get("type") == "text":
+                parsed = _teamme_property_parse_text(message.get("text") or "")
+                if parsed:
+                    return _teamme_property_handle_parsed(event, parsed)
+            return _TEAMME_PROPERTY_MESSAGE_BASE(event)
+
+        _ORIGINAL_PROCESS_LINE_MESSAGE_EVENT_V5 = _teamme_property_message_base
+        print("✅ LINE 房產文字路由已插入現有防重複流程")
+    else:
+        _TEAMME_PROPERTY_MESSAGE_BASE = process_line_message_event
+
+        def process_line_message_event(event):
+            message = (event or {}).get("message") or {}
+            if message.get("type") == "text":
+                parsed = _teamme_property_parse_text(message.get("text") or "")
+                if parsed:
+                    return _teamme_property_handle_parsed(event, parsed)
+            return _TEAMME_PROPERTY_MESSAGE_BASE(event)
+
+        print("✅ LINE 房產文字路由已啟用")
+except Exception as exc:
+    print("⚠️ LINE 房產文字路由套用失敗：", exc)
+
+
+# Flex Message 按鈕 postback。
+try:
+    _TEAMME_PROPERTY_POSTBACK_BASE = process_line_postback_event
+
+    def process_line_postback_event(event):
+        parsed = _teamme_property_parse_postback(event)
+        if parsed:
+            return _teamme_property_handle_parsed(event, parsed)
+        return _TEAMME_PROPERTY_POSTBACK_BASE(event)
+
+    print("✅ LINE 房產 Flex postback 路由已啟用")
+except Exception as exc:
+    print("⚠️ LINE 房產 Flex postback 路由套用失敗：", exc)
+
+
+_TEAMME_PROPERTY_RESULT_TEMPLATE = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Team M.E 房產查詢結果</title>
+  <style>
+    body{font-family:Arial,"Microsoft JhengHei",sans-serif;background:#f7f3ee;color:#3b3028;margin:0;padding:20px}
+    .wrap{max-width:1100px;margin:auto}.card{background:#fff;border:1px solid #eadbc9;border-radius:18px;padding:20px;margin-bottom:16px;box-shadow:0 8px 25px rgba(85,55,25,.06)}
+    h1,h2{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.metric{background:#fff8f0;border:1px solid #f0d2b1;border-radius:12px;padding:12px}.metric b{display:block;font-size:20px}.muted{color:#7c6b5c;font-size:13px}.ok{color:#198754}.bad{color:#c0392b}table{width:100%;border-collapse:collapse;font-size:14px}th,td{border-bottom:1px solid #eee;padding:9px;text-align:left;vertical-align:top}th{background:#fff2df}pre{white-space:pre-wrap;word-break:break-word;background:#292522;color:#f8f2eb;padding:15px;border-radius:12px;overflow:auto}
+  </style>
+</head>
+<body><div class="wrap">
+  <div class="card"><h1>Team M.E 房產查詢結果</h1><div class="muted">任務：{{ task_id }}｜建立時間：{{ created_at }}</div></div>
+  {% if kind == 'url' %}
+  <div class="card"><h2>網址解析</h2><div class="grid">
+    <div class="metric"><b>{{ parsed.get('building_area_ping') or '—' }}</b><span>總建坪</span></div>
+    <div class="metric"><b>{{ parsed.get('main_area_ping') or '—' }}</b><span>主建物</span></div>
+    <div class="metric"><b>{{ parsed.get('land_area_ping') or '—' }}</b><span>地坪</span></div>
+    <div class="metric"><b>{{ parsed.get('district') or '—' }}</b><span>區域</span></div>
+    <div class="metric"><b>{{ parsed.get('floor_text') or parsed.get('total_floors') or '—' }}</b><span>樓層</span></div>
+    <div class="metric"><b>{{ parsed.get('building_age') or '—' }}</b><span>屋齡</span></div>
+  </div><p><b>{{ parsed.get('title') or '' }}</b><br>{{ parsed.get('public_address') or '平台未公開地址' }}</p></div>
+  <div class="card"><h2>候選地址</h2><table><thead><tr><th>#</th><th>地址</th><th>完全符合率</th><th>總建坪</th><th>主建物</th><th>區域</th><th>樓層</th><th>屋齡</th></tr></thead><tbody>
+  {% for c in candidates %}<tr><td>{{ loop.index }}</td><td>{{ c.get('address') }}</td><td>{{ c.get('core_exact_match_ratio') }}%</td><td>{{ c.get('building_area_ping') }}</td><td>{{ c.get('main_building_area_ping') }}</td><td>{{ c.get('district') }}</td><td>{{ c.get('transfer_floor') }}/{{ c.get('total_floors') }}</td><td>{{ c.get('candidate_current_age') }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% elif kind == 'address' %}
+  <div class="card"><h2>{{ result.get('query') }}</h2><div class="grid"><div class="metric"><b>{{ summary.get('count') or 0 }}</b><span>附近成交</span></div><div class="metric"><b>{{ summary.get('median_unit') or '—' }}</b><span>單價中位數</span></div><div class="metric"><b>{{ summary.get('average_unit') or '—' }}</b><span>平均單價</span></div><div class="metric"><b>{{ summary.get('median_total') or '—' }}</b><span>總價中位數</span></div></div></div>
+  {% endif %}
+  <div class="card"><h2>完整資料</h2><pre>{{ raw_json }}</pre></div>
+</div></body></html>
+"""
+
+
+def _teamme_property_result_page(token):
+    try:
+        docs = list(
+            db.collection(TEAMME_PROPERTY_RESULT_COLLECTION)
+            .where("result_token", "==", token)
+            .limit(1)
+            .stream()
+        )
+    except Exception as exc:
+        return f"讀取結果失敗：{exc}", 500
+
+    if not docs:
+        return "找不到查詢結果，連結可能已失效。", 404
+
+    data = docs[0].to_dict() or {}
+    result = data.get("result") or {}
+    return render_template_string(
+        _TEAMME_PROPERTY_RESULT_TEMPLATE,
+        task_id=data.get("task_id") or docs[0].id,
+        created_at=data.get("created_at") or "",
+        kind=result.get("kind") or "",
+        result=result,
+        parsed=result.get("parsed") or {},
+        candidates=result.get("candidates") or [],
+        summary=result.get("summary") or {},
+        raw_json=json.dumps(result, ensure_ascii=False, indent=2, default=str),
+    )
+
+
+try:
+    if "teamme_property_result" not in app.view_functions:
+        app.add_url_rule(
+            "/result/<token>",
+            endpoint="teamme_property_result",
+            view_func=_teamme_property_result_page,
+            methods=["GET"],
+        )
+except Exception as exc:
+    print("⚠️ 房產結果頁路由加入失敗：", exc)
+
+
+@app.route("/debug/property-line-check")
+@login_required
+def debug_property_line_check():
+    return {
+        "ok": True,
+        "task_collection": TEAMME_PROPERTY_TASK_COLLECTION,
+        "result_collection": TEAMME_PROPERTY_RESULT_COLLECTION,
+        "target_worker": TEAMME_PROPERTY_DEFAULT_WORKER,
+        "property_permission_registered": any(
+            str(item[0]) == TEAMME_PROPERTY_COMMAND_TYPE
+            for item in (LINE_COMMAND_TYPE_OPTIONS or [])
+        ),
+        "line_webhook": getattr(app.view_functions.get("line_webhook"), "__name__", ""),
+        "message_handler": getattr(process_line_message_event, "__name__", ""),
+        "postback_handler": getattr(process_line_postback_event, "__name__", ""),
+        "version": "5.4",
+    }
+
+
+print("✅ Team M.E LINE 房產助理整合 v5.4 載入完成")
+# =============================================================================
+# Team M.E LINE 房產助理整合 v5.4 End
+# =============================================================================
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000") or 5000)
+    print("Routes:", app.url_map)
+    app.run(host="0.0.0.0", port=port, debug=True)
 
