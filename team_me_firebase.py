@@ -31697,6 +31697,739 @@ print("✅ Team M.E LINE 房產助理整合 v5.4 載入完成")
 # =============================================================================
 
 
+
+# =============================================================================
+# Team M.E LINE 指令分流修正 Patch v20260717_LINE_ROUTING_FIX
+# 修正：
+# 1. #新增開發 內含網址時，不再被房產 url_lookup 攔截。
+# 2. LINE 新增開發支援公司 / 建案 / 粉專 / 網址 / 電話 / 地址 / 備註等欄位。
+# 3. 新增 #AI屋主回報 / #生成屋主回報 LINE 指令。
+# 4. 屋主回報 Gemini JSON 生成增加 REST fallback，避免 google-genai 套件或 JSON 擷取失敗。
+# =============================================================================
+
+def _crm_line_text_first_command(raw_text: str) -> str:
+    text = str(raw_text or "").replace("＃", "#").strip()
+    if not text:
+        return ""
+    first = text.splitlines()[0].strip()
+    if first.startswith("#"):
+        first = first[1:].strip()
+    return re.sub(r"\s+", "", first)
+
+
+_CRM_LINE_NON_PROPERTY_COMMAND_PREFIXES = (
+    "新增開發",
+    "新增開發批次",
+    "開發追蹤",
+    "新增客需",
+    "新增委託",
+    "買方追蹤",
+    "賣方追蹤",
+    "客戶分類",
+    "查詢紀錄",
+    "查詢開發",
+    "查詢委託到期",
+    "AI屋主回報",
+    "生成屋主回報",
+    "屋主回報AI",
+)
+
+_CRM_LINE_PROPERTY_COMMAND_PREFIXES = (
+    "查詢網址",
+    "網址查詢",
+    "查房產網址",
+    "房產網址",
+    "查詢地址",
+    "地址查詢",
+    "查房產地址",
+    "房產說明",
+    "查房產說明",
+    "查房產",
+    "房產查詢",
+    "房產狀態",
+    "實價狀態",
+    "資料庫狀態",
+    "更新實價",
+    "更新實價登錄",
+    "更新實價登陸",
+    "重配座標",
+    "重新配對座標",
+    "更新座標",
+    "房產最近",
+    "最近房產查詢",
+)
+
+def _crm_line_is_non_property_explicit_command(raw_text: str) -> bool:
+    cmd = _crm_line_text_first_command(raw_text)
+    return any(cmd.startswith(prefix) for prefix in _CRM_LINE_NON_PROPERTY_COMMAND_PREFIXES)
+
+def _crm_line_is_property_explicit_command(raw_text: str) -> bool:
+    cmd = _crm_line_text_first_command(raw_text)
+    return any(cmd.startswith(prefix) for prefix in _CRM_LINE_PROPERTY_COMMAND_PREFIXES)
+
+def _crm_line_find_listing_url(text: str) -> str:
+    try:
+        m = _TEAMME_PROPERTY_LISTING_URL_RE.search(text or "")
+        return m.group(0).rstrip(".,，。") if m else ""
+    except Exception:
+        m = re.search(r"https?://[^\s<>]*(?:rakuya\.com\.tw|591\.com\.tw)[^\s<>]*", text or "", re.I)
+        return m.group(0).rstrip(".,，。") if m else ""
+
+def _crm_line_text_without_urls(text: str) -> str:
+    cleaned = re.sub(r"https?://\S+", "", str(text or ""))
+    cleaned = re.sub(r"www\.\S+", "", cleaned)
+    return cleaned.strip(" \n\t，,。:：；;「」『』()（）[]【】")
+
+try:
+    _CRM_LINE_ROUTING_FIX_PROPERTY_PARSE_BASE = _teamme_property_parse_text
+
+    def _teamme_property_parse_text(raw_text):
+        """
+        v20260717 修正：
+        - 明確 CRM 指令優先，例如 #新增開發、#AI屋主回報，不會因內容有樂屋/591網址而被 url_lookup 攔截。
+        - 只有純網址、或明確 #查詢網址，才走房產網址解析。
+        """
+        text = str(raw_text or "").strip()
+        if not text:
+            return None
+
+        normalized = text.replace("＃", "#").strip()
+        first_line = normalized.splitlines()[0].strip()
+        body = first_line[1:].strip() if first_line.startswith("#") else first_line
+        compact = re.sub(r"\s+", "", body)
+
+        if _crm_line_is_non_property_explicit_command(text):
+            return None
+
+        # 明確查詢網址
+        if compact in {"查詢網址", "網址查詢", "查房產網址", "房產網址"}:
+            url = _crm_line_find_listing_url(text)
+            if not url:
+                return {
+                    "command": "help",
+                    "payload": {},
+                    "reply_text": "請在 #查詢網址 後面貼上樂屋或 591 物件網址。",
+                    "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+                }
+            return {
+                "command": "url_lookup",
+                "payload": {"url": url},
+                "reply_text": "🔎 已收到房產網址，正在由 ELLEN-PC 解析並比對實價候選。",
+                "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+            }
+
+        # 沒有明確指令時，只有整段幾乎是純網址才走 url_lookup。
+        url = _crm_line_find_listing_url(text)
+        if url:
+            rest = _crm_line_text_without_urls(text)
+            if not rest:
+                return {
+                    "command": "url_lookup",
+                    "payload": {"url": url},
+                    "reply_text": "🔎 已收到房產網址，正在由 ELLEN-PC 解析並比對實價候選。",
+                    "permission": TEAMME_PROPERTY_COMMAND_TYPE,
+                }
+            # 例如開發資料裡附了一個樂屋/591網址，不要攔截，交給 CRM / 開發解析。
+            return None
+
+        return _CRM_LINE_ROUTING_FIX_PROPERTY_PARSE_BASE(raw_text)
+
+    print("✅ LINE 分流修正：#新增開發 / #AI屋主回報 不再被房產網址查詢攔截")
+except Exception as exc:
+    print("⚠️ LINE 分流修正套用失敗：", exc)
+
+
+def _crm_dev_normalize_key(key: str):
+    k = (key or "").strip().replace(" ", "")
+    mapping = {
+        "公司": "company_name",
+        "建設公司": "company_name",
+        "建商": "company_name",
+        "品牌": "company_name",
+        "粉專": "source_page",
+        "粉絲團": "source_page",
+        "粉專名稱": "source_page",
+        "建案": "project_name",
+        "建案名稱": "project_name",
+        "案名": "project_name",
+        "基地": "address",
+        "基地地址": "address",
+        "位置": "address",
+        "網址": "url",
+        "連結": "url",
+        "網站": "url",
+        "FB": "url",
+        "Facebook": "url",
+        "臉書": "url",
+        "電話": "phone",
+        "手機": "phone",
+        "聯絡電話": "phone",
+        "聯絡人": "name",
+        "姓名": "name",
+        "窗口": "name",
+        "來源": "source",
+        "目前狀況": "current_stage",
+        "目前狀態": "current_stage",
+        "狀態": "current_stage",
+        "進度": "current_stage",
+        "下一步": "next_action",
+        "下一次時間": "next_action_date",
+        "下次時間": "next_action_date",
+        "下次聯絡日": "next_action_date",
+        "備註": "content",
+        "內容": "content",
+        "說明": "content",
+        "地址": "address",
+        "戶籍地址": "registered_address",
+        "日期": "record_date",
+        "標籤": "labels",
+        "分類": "labels",
+    }
+    if k in mapping:
+        return mapping[k]
+    try:
+        return normalize_line_key(key)
+    except Exception:
+        return k
+
+
+try:
+    _CRM_LINE_ROUTING_FIX_PARSE_FLEX_DEV_BASE = parse_flexible_development_chunk
+
+    def parse_flexible_development_chunk(raw_text: str) -> dict:
+        """
+        v20260717：放寬 #新增開發 解析。
+        支援：
+        公司、建設公司、建案、案名、粉專、網址、電話、地址、備註。
+        非 key:value 行也會自動抓 URL / 電話 / 地址。
+        """
+        text = (raw_text or "").replace("\r\n", "\n").strip()
+        if not text:
+            return {}
+
+        fields = {}
+        notes = []
+        candidate_names = []
+
+        for raw_line in text.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            m = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", line)
+            if m:
+                key = _crm_dev_normalize_key(m.group(1))
+                value = (m.group(2) or "").strip()
+                if key == "labels":
+                    fields[key] = parse_label_csv(value)
+                elif value:
+                    fields[key] = value
+
+                    # 欄位值裡如果含網址 / 電話，也順便補到標準欄位。
+                    url = _extract_first_url(value) if "_extract_first_url" in globals() else ""
+                    phone = _extract_first_phone(value) if "_extract_first_phone" in globals() else ""
+                    if url and not fields.get("url"):
+                        fields["url"] = url
+                    if phone and not fields.get("phone"):
+                        fields["phone"] = phone
+                continue
+
+            url = _extract_first_url(line) if "_extract_first_url" in globals() else ""
+            phone = _extract_first_phone(line) if "_extract_first_phone" in globals() else ""
+            date_txt = _extract_date_text(line) if "_extract_date_text" in globals() else ""
+
+            if url and not fields.get("url"):
+                fields["url"] = url
+                leftover = line.replace(url, "").strip()
+                if leftover:
+                    notes.append(leftover)
+                continue
+
+            if phone and not fields.get("phone"):
+                fields["phone"] = phone
+                leftover = line.replace(phone, "").strip(" ：:")
+                if leftover and "_looks_like_name" in globals() and _looks_like_name(leftover):
+                    candidate_names.append(leftover)
+                elif leftover:
+                    notes.append(leftover)
+                continue
+
+            if "_looks_like_address" in globals() and _looks_like_address(line):
+                if not fields.get("address"):
+                    fields["address"] = line
+                elif not fields.get("registered_address") and ("戶籍" in line or "住址" in line):
+                    fields["registered_address"] = line
+                else:
+                    notes.append(line)
+                continue
+
+            if date_txt and not fields.get("next_action_date") and any(word in line for word in ["下次", "再", "聯絡", "時間", "日期"]):
+                fields["next_action_date"] = date_txt
+                leftover = line.replace(date_txt, "").strip(" ：:")
+                if leftover and leftover not in ("下次", "下次時間", "下一次時間", "下次日期"):
+                    notes.append(leftover)
+                continue
+
+            if "_looks_like_name" in globals() and _looks_like_name(line):
+                candidate_names.append(line)
+                continue
+
+            notes.append(line)
+
+        # 名稱優先：聯絡人/姓名 > 公司 > 建案 > 地址 > 候選姓名
+        if not fields.get("name"):
+            fields["name"] = (
+                fields.get("company_name")
+                or fields.get("project_name")
+                or (candidate_names[0] if candidate_names else "")
+                or fields.get("address")
+                or "未填姓名"
+            )
+
+        joined_notes = "\n".join(notes).strip()
+        meta_notes = []
+        if fields.get("company_name"):
+            meta_notes.append(f"公司：{fields.get('company_name')}")
+        if fields.get("project_name"):
+            meta_notes.append(f"建案：{fields.get('project_name')}")
+        if fields.get("source_page"):
+            meta_notes.append(f"粉專：{fields.get('source_page')}")
+        if fields.get("url"):
+            meta_notes.append(f"網址：{fields.get('url')}")
+        if joined_notes:
+            meta_notes.append(joined_notes)
+
+        if meta_notes:
+            old_content = fields.get("content", "")
+            fields["content"] = "\n".join([x for x in [old_content, "\n".join(meta_notes)] if x]).strip()
+
+        big_text = text
+        if not fields.get("current_stage"):
+            auto_stage = _find_status_in_text(big_text) if "_find_status_in_text" in globals() else ""
+            fields["current_stage"] = normalize_development_status(auto_stage or "待聯繫")
+        else:
+            fields["current_stage"] = normalize_development_status(fields.get("current_stage"))
+
+        if not fields.get("next_action"):
+            fields["next_action"] = normalize_development_next_action(_find_next_action_in_text(big_text) if "_find_next_action_in_text" in globals() else "")
+        else:
+            fields["next_action"] = normalize_development_next_action(fields.get("next_action"))
+
+        if not fields.get("next_action_date") and "_extract_date_text" in globals():
+            auto_date = _extract_date_text(big_text)
+            if auto_date:
+                fields["next_action_date"] = auto_date
+
+        fields["source"] = infer_development_source(fields.get("source", ""), fields.get("url", "")) if "infer_development_source" in globals() else (fields.get("source") or "LINE")
+        if not fields.get("record_date"):
+            fields["record_date"] = now_taipei().strftime("%Y-%m-%d")
+
+        has_any = any(fields.get(k) for k in ["name", "phone", "address", "url", "content", "company_name", "project_name"])
+        return fields if has_any else {}
+
+    print("✅ LINE 新增開發解析已放寬：支援公司/建案/網址/粉專/電話/地址")
+except Exception as exc:
+    print("⚠️ LINE 新增開發解析修正失敗：", exc)
+
+
+try:
+    _CRM_LINE_ROUTING_FIX_CREATE_DEV_BASE = create_development
+
+    def create_development(fields, event):
+        """
+        v20260717：新增 company_name / project_name / source_page 欄位，並允許無電話但有網址/公司/建案時建立開發資料。
+        """
+        fields = fields or {}
+        phone = str(fields.get("phone") or "").strip()
+        company_name = str(fields.get("company_name") or "").strip()
+        project_name = str(fields.get("project_name") or "").strip()
+        address = str(fields.get("address") or "").strip()
+        url = str(fields.get("url") or "").strip()
+        name = str(fields.get("name") or "").strip() or company_name or project_name or address or "未填姓名"
+        source = infer_development_source(fields.get("source", ""), url) if "infer_development_source" in globals() else (fields.get("source") or "LINE")
+
+        matches = find_records_by_phone("developments", phone) if phone else []
+        if not matches and address and "find_development_record" in globals():
+            doc = find_development_record(address=address)
+            if doc:
+                matches = [doc]
+        if not matches and url:
+            try:
+                docs = list(db.collection("developments").where("url", "==", url).limit(2).stream())
+                if len(docs) == 1:
+                    matches = [docs[0]]
+            except Exception:
+                pass
+
+        labels = build_development_labels(fields.get("labels"))
+        content_text = (
+            str(fields.get("content") or "").strip()
+            or address
+            or url
+            or company_name
+            or project_name
+            or "LINE 新增開發"
+        )
+        note_content = build_line_summary(content_text, event)
+
+        stage = normalize_development_status(str(fields.get("current_stage") or fields.get("stage") or "待聯繫").strip())
+        next_action = normalize_development_next_action(str(fields.get("next_action") or "").strip())
+        next_date = str(fields.get("next_action_date") or fields.get("next_contact_date") or "").strip()
+
+        payload = {
+            "name": name,
+            "phone": phone,
+            "company_name": company_name,
+            "project_name": project_name,
+            "source_page": str(fields.get("source_page") or "").strip(),
+            "source": source,
+            "url": url,
+            "address": address,
+            "registered_address": str(fields.get("registered_address") or "").strip(),
+            "current_stage": stage,
+            "stage": stage,
+            "next_action": next_action,
+            "next_action_date": next_date,
+            "record_date": str(fields.get("record_date") or "").strip() or now_taipei().strftime("%Y-%m-%d"),
+            "note": "",
+            "labels": labels,
+            "updated_at": now_taipei().isoformat(),
+            "updated_by_id": "line_bot",
+            "updated_by_name": "LINE Bot",
+            "sender_display_name": get_line_sender_display_name(event) or "",
+        }
+
+        if len(matches) == 1:
+            doc = matches[0]
+            doc_ref = db.collection("developments").document(doc.id)
+            update_customer_note_and_labels(
+                target_type="development",
+                doc_ref=doc_ref,
+                content=note_content,
+                labels=labels,
+                stage=payload["stage"],
+                source=payload["source"],
+                event=event,
+            )
+            doc_ref.update({k: v for k, v in payload.items() if v != "" and k != "note"})
+            add_customer_followup(
+                target_type="development",
+                customer_id=doc.id,
+                content=note_content,
+                next_action=payload.get("next_action", ""),
+                next_contact_date=payload.get("next_action_date", ""),
+                labels=labels,
+                line_event=event,
+            )
+            updated_doc = doc_ref.get().to_dict() or {}
+            return {
+                "handled": True,
+                "ok": True,
+                "reply_text": f"已註記開發：{updated_doc.get('name', '') or name}",
+                "target_type": "development",
+                "target_id": doc.id,
+                "customer_name": updated_doc.get("name", "") or name,
+                "phone": updated_doc.get("phone", "") or phone,
+                "parsed_tag": "新增開發",
+            }
+
+        if len(matches) > 1:
+            return {
+                "handled": True,
+                "ok": False,
+                "reply_text": "未寫入：同電話/網址有多筆開發資料，請補地址或開發ID",
+            }
+
+        now = now_taipei().isoformat()
+        payload.update({
+            "created_at": now,
+            "created_by_id": "line_bot",
+            "created_by_name": "LINE Bot",
+            "note": append_note_block("", note_content, build_line_operator_label(event)),
+        })
+        doc_ref = db.collection("developments").document()
+        doc_ref.set(payload)
+        add_customer_followup(
+            target_type="development",
+            customer_id=doc_ref.id,
+            content=note_content,
+            next_action=payload.get("next_action", ""),
+            next_contact_date=payload.get("next_action_date", ""),
+            labels=labels,
+            line_event=event,
+        )
+        return {
+            "handled": True,
+            "ok": True,
+            "reply_text": f"已註記開發：{name}",
+            "target_type": "development",
+            "target_id": doc_ref.id,
+            "customer_name": name,
+            "phone": phone,
+            "parsed_tag": "新增開發",
+        }
+
+    print("✅ LINE 新增開發寫入已修正：支援無電話但有網址/公司/建案")
+except Exception as exc:
+    print("⚠️ LINE 新增開發寫入修正失敗：", exc)
+
+
+def _crm_line_parse_key_value_body(raw_text: str) -> dict:
+    lines = [ln.strip() for ln in str(raw_text or "").splitlines() if ln.strip()]
+    if lines and lines[0].replace("＃", "#").startswith("#"):
+        lines = lines[1:]
+    fields = {}
+    for line in lines:
+        m = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", line)
+        if not m:
+            continue
+        key = _crm_dev_normalize_key(m.group(1))
+        val = (m.group(2) or "").strip()
+        if val:
+            fields[key] = val
+    return fields
+
+def _line_find_seller_for_owner_report(fields):
+    record_id = str(fields.get("record_id") or "").strip()
+    phone = str(fields.get("phone") or "").strip()
+    name = str(fields.get("name") or fields.get("seller_name") or fields.get("owner_name") or "").strip()
+    address = str(fields.get("address") or "").strip()
+
+    if record_id:
+        doc = db.collection("sellers").document(record_id).get()
+        if doc.exists:
+            return doc
+
+    if phone:
+        matches = find_records_by_phone("sellers", phone)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return None
+
+    if name:
+        docs = list(db.collection("sellers").where("name", "==", name).limit(2).stream())
+        if len(docs) == 1:
+            return docs[0]
+
+    if address:
+        docs = list(db.collection("sellers").where("address", "==", address).limit(2).stream())
+        if len(docs) == 1:
+            return docs[0]
+
+    return None
+
+def _line_handle_ai_owner_report(event):
+    message = (event or {}).get("message") or {}
+    raw_text = message.get("text") or ""
+    fields = _crm_line_parse_key_value_body(raw_text)
+    # 額外支援：案名/物件 被 normalize 成 address/project_name 的情況
+    if fields.get("project_name") and not fields.get("address"):
+        fields["address"] = fields.get("project_name")
+
+    seller_doc = _line_find_seller_for_owner_report(fields)
+    if not seller_doc:
+        return {
+            "handled": True,
+            "ok": False,
+            "reply_text": (
+                "找不到唯一委託資料，請補其中一個：\n"
+                "ID：委託ID\n"
+                "姓名：屋主姓名\n"
+                "電話：屋主電話\n"
+                "地址：物件地址"
+            ),
+            "parsed_tag": "AI屋主回報",
+        }
+
+    seller = seller_doc.to_dict() or {}
+    seller["id"] = seller_doc.id
+
+    report_type = str(fields.get("report_type") or fields.get("type") or "general").strip()
+    period_start = str(fields.get("period_start") or fields.get("start") or fields.get("開始") or "").strip()
+    period_end = str(fields.get("period_end") or fields.get("end") or fields.get("結束") or "").strip()
+    extra_note = str(fields.get("content") or fields.get("note") or raw_text).strip()
+
+    draft = generate_owner_report_draft_with_ai(
+        seller,
+        report_type=report_type,
+        period_start=period_start,
+        period_end=period_end or _owner_report_today(),
+        extra_note=extra_note,
+    )
+    draft.update({
+        "seller_id": seller_doc.id,
+        "report_type": report_type,
+        "report_period_start": period_start,
+        "report_period_end": period_end or _owner_report_today(),
+        "report_date": _owner_report_today(),
+        "extra_note": extra_note,
+        "created_at": now_taipei().isoformat(),
+        "created_by_id": "line_bot",
+        "created_by_name": "LINE Bot",
+        "source": "LINE_AI屋主回報",
+    })
+    ref = db.collection(OWNER_REPORT_DRAFT_COLLECTION).document()
+    ref.set(draft)
+
+    reply = (
+        f"AI屋主回報草稿已生成：{seller.get('name') or seller.get('address') or '委託'}\n"
+        f"草稿ID：{ref.id[:12]}\n\n"
+        f"{draft.get('report_message') or draft.get('progress_summary') or ''}\n\n"
+        f"給房仲建議：{draft.get('ai_suggestion') or '-'}"
+    ).strip()
+
+    return {
+        "handled": True,
+        "ok": True,
+        "reply_text": reply[:5000],
+        "target_type": "seller",
+        "target_id": seller_doc.id,
+        "customer_name": seller.get("name", ""),
+        "phone": seller.get("phone", ""),
+        "parsed_tag": "AI屋主回報",
+    }
+
+
+try:
+    _CRM_LINE_ROUTING_FIX_OWNER_GEMINI_BASE = _owner_report_gemini_json
+
+    def _owner_report_extract_json_object(text: str):
+        text = str(text or "").strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            raise RuntimeError("Gemini 回傳未包含 JSON object")
+        return json.loads(m.group(0))
+
+    def _owner_report_gemini_json(prompt):
+        """
+        v20260717：Gemini JSON 生成強化。
+        先用原 helper；失敗時改用 Gemini REST API，避免 google-genai 套件缺失或 JSON 包在 markdown 造成失敗。
+        """
+        try:
+            return _CRM_LINE_ROUTING_FIX_OWNER_GEMINI_BASE(prompt)
+        except Exception as base_exc:
+            api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+            if not api_key:
+                raise base_exc
+
+            model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.35,
+                    "responseMimeType": "application/json",
+                },
+            }
+            import urllib.request
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=45) as res:
+                body = json.loads(res.read().decode("utf-8"))
+            parts = (((body.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+            text = "\n".join(str(p.get("text") or "") for p in parts)
+            return _owner_report_extract_json_object(text)
+
+    print("✅ AI屋主回報 Gemini JSON 生成已強化：支援 REST fallback")
+except Exception as exc:
+    print("⚠️ AI屋主回報 Gemini JSON 修正失敗：", exc)
+
+
+try:
+    _CRM_LINE_ROUTING_FIX_PROCESS_BASE = process_line_message_event
+
+    def _crm_line_dispatch_development_from_text(event, raw_text):
+        normalized = str(raw_text or "").replace("＃", "#").strip()
+        # 支援「新增開發」沒加 # 的格式
+        if not normalized.startswith("#"):
+            normalized = "#" + normalized
+        parsed = parse_line_formatted_message(normalized)
+        if not parsed:
+            return {
+                "handled": True,
+                "ok": False,
+                "reply_text": (
+                    "未寫入：#新增開發 解析不到有效資料。\n"
+                    "建議格式：\n"
+                    "#新增開發\n公司：○○建設\n建案：○○案\n網址：https://...\n電話：09...\n備註：留言很多"
+                ),
+                "parsed_tag": "新增開發",
+            }
+
+        if parsed.get("action") == "create_development_batch":
+            result = create_development_batch(parsed.get("raw_body") or normalized, event)
+        else:
+            result = create_development(parsed.get("fields") or {}, event)
+
+        try:
+            save_line_log(
+                parsed,
+                event,
+                "success" if result.get("ok") else "failed",
+                target_type=result.get("target_type", ""),
+                target_id=result.get("target_id", ""),
+                note=result.get("reply_text", ""),
+                sender_display_name=get_line_sender_display_name(event),
+            )
+            if result.get("ok") and result.get("target_type") and result.get("target_id"):
+                incoming_message_id = ((event.get("message") or {}).get("id") or "")
+                save_line_message_link(
+                    incoming_message_id,
+                    result["target_type"],
+                    result["target_id"],
+                    tag=result.get("parsed_tag", "新增開發"),
+                    action="create_development",
+                    customer_name=result.get("customer_name", ""),
+                    phone=result.get("phone", ""),
+                    source_event=event,
+                )
+        except Exception as log_exc:
+            print("⚠️ LINE 新增開發紀錄 link/log 失敗：", log_exc)
+        return result
+
+    def process_line_message_event(event):
+        message = (event or {}).get("message") or {}
+        if message.get("type") == "text":
+            raw_text = message.get("text") or ""
+            cmd = _crm_line_text_first_command(raw_text)
+
+            if cmd.startswith("新增開發"):
+                return _crm_line_dispatch_development_from_text(event, raw_text)
+
+            if cmd.startswith("AI屋主回報") or cmd.startswith("生成屋主回報") or cmd.startswith("屋主回報AI"):
+                result = _line_handle_ai_owner_report(event)
+                try:
+                    save_line_log(
+                        {"tag": "AI屋主回報", "action": "seller_owner_report_ai", "fields": _crm_line_parse_key_value_body(raw_text), "raw_text": raw_text},
+                        event,
+                        "success" if result.get("ok") else "failed",
+                        target_type=result.get("target_type", ""),
+                        target_id=result.get("target_id", ""),
+                        note=result.get("reply_text", "")[:500],
+                        sender_display_name=get_line_sender_display_name(event),
+                    )
+                except Exception as log_exc:
+                    print("⚠️ AI屋主回報 LINE log 失敗：", log_exc)
+                return result
+
+        return _CRM_LINE_ROUTING_FIX_PROCESS_BASE(event)
+
+    print("✅ LINE 指令主路由已修正：新增開發 / AI屋主回報 優先於網址查詢")
+except Exception as exc:
+    print("⚠️ LINE 指令主路由修正失敗：", exc)
+
+# =============================================================================
+# Team M.E LINE 指令分流修正 Patch End
+# =============================================================================
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
     print("Routes:", app.url_map)
