@@ -32435,3 +32435,327 @@ if __name__ == "__main__":
     print("Routes:", app.url_map)
     app.run(host="0.0.0.0", port=port, debug=True)
 
+
+# =============================================================================
+# v25：AI屋主回報簡潔介面 + 生成穩定化
+# - 新增 /assistant/owner-report-ai
+# - 只需要輸入「回報目標」與「回報內容」即可生成可直接貼給屋主的對話
+# - Gemini 回傳不是純 JSON 時也會自動抽取/降級，不再讓畫面沒有結果
+# - 可選 seller_id：/assistant/owner-report-ai?seller_id=xxxxx
+# =============================================================================
+
+def _v25_extract_json_or_text(text_value):
+    """把 Gemini 回傳內容轉成 dict；若不是 JSON，就當成 report_message。"""
+    raw = str(text_value or "").strip()
+    if not raw:
+        return {}
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I).strip()
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", cleaned)
+    if m:
+        try:
+            parsed = json.loads(m.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {"report_message": cleaned}
+
+
+def _owner_report_gemini_json(prompt):
+    """
+    v25 覆寫原本屋主回報 Gemini JSON 解析：
+    Gemini 若回傳 markdown 或前後多文字，也會盡量抽取 JSON；抽不到就當文字結果。
+    """
+    if "_gemini_generate_json" in globals():
+        result = _gemini_generate_json(prompt)
+        if isinstance(result, dict):
+            return result
+        return _v25_extract_json_or_text(result)
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("尚未設定 GEMINI_API_KEY")
+
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        res = client.models.generate_content(
+            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+            contents=prompt,
+        )
+        return _v25_extract_json_or_text(getattr(res, "text", "") or "")
+    except Exception as e:
+        raise RuntimeError(f"Gemini 生成失敗：{e}")
+
+
+def _v25_owner_report_normalize_result(data, report_goal, report_content):
+    data = data if isinstance(data, dict) else {}
+    for key in ("progress_summary", "customer_feedback", "owner_response", "next_action", "ai_suggestion", "report_message"):
+        data[key] = str(data.get(key) or "").strip()
+
+    if not data["progress_summary"]:
+        data["progress_summary"] = str(report_content or "").strip()[:500]
+    if not data["customer_feedback"]:
+        data["customer_feedback"] = "依目前輸入內容整理，尚可持續補充客戶反應。"
+    if not data["next_action"]:
+        data["next_action"] = "持續追蹤詢問、帶看與客戶回饋，並再向屋主回報。"
+    if not data["ai_suggestion"]:
+        data["ai_suggestion"] = "已依回報目標整理成較適合傳給屋主的口吻。"
+
+    if not data["report_message"]:
+        goal = str(report_goal or "回報目前物件進度").strip()
+        content = str(report_content or "目前持續曝光與追蹤物件進度。").strip()
+        data["report_message"] = (
+            "您好，跟您回報一下目前物件的進度。\n\n"
+            f"這次主要想跟您說明：{goal}\n\n"
+            f"目前狀況是：{content}\n\n"
+            "接下來我會持續幫您追蹤詢問、帶看以及客人的實際回饋，"
+            "有新的進度會再第一時間跟您回報。"
+        )
+    return data
+
+
+def generate_owner_report_simple_ai(report_goal, report_content, seller=None):
+    """v25 簡潔版：只吃回報目標 + 回報內容，產生給屋主的對話。"""
+    seller = seller or {}
+    report_goal = str(report_goal or "").strip()
+    report_content = str(report_content or "").strip()
+    seller_block = _owner_report_format_seller_basic(seller) if seller else "未指定委託資料，請只根據使用者輸入內容生成。"
+
+    prompt = f"""
+你是台中海線房仲的屋主回報助理。請把房仲輸入的雜記，整理成一段可以直接傳給屋主的 LINE 對話。
+
+任務重點：
+1. 只根據輸入內容生成，不要編造詢問量、帶看量、價格或客戶反應。
+2. 語氣要口語、專業、穩定屋主信心，不要太制式。
+3. 文字不要太長，適合直接貼給屋主。
+4. 如果目標是議價或調整價格，要委婉，用市場反應與客戶回饋帶出，不要強迫屋主。
+5. 請輸出 JSON，不要輸出 markdown。
+
+委託資料：
+{seller_block}
+
+回報目標：
+{report_goal or '一般進度回報'}
+
+房仲輸入內容：
+{report_content or '目前持續曝光與追蹤物件進度。'}
+
+請輸出格式：
+{{
+  "progress_summary": "本次進度摘要",
+  "customer_feedback": "客戶反應整理，沒有就寫目前尚待累積",
+  "owner_response": "如果沒有屋主回應就留空字串",
+  "next_action": "下一步建議",
+  "ai_suggestion": "給房仲看的策略建議",
+  "report_message": "可以直接傳給屋主的完整 LINE 對話，繁體中文"
+}}
+""".strip()
+
+    try:
+        data = _owner_report_gemini_json(prompt) or {}
+    except Exception as e:
+        print("⚠️ v25 簡潔版 AI 屋主回報失敗，改用規則生成：", e)
+        data = {}
+    return _v25_owner_report_normalize_result(data, report_goal, report_content)
+
+
+def _v25_get_optional_seller(seller_id):
+    seller_id = str(seller_id or "").strip()
+    if not seller_id:
+        return {}
+    try:
+        snap = db.collection("sellers").document(seller_id).get()
+        if snap.exists:
+            seller = snap.to_dict() or {}
+            seller["id"] = snap.id
+            return seller
+    except Exception as e:
+        print("⚠️ v25 讀取委託資料失敗：", e)
+    return {}
+
+
+@app.route("/assistant/owner-report-ai", methods=["GET", "POST"])
+@login_required
+def assistant_owner_report_ai():
+    """AI屋主回報簡潔介面：只輸入回報目標與內容。"""
+    seller_id = (request.values.get("seller_id") or "").strip()
+    seller = _v25_get_optional_seller(seller_id)
+    report_goal = ""
+    report_content = ""
+    result = {}
+    draft_id = ""
+
+    if request.method == "POST":
+        report_goal = (request.form.get("report_goal") or "").strip()
+        report_content = (request.form.get("report_content") or "").strip()
+        seller_id = (request.form.get("seller_id") or seller_id or "").strip()
+        seller = _v25_get_optional_seller(seller_id)
+        if not report_goal and not report_content:
+            flash("請至少輸入回報目標或回報內容", "warning")
+        else:
+            result = generate_owner_report_simple_ai(report_goal, report_content, seller=seller)
+            try:
+                draft_payload = dict(result)
+                draft_payload.update({
+                    "seller_id": seller_id,
+                    "seller_name": seller.get("name", "") if seller else "",
+                    "seller_phone": seller.get("phone", "") if seller else "",
+                    "report_goal": report_goal,
+                    "report_content": report_content,
+                    "report_type": "simple_ai",
+                    "report_date": _owner_report_today(),
+                    "source": "v25_simple_owner_report_ai",
+                    "created_at": now_taipei().isoformat(),
+                    "created_by_id": session.get("user_id"),
+                    "created_by_name": session.get("user_name"),
+                })
+                ref = db.collection(OWNER_REPORT_DRAFT_COLLECTION).document()
+                ref.set(draft_payload)
+                draft_id = ref.id
+                flash("AI 已生成屋主回報，可直接複製傳給屋主", "success")
+            except Exception as e:
+                print("⚠️ v25 儲存屋主回報草稿失敗：", e)
+                flash("AI 已生成，但草稿沒有成功存入 Firebase；仍可先複製畫面文字", "warning")
+
+    html = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 屋主回報生成</title>
+  <style>
+    :root { --bg:#f7f3ed; --card:#fffaf3; --ink:#2f2a25; --muted:#8a7b6b; --brand:#f28c28; --line:#eadfce; }
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft JhengHei",Arial,sans-serif;}
+    .wrap{max-width:1080px;margin:0 auto;padding:28px 18px 60px;}
+    .top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:18px;}
+    h1{font-size:26px;margin:0 0 6px;}
+    .sub{color:var(--muted);font-size:14px;line-height:1.6;}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start;}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:0 8px 24px rgba(80,55,20,.06);}
+    label{display:block;font-weight:700;margin:14px 0 8px;}
+    textarea,input{width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:14px;background:#fff;padding:13px 14px;font-size:15px;line-height:1.6;outline:none;}
+    textarea:focus,input:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(242,140,40,.14);}
+    .btn{border:0;border-radius:999px;background:var(--brand);color:#fff;padding:12px 18px;font-weight:800;cursor:pointer;font-size:15px;text-decoration:none;display:inline-block;}
+    .btn.secondary{background:#7d6a58;}
+    .btn.light{background:#fff;color:var(--ink);border:1px solid var(--line);}
+    .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:16px;}
+    .resultBox{min-height:300px;white-space:pre-wrap;background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;font-size:16px;line-height:1.75;}
+    .hint{font-size:13px;color:var(--muted);margin-top:8px;line-height:1.5;}
+    .seller{font-size:14px;background:#fff;border:1px dashed var(--line);border-radius:14px;padding:12px;line-height:1.7;color:#5f5144;margin-top:10px;}
+    .flash{margin:10px 0 16px;padding:12px 14px;border-radius:14px;background:#fff;border:1px solid var(--line);color:#6b4b2e;}
+    @media(max-width:860px){.grid{grid-template-columns:1fr}.top{display:block}.wrap{padding:18px 12px 40px}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>AI 屋主回報生成</h1>
+      <div class="sub">只要輸入「你想達成的回報目標」跟「目前狀況內容」，AI 會整理成可以直接傳給屋主的 LINE 對話。</div>
+    </div>
+    <div class="actions">
+      <a class="btn light" href="{{ url_for('sellers') }}">回委託列表</a>
+      {% if seller and seller.id %}<a class="btn light" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回這筆委託</a>{% endif %}
+    </div>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}{% for category, message in messages %}<div class="flash">{{ message }}</div>{% endfor %}{% endif %}
+  {% endwith %}
+
+  <div class="grid">
+    <form class="card" method="post">
+      <input type="hidden" name="seller_id" value="{{ seller.id if seller else seller_id }}">
+      {% if seller and seller.id %}
+      <div class="seller">
+        <b>目前委託：</b>{{ seller.name or '-' }}<br>
+        <b>物件：</b>{{ seller.address or '-' }}<br>
+        <b>開價：</b>{{ seller.expected_price or seller.price or '-' }}
+      </div>
+      {% endif %}
+
+      <label>回報目標</label>
+      <textarea name="report_goal" rows="4" placeholder="例：讓屋主知道本週曝光和帶看狀況，順便委婉鋪陳價格可能需要討論。">{{ report_goal }}</textarea>
+      <div class="hint">你可以寫：一般進度、議價、帶看後回報、詢問量不足、委託快到期維繫。</div>
+
+      <label>回報內容</label>
+      <textarea name="report_content" rows="10" placeholder="例：本週詢問 3 組，帶看 1 組。客人喜歡格局，但覺得總價偏高；同區近期類似物件有降價競爭。">{{ report_content }}</textarea>
+      <div class="hint">不用整理得很漂亮，直接把你知道的狀況、客人反應、下一步想法貼上來即可。</div>
+
+      <div class="actions">
+        <button class="btn" type="submit">AI 生成屋主回報</button>
+        <a class="btn light" href="{{ url_for('assistant_owner_report_ai', seller_id=seller.id) if seller and seller.id else url_for('assistant_owner_report_ai') }}">清空</a>
+      </div>
+    </form>
+
+    <div class="card">
+      <label>生成結果：可直接傳給屋主</label>
+      {% if result and result.report_message %}
+        <div id="reportText" class="resultBox">{{ result.report_message }}</div>
+        <div class="actions">
+          <button class="btn" onclick="copyReport()" type="button">複製文字</button>
+          {% if seller and seller.id %}
+          <form method="post" action="{{ url_for('seller_owner_report_create', seller_id=seller.id) }}" style="display:inline">
+            <input type="hidden" name="report_type" value="simple_ai">
+            <input type="hidden" name="report_date" value="{{ today_date }}">
+            <input type="hidden" name="progress_summary" value="{{ result.progress_summary }}">
+            <input type="hidden" name="customer_feedback" value="{{ result.customer_feedback }}">
+            <input type="hidden" name="next_action" value="{{ result.next_action }}">
+            <input type="hidden" name="ai_suggestion" value="{{ result.ai_suggestion }}">
+            <input type="hidden" name="report_message" value="{{ result.report_message }}">
+            <button class="btn secondary" type="submit">儲存到屋主回報紀錄</button>
+          </form>
+          {% endif %}
+        </div>
+        <div class="hint">草稿ID：{{ draft_id or '未儲存' }}</div>
+      {% else %}
+        <div class="resultBox" style="color:#9a8a78">生成後會出現在這裡。</div>
+      {% endif %}
+
+      {% if result and result.ai_suggestion %}
+      <label style="margin-top:18px">給房仲看的建議</label>
+      <div class="resultBox" style="min-height:80px;font-size:14px;color:#5f5144">{{ result.ai_suggestion }}</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+<script>
+function copyReport(){
+  const el = document.getElementById('reportText');
+  if(!el) return;
+  navigator.clipboard.writeText(el.innerText).then(()=>alert('已複製屋主回報文字'));
+}
+</script>
+</body>
+</html>
+"""
+    return render_template_string(
+        html,
+        seller=seller,
+        seller_id=seller_id,
+        report_goal=report_goal,
+        report_content=report_content,
+        result=result,
+        draft_id=draft_id,
+        today_date=_owner_report_today(),
+    )
+
+
+@app.route("/sellers/<seller_id>/owner-report/simple-ai", methods=["GET"])
+@login_required
+def seller_owner_report_simple_ai_entry(seller_id):
+    return redirect(url_for("assistant_owner_report_ai", seller_id=seller_id))
+
+print("✅ v25 AI屋主回報簡潔介面已啟用：/assistant/owner-report-ai")
+# =============================================================================
+# v25 End
+# =============================================================================
