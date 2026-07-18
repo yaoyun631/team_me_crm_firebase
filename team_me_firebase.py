@@ -33021,3 +33021,284 @@ except Exception as e:
 # =============================================================================
 # v26 End
 # =============================================================================
+
+
+# =============================================================================
+# v27：AI屋主回報極簡頁面 + 自然口吻優化
+# - 頁面只保留一個輸入欄位：這次希望 AI 著重什麼？
+# - 結果直接在同頁顯示，不再跳來跳去找草稿
+# - 回覆口吻改成自然 LINE 對話，不像報告、不像制式公文
+# - 舊的 /sellers/<seller_id>/owner-report/ai 仍可相容，會導到極簡頁
+# =============================================================================
+
+def _v27_owner_report_result_to_message(data, focus_note):
+    """把 AI 結果整理成最終顯示文字；避免空白，也避免太像報告。"""
+    data = data if isinstance(data, dict) else {}
+    msg = str(data.get("report_message") or data.get("message") or data.get("text") or "").strip()
+    if msg:
+        # 移除常見 AI 開頭，讓複製給屋主更自然。
+        msg = re.sub(r"^(以下是|這是|當然可以|好的[,，]?|草稿[:：]?|屋主回報[:：]?)\s*", "", msg.strip(), flags=re.I)
+        msg = re.sub(r"\n{3,}", "\n\n", msg).strip()
+        return msg
+
+    focus_note = str(focus_note or "目前持續曝光與追蹤物件進度。").strip()
+    return (
+        "您好，跟您回報一下目前物件的狀況。\n\n"
+        f"這段時間我們這邊持續有在整理曝光、詢問和客戶回饋，目前比較主要的重點是：{focus_note}\n\n"
+        "我會再繼續追蹤後續反應，有新的詢問、帶看或比較明確的客戶想法，會再跟您更新。"
+    )
+
+
+def generate_owner_report_simple_ai(report_goal=None, report_content=None, seller=None):
+    """v27：改成更自然的 LINE 屋主回報，不要求使用者分回報目的/區間。"""
+    seller = seller or {}
+    focus_note = str(report_content or report_goal or "").strip()
+    seller_block = _owner_report_format_seller_basic(seller) if seller else "未指定委託資料，請只根據使用者輸入內容生成。"
+
+    prompt = f"""
+你是台中海線房仲的文字助理，請把房仲輸入的重點，改寫成一段可以直接傳給屋主的 LINE 訊息。
+
+請務必遵守：
+1. 口吻自然、像真人房仲，不要像報告、公文、客服罐頭。
+2. 不要寫標題，不要列點，不要寫「以下是草稿」。
+3. 文字控制在 120～260 字左右，分 2～4 段即可。
+4. 不要編造沒有輸入的詢問量、帶看量、成交行情、客戶反應。
+5. 如果內容是要議價或談價格，請委婉表達，用「客戶回饋、比較同區物件、市場反應」帶出，不要逼屋主降價。
+6. 語氣要讓屋主覺得我們有在做事、有持續追蹤，但不要過度承諾。
+7. 請輸出 JSON，不要 markdown。
+
+委託資料：
+{seller_block}
+
+房仲輸入重點：
+{focus_note or '目前持續曝光與追蹤物件進度，想自然回報給屋主。'}
+
+請輸出：
+{{
+  "report_message": "可以直接複製傳給屋主的 LINE 訊息",
+  "progress_summary": "一句話摘要",
+  "customer_feedback": "客戶反應整理，沒有就留空",
+  "next_action": "下一步",
+  "ai_suggestion": "給房仲看的簡短提醒"
+}}
+""".strip()
+
+    try:
+        data = _owner_report_gemini_json(prompt) or {}
+    except Exception as e:
+        print("⚠️ v27 AI 屋主回報失敗，改用規則生成：", e)
+        data = {}
+
+    data = data if isinstance(data, dict) else {}
+    message = _v27_owner_report_result_to_message(data, focus_note)
+    return {
+        "report_message": message,
+        "progress_summary": str(data.get("progress_summary") or focus_note or message[:120]).strip(),
+        "customer_feedback": str(data.get("customer_feedback") or "").strip(),
+        "owner_response": str(data.get("owner_response") or "").strip(),
+        "next_action": str(data.get("next_action") or "持續追蹤詢問、帶看與客戶回饋，必要時再和屋主討論調整方向。").strip(),
+        "ai_suggestion": str(data.get("ai_suggestion") or "已整理成較自然的屋主 LINE 回報，可先確認內容是否符合實際狀況再傳送。").strip(),
+    }
+
+
+def _v27_save_owner_report_draft(result, seller_id, seller, focus_note, source="v27_clean_owner_report_ai"):
+    result = result if isinstance(result, dict) else {}
+    draft_payload = dict(result)
+    draft_payload.update({
+        "seller_id": seller_id or "",
+        "seller_name": seller.get("name", "") if seller else "",
+        "seller_phone": seller.get("phone", "") if seller else "",
+        "seller_address": seller.get("address", "") if seller else "",
+        "focus_note": focus_note or "",
+        "report_goal": "屋主回報",
+        "report_content": focus_note or "",
+        "report_type": "simple_ai",
+        "report_date": _owner_report_today(),
+        "source": source,
+        "created_at": now_taipei().isoformat(),
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+    })
+    ref = db.collection(OWNER_REPORT_DRAFT_COLLECTION).document()
+    ref.set(draft_payload)
+    return ref.id
+
+
+def v27_assistant_owner_report_ai():
+    """v27 極簡頁：不顯示目的、區間、很多說明，只輸入重點並顯示結果。"""
+    seller_id = (request.values.get("seller_id") or "").strip()
+    seller = _v25_get_optional_seller(seller_id)
+    draft_id = (request.values.get("draft_id") or "").strip()
+    loaded_draft = _v26_load_owner_report_draft(draft_id, seller_id=seller_id) if "_v26_load_owner_report_draft" in globals() else {}
+
+    focus_note = ""
+    result = {}
+
+    if loaded_draft:
+        result = loaded_draft
+        focus_note = loaded_draft.get("focus_note") or loaded_draft.get("report_content") or loaded_draft.get("extra_note") or ""
+        if not seller and loaded_draft.get("seller_id"):
+            seller_id = loaded_draft.get("seller_id") or seller_id
+            seller = _v25_get_optional_seller(seller_id)
+
+    if request.method == "POST":
+        seller_id = (request.form.get("seller_id") or seller_id or "").strip()
+        seller = _v25_get_optional_seller(seller_id)
+        focus_note = (request.form.get("focus_note") or request.form.get("report_content") or request.form.get("extra_note") or "").strip()
+        result = {}
+        draft_id = ""
+        if not focus_note:
+            flash("請先輸入想跟屋主回報的重點", "warning")
+        else:
+            result = generate_owner_report_simple_ai(report_content=focus_note, seller=seller)
+            try:
+                draft_id = _v27_save_owner_report_draft(result, seller_id, seller, focus_note)
+                flash("已生成，可直接複製傳給屋主", "success")
+            except Exception as e:
+                print("⚠️ v27 儲存屋主回報草稿失敗：", e)
+                flash("已生成，但草稿沒有存入 Firebase；可以先複製文字", "warning")
+
+    html = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 屋主回報</title>
+  <style>
+    :root{--bg:#faf7f1;--card:#fff;--ink:#2f2a25;--muted:#8b7b69;--brand:#f7a51f;--line:#eadfce;--soft:#fff7e8;}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft JhengHei",Arial,sans-serif;}
+    .wrap{max-width:980px;margin:0 auto;padding:22px 14px 48px;}
+    .top{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px;}
+    h1{font-size:22px;margin:0;font-weight:850;}
+    .nav{display:flex;gap:8px;flex-wrap:wrap}.link{color:#6f5c47;text-decoration:none;background:#fff;border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-size:13px;}
+    .grid{display:grid;grid-template-columns:1fr 1.08fr;gap:14px;align-items:start;}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:0 8px 20px rgba(92,64,24,.05);}
+    .seller{font-size:13px;background:var(--soft);border:1px solid var(--line);border-radius:14px;padding:10px 12px;line-height:1.6;color:#675543;margin-bottom:12px;}
+    label{display:block;font-weight:850;margin:0 0 9px;font-size:15px;}
+    textarea{width:100%;min-height:245px;resize:vertical;border:1px solid var(--line);border-radius:14px;background:#fff;padding:13px 14px;font-size:15px;line-height:1.65;outline:none;}
+    textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(247,165,31,.15);}
+    .btn{width:100%;border:0;border-radius:14px;background:var(--brand);color:#fff;padding:12px 16px;font-weight:850;cursor:pointer;font-size:15px;margin-top:12px;}
+    .btn2{border:0;border-radius:999px;background:#7d6a58;color:#fff;padding:10px 14px;font-weight:800;cursor:pointer;font-size:14px;text-decoration:none;display:inline-block;}
+    .btn2.light{background:#fff;color:#2f2a25;border:1px solid var(--line);}
+    .resultTitle{font-size:14px;color:var(--muted);font-weight:850;margin-bottom:8px;}
+    .resultBox{min-height:310px;white-space:pre-wrap;background:#fffdf9;border:1px solid var(--line);border-radius:16px;padding:16px;font-size:16px;line-height:1.85;}
+    .empty{color:#9a8a78}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center;}
+    .flash{margin:8px 0 12px;padding:10px 12px;border-radius:14px;background:#fff7e8;border:1px solid var(--line);color:#6b4b2e;font-size:14px;}
+    .tip{font-size:12px;color:var(--muted);line-height:1.5;margin-top:8px;}
+    details{margin-top:12px;color:#6d5a48;font-size:13px;} summary{cursor:pointer;color:#8a6c4b;font-weight:800;}
+    @media(max-width:840px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}.resultBox{min-height:220px}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>AI 屋主回報</h1>
+    <div class="nav">
+      <a class="link" href="{{ url_for('sellers') }}">委託列表</a>
+      {% if seller and seller.id %}<a class="link" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託</a>{% endif %}
+    </div>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}{% for category, message in messages %}<div class="flash">{{ message }}</div>{% endfor %}{% endif %}
+  {% endwith %}
+
+  <div class="grid">
+    <form class="card" method="post">
+      <input type="hidden" name="seller_id" value="{{ seller.id if seller else seller_id }}">
+      {% if seller and seller.id %}
+      <div class="seller">
+        <b>{{ seller.name or '委託' }}</b><br>
+        {{ seller.address or '-' }}<br>
+        開價：{{ seller.expected_price or seller.price or '-' }}
+      </div>
+      {% endif %}
+      <label>這次想跟屋主說什麼？</label>
+      <textarea name="focus_note" placeholder="例：本週詢問3組、帶看1組，客人喜歡格局但覺得總價偏高。想委婉跟屋主說明市場反應，並鋪陳後續可以討論價格或行銷方向。">{{ focus_note }}</textarea>
+      <button class="btn" type="submit">生成給屋主的話</button>
+      <div class="tip">直接打重點即可，不用整理格式。</div>
+    </form>
+
+    <div class="card">
+      <div class="resultTitle">給屋主的訊息</div>
+      {% if result and result.report_message %}
+        <div id="reportText" class="resultBox">{{ result.report_message }}</div>
+        <div class="actions">
+          <button class="btn2" onclick="copyReport()" type="button">複製</button>
+          {% if seller and seller.id %}
+          <form method="post" action="{{ url_for('seller_owner_report_create', seller_id=seller.id) }}" style="display:inline">
+            <input type="hidden" name="report_type" value="simple_ai">
+            <input type="hidden" name="report_date" value="{{ today_date }}">
+            <input type="hidden" name="progress_summary" value="{{ result.progress_summary }}">
+            <input type="hidden" name="customer_feedback" value="{{ result.customer_feedback }}">
+            <input type="hidden" name="next_action" value="{{ result.next_action }}">
+            <input type="hidden" name="ai_suggestion" value="{{ result.ai_suggestion }}">
+            <input type="hidden" name="report_message" value="{{ result.report_message }}">
+            <button class="btn2 light" type="submit">存到紀錄</button>
+          </form>
+          {% endif %}
+        </div>
+        {% if result and result.ai_suggestion %}
+        <details><summary>房仲提醒</summary><div style="margin-top:8px;line-height:1.7">{{ result.ai_suggestion }}</div></details>
+        {% endif %}
+      {% else %}
+        <div class="resultBox empty">生成後會顯示在這裡。</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+<script>
+function copyReport(){
+  const el=document.getElementById('reportText');
+  if(!el) return;
+  navigator.clipboard.writeText(el.innerText).then(()=>alert('已複製'));
+}
+</script>
+</body>
+</html>
+"""
+    return render_template_string(
+        html,
+        seller=seller,
+        seller_id=seller_id,
+        focus_note=focus_note,
+        result=result,
+        draft_id=draft_id,
+        today_date=_owner_report_today(),
+    )
+
+
+def v27_seller_owner_report_ai_generate(seller_id):
+    """相容舊的委託詳細頁 AI 表單；不論舊表單有哪些欄位，都導到極簡結果頁。"""
+    seller, resp = _get_seller_or_redirect(seller_id)
+    if resp:
+        return resp
+    if "_v26_build_focus_note_from_form" in globals():
+        focus_note = _v26_build_focus_note_from_form(request.form)
+    else:
+        focus_note = (request.form.get("focus_note") or request.form.get("extra_note") or request.form.get("report_content") or "").strip()
+    if not focus_note:
+        flash("請先輸入想跟屋主回報的重點", "warning")
+        return redirect(url_for("assistant_owner_report_ai", seller_id=seller_id))
+
+    result = generate_owner_report_simple_ai(report_content=focus_note, seller=seller)
+    try:
+        draft_id = _v27_save_owner_report_draft(result, seller_id, seller, focus_note, source="v27_seller_detail_ai_redirect")
+        flash("已生成，可直接複製傳給屋主", "success")
+        return redirect(url_for("assistant_owner_report_ai", seller_id=seller_id, draft_id=draft_id))
+    except Exception as e:
+        print("⚠️ v27 儲存舊表單屋主回報草稿失敗：", e)
+        flash("已生成，但草稿沒有成功存入 Firebase，請改用極簡頁重新生成", "warning")
+        return redirect(url_for("assistant_owner_report_ai", seller_id=seller_id))
+
+
+try:
+    app.view_functions["assistant_owner_report_ai"] = login_required(v27_assistant_owner_report_ai)
+    app.view_functions["seller_owner_report_ai_generate"] = login_required(v27_seller_owner_report_ai_generate)
+    print("✅ v27 AI屋主回報極簡介面已啟用：頁面更乾淨、回覆更自然")
+except Exception as e:
+    print("⚠️ v27 AI屋主回報介面套用失敗：", e)
+# =============================================================================
+# v27 End
+# =============================================================================
