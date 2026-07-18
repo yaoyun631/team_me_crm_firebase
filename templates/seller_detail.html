@@ -1,16 +1,373 @@
-{# v27 極簡 AI 屋主回報區塊
-   用法：把 templates/seller_detail.html 裡原本「AI 生成屋主回報」與「新增屋主回報」那一大段，替換成這段。
-   這段只保留一個欄位，結果會導到 /assistant/owner-report-ai 同頁顯示。
-#}
-<div class="card" style="border:1px solid #eadfce;border-radius:18px;padding:16px;background:#fffdf9;margin-bottom:16px;">
-  <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:10px;">
-    <h3 style="margin:0;font-size:18px;">AI 屋主回報</h3>
-    <a href="{{ url_for('assistant_owner_report_ai', seller_id=seller.id) }}" style="font-size:13px;color:#8a6c4b;text-decoration:none;">開啟完整頁</a>
+{% extends "base.html" %}
+{% block content %}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3 class="mb-0">委託詳細資料</h3>
+  <div>
+    <a href="{{ url_for('calendar_new', related_type='seller', related_id=seller.id, title=(seller.name ~ ' 委託追蹤'), customer_name=seller.name, phone=seller.phone, location=seller.address, note=seller.note) }}" class="btn btn-outline-success me-2">加入行事曆</a>
+    <form method="post" action="{{ url_for('seller_send_to_line', seller_id=seller.id) }}" class="d-inline-flex align-items-center gap-1 me-2 flex-wrap">
+      {% set opts = line_delivery_options('seller') %}
+      <select name="line_destination" class="form-select form-select-sm" style="width:auto; min-width:180px;">
+        {% for opt in opts %}<option value="{{ opt.value }}">{{ opt.label }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="btn btn-outline-info">傳LINE</button>
+    </form>
+    <a href="{{ url_for('seller_edit', seller_id=seller.id) }}" class="btn btn-warning me-2">編輯資料</a>
+    <a href="{{ url_for('sellers') }}" class="btn btn-secondary">返回列表</a>
+  </div>
+</div>
+
+{# 先統一處理圖片資料：支援 photo_urls + 舊版 photo_url #}
+{% set photos = [] %}
+{% if seller.photo_urls is defined and seller.photo_urls %}
+  {% set photos = seller.photo_urls %}
+{% elif seller.photo_url %}
+  {% set photos = [seller.photo_url] %}
+{% endif %}
+
+<div class="card mb-4">
+  <div class="card-body">
+    <h5 class="card-title mb-3">
+      {{ seller.name }}
+      {% if seller.level %}
+        <span class="badge bg-primary ms-2">等級 {{ seller.level }}</span>
+      {% endif %}
+    </h5>
+
+    <div class="mb-3">
+      <span class="badge {% if seller.visibility == 'personal' %}bg-warning text-dark{% else %}bg-success{% endif %}">
+        LINE顯示：{{ '個人資料' if seller.visibility == 'personal' else '公開資料' }}
+      </span>
+      {% if seller.visibility == 'personal' %}
+        <span class="badge bg-light text-dark ms-1">{{ seller.owner_line_name or seller.owner_user_name or '未綁定個人LINE' }}</span>
+      {% endif %}
+    </div>
+
+    {% if photos %}
+      <p class="mb-3">
+        <a href="#" data-bs-toggle="modal" data-bs-target="#sellerPhotoModal">
+          查看委託圖片（共 {{ photos|length }} 張）
+        </a>
+      </p>
+    {% endif %}
+
+    <div class="row mb-2">
+      <div class="col-md-6">
+        <p class="mb-1"><strong>電話：</strong>{{ seller.phone or "-" }}</p>
+        <p class="mb-1"><strong>LINE ID：</strong>{{ seller.line_id or "-" }}</p>
+        <p class="mb-1"><strong>Email：</strong>{{ seller.email or "-" }}</p>
+        <p class="mb-1"><strong>客源來源：</strong>{{ seller.source or "-" }}</p>
+      </div>
+      <div class="col-md-6">
+        <p class="mb-1">
+          <strong>委託類型：</strong>
+          {% if seller.deal_type == "sale" %}買賣
+          {% elif seller.deal_type == "rent" %}出租
+          {% else %}-{% endif %}
+        </p>
+        <p class="mb-1"><strong>物件地址：</strong>{{ seller.address or "-" }}</p>
+        <p class="mb-1"><strong>產品類型：</strong>{{ seller.property_type or "-" }}</p>
+        <p class="mb-1"><strong>目前進程：</strong>{{ seller.stage or "-" }}</p>
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="row">
+      <div class="col-md-6">
+        <p class="mb-1"><strong>開價 / 期望價：</strong>{{ seller.expected_price or seller.price or "-" }}</p>
+        <p class="mb-1"><strong>底價：</strong>{{ seller.min_price or "-" }}</p>
+        <p class="mb-1"><strong>委託到期日：</strong>{{ seller.contract_end_date or "-" }}</p>
+      </div>
+      <div class="col-md-6">
+        <p class="mb-1"><strong>出售 / 出租原因：</strong>{{ seller.reason or "-" }}</p>
+        <p class="mb-1"><strong>內部備註：</strong>{{ seller.note or "-" }}</p>
+      </div>
+    </div>
+
+    <p class="mb-0 text-muted mt-2">
+      <small>
+        建立時間：{{ seller.created_at or "-" }}
+        {% if seller.created_by_name %}｜建立者：{{ seller.created_by_name }}{% endif %}
+      </small>
+    </p>
+    {% if seller.updated_at %}
+      <p class="mb-0 text-muted">
+        <small>
+          最後編輯時間：{{ seller.updated_at }}
+          {% if seller.updated_by_name %}｜編輯者：{{ seller.updated_by_name }}{% endif %}
+        </small>
+      </p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row">
+  <div class="col-md-6 mb-4">
+    <h4 class="mb-3">新增追蹤紀錄</h4>
+    <form id="followupForm" method="post" action="{{ url_for('add_seller_followup', seller_id=seller.id) }}">
+      <div class="mb-3">
+        <label class="form-label">聯絡時間（不填則用現在）</label>
+        <input type="datetime-local" name="contact_time" class="form-control">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">聯絡方式</label>
+        <input id="followupChannel" type="text" name="channel" class="form-control"
+               placeholder="電話 / LINE / 簡訊 / 現場…">
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">聯絡內容紀錄</label>
+        <textarea id="followupContent" name="content" class="form-control" rows="3"
+                  placeholder="聊了什麼？屋主反應如何？"></textarea>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">下一步怎麼做？</label>
+        <textarea name="next_action" class="form-control" rows="2"
+                  placeholder="例：整理帶看回饋、回報曝光狀況、確認底價…"></textarea>
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">下次聯絡日期（選填）</label>
+        <input type="date" name="next_contact_date" class="form-control">
+      </div>
+
+      <button type="submit" class="btn btn-primary">新增紀錄</button>
+    </form>
   </div>
 
-  <form method="post" action="{{ url_for('seller_owner_report_ai_generate', seller_id=seller.id) }}">
-    <label style="display:block;font-weight:700;margin-bottom:8px;">這次想跟屋主說什麼？</label>
-    <textarea name="focus_note" rows="5" style="width:100%;border:1px solid #eadfce;border-radius:14px;padding:12px;line-height:1.6;resize:vertical;" placeholder="例：本週詢問3組、帶看1組，客人喜歡格局但覺得總價偏高。想委婉跟屋主說明市場反應，並鋪陳後續可以討論價格或行銷方向。"></textarea>
-    <button type="submit" style="margin-top:10px;width:100%;border:0;border-radius:14px;background:#f7a51f;color:white;padding:11px 14px;font-weight:800;cursor:pointer;">生成給屋主的話</button>
-  </form>
+  <div class="col-md-6 mb-4">
+    <h4 class="mb-3">AI 生成屋主回報</h4>
+
+    <div class="card">
+      <div class="card-body">
+        <form method="post" action="{{ url_for('seller_owner_report_ai_generate', seller_id=seller.id) }}">
+          <input type="hidden" name="report_type" value="general">
+          <input type="hidden" name="report_period_start" value="">
+          <input type="hidden" name="report_period_end" value="{{ today_date or '' }}">
+
+          <div class="mb-3">
+            <label class="form-label">這次想跟屋主說什麼？</label>
+            <textarea name="extra_note" class="form-control" rows="6"
+                      placeholder="例：本週詢問3組，帶看1組。客人喜歡格局，但普遍覺得價格偏高，想委婉跟屋主鋪陳後續可以討論價格或行銷方向。"></textarea>
+          </div>
+
+          <button type="submit" class="btn btn-warning w-100">AI 生成給屋主的回報對話</button>
+        </form>
+
+        {% if ai_owner_report_draft and ai_owner_report_draft.report_message %}
+          <hr>
+          <label class="form-label">AI 生成結果</label>
+          <textarea id="ownerReportText" class="form-control" rows="8">{{ ai_owner_report_draft.report_message }}</textarea>
+
+          <div class="d-flex gap-2 mt-3 flex-wrap">
+            <button type="button" class="btn btn-outline-secondary" id="copyOwnerReportBtn">複製文字</button>
+
+            <form method="post" action="{{ url_for('seller_owner_report_create', seller_id=seller.id) }}" class="d-inline">
+              <input type="hidden" name="report_date" value="{{ today_date or '' }}">
+              <input type="hidden" name="report_type" value="{{ ai_owner_report_draft.report_type or 'general' }}">
+              <input type="hidden" name="progress_summary" value="{{ ai_owner_report_draft.progress_summary or '' }}">
+              <input type="hidden" name="customer_feedback" value="{{ ai_owner_report_draft.customer_feedback or '' }}">
+              <input type="hidden" name="owner_response" value="{{ ai_owner_report_draft.owner_response or '' }}">
+              <input type="hidden" name="next_action" value="{{ ai_owner_report_draft.next_action or '' }}">
+              <input type="hidden" name="ai_suggestion" value="{{ ai_owner_report_draft.ai_suggestion or '' }}">
+              <input type="hidden" name="report_message" value="{{ ai_owner_report_draft.report_message or '' }}">
+              <button type="submit" class="btn btn-primary">儲存成屋主回報</button>
+            </form>
+          </div>
+        {% else %}
+          <p class="text-muted small mb-0 mt-3">
+            輸入重點後按生成，AI 會整理成比較自然、可以直接傳給屋主的 LINE 文字。
+          </p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
 </div>
+
+<div class="row">
+  <div class="col-md-6 mb-4">
+    <h4 class="mb-3">追蹤紀錄列表</h4>
+    {% if followups %}
+      <div class="list-group">
+        {% for f in followups %}
+          <div class="list-group-item">
+            <div class="d-flex justify-content-between align-items-center">
+              <div>
+                <strong>{{ f.contact_time }}</strong>
+                {% if f.channel %}
+                  <span class="badge bg-secondary ms-2">{{ f.channel }}</span>
+                {% endif %}
+              </div>
+              <div class="text-end">
+                <small class="text-muted d-block mb-1">
+                  建立者：{{ f.created_by_name or "-" }}
+                </small>
+                <a href="{{ url_for('seller_followup_edit', seller_id=seller.id, followup_id=f.id) }}"
+                   class="btn btn-sm btn-outline-secondary me-1">編輯</a>
+                <button type="button"
+                        class="btn btn-sm btn-outline-primary me-1 js-reply-followup"
+                        data-channel="{{ f.channel or 'LINE' }}"
+                        data-reply="回覆 {{ f.contact_time or '' }} 追蹤：">回覆追蹤</button>
+                <form method="post"
+                      action="{{ url_for('seller_followup_delete', seller_id=seller.id, followup_id=f.id) }}"
+                      style="display:inline;"
+                      onsubmit="return confirm('確定要刪除這筆追蹤紀錄嗎？');">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
+                </form>
+              </div>
+            </div>
+
+            {% if f.content %}
+              <p class="mt-2 mb-1"><strong>內容：</strong>{{ f.content }}</p>
+            {% endif %}
+            {% if f.next_action %}
+              <p class="mb-1"><strong>下一步：</strong>{{ f.next_action }}</p>
+            {% endif %}
+            {% if f.next_contact_date %}
+              <p class="mb-0 text-muted">
+                <small>預計下次聯絡日期：{{ f.next_contact_date }}</small>
+              </p>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="text-muted">尚無追蹤紀錄，可以上方新增一筆。</p>
+    {% endif %}
+  </div>
+
+  <div class="col-md-6 mb-4">
+    <h4 class="mb-3">屋主回報紀錄</h4>
+    {% if owner_reports %}
+      <div class="list-group">
+        {% for r in owner_reports %}
+          <div class="list-group-item">
+            <div class="d-flex justify-content-between align-items-start">
+              <div>
+                <strong>{{ r.report_date or r.created_at or "-" }}</strong>
+                {% if r.report_type_label %}
+                  <span class="badge bg-secondary ms-2">{{ r.report_type_label }}</span>
+                {% endif %}
+              </div>
+              <form method="post"
+                    action="{{ url_for('seller_owner_report_delete', seller_id=seller.id, report_id=r.id) }}"
+                    style="display:inline;"
+                    onsubmit="return confirm('確定要刪除這筆屋主回報嗎？');">
+                <button type="submit" class="btn btn-sm btn-outline-danger">刪除</button>
+              </form>
+            </div>
+
+            {% if r.report_message %}
+              <p class="mt-2 mb-1" style="white-space: pre-line;">{{ r.report_message }}</p>
+            {% elif r.progress_summary %}
+              <p class="mt-2 mb-1">{{ r.progress_summary }}</p>
+            {% endif %}
+
+            {% if r.next_action %}
+              <p class="mb-0 text-muted"><small>下一步：{{ r.next_action }}</small></p>
+            {% endif %}
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="text-muted">尚無屋主回報紀錄。</p>
+    {% endif %}
+  </div>
+</div>
+
+{# ===== 圖片 Modal + Carousel：點文字後展開，左右可滑 ===== #}
+{% if photos %}
+<div class="modal fade" id="sellerPhotoModal" tabindex="-1" aria-labelledby="sellerPhotoModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-lg">
+    <div class="modal-content bg-dark">
+      <div class="modal-header border-0">
+        <h5 class="modal-title text-white" id="sellerPhotoModalLabel">委託圖片</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body p-0">
+        <div id="sellerPhotoCarousel" class="carousel slide" data-bs-ride="carousel" data-bs-touch="true">
+          <div class="carousel-inner">
+            {% for url in photos %}
+              <div class="carousel-item {% if loop.first %}active{% endif %}">
+                <img src="{{ url }}"
+                     class="d-block w-100"
+                     style="max-height: 80vh; object-fit: contain;"
+                     alt="委託照片 {{ loop.index }}">
+              </div>
+            {% endfor %}
+          </div>
+
+          {% if photos|length > 1 %}
+          <button class="carousel-control-prev" type="button" data-bs-target="#sellerPhotoCarousel" data-bs-slide="prev">
+            <span class="carousel-control-prev-icon" aria-hidden="true"></span>
+            <span class="visually-hidden">Previous</span>
+          </button>
+          <button class="carousel-control-next" type="button" data-bs-target="#sellerPhotoCarousel" data-bs-slide="next">
+            <span class="carousel-control-next-icon" aria-hidden="true"></span>
+            <span class="visually-hidden">Next</span>
+          </button>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  const buttons = document.querySelectorAll('.js-reply-followup');
+  const content = document.getElementById('followupContent');
+  const channel = document.getElementById('followupChannel');
+  const form = document.getElementById('followupForm');
+
+  buttons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (!content || !form) return;
+      const prefix = btn.dataset.reply || '回覆追蹤：';
+      const channelValue = btn.dataset.channel || 'LINE';
+
+      if (channel && !channel.value) {
+        channel.value = channelValue;
+      }
+
+      if (!content.value.trim()) {
+        content.value = prefix + '\n';
+      } else {
+        content.value = content.value.trim() + '\n\n' + prefix + '\n';
+      }
+
+      form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setTimeout(function () {
+        content.focus();
+        content.selectionStart = content.selectionEnd = content.value.length;
+      }, 350);
+    });
+  });
+
+  const copyBtn = document.getElementById('copyOwnerReportBtn');
+  const reportText = document.getElementById('ownerReportText');
+
+  if (copyBtn && reportText) {
+    copyBtn.addEventListener('click', async function () {
+      try {
+        await navigator.clipboard.writeText(reportText.value || '');
+        copyBtn.textContent = '已複製';
+        setTimeout(() => copyBtn.textContent = '複製文字', 1500);
+      } catch (e) {
+        reportText.select();
+        document.execCommand('copy');
+        copyBtn.textContent = '已複製';
+        setTimeout(() => copyBtn.textContent = '複製文字', 1500);
+      }
+    });
+  }
+});
+</script>
+{% endblock %}
