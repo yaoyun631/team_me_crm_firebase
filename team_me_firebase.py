@@ -33302,3 +33302,314 @@ except Exception as e:
 # =============================================================================
 # v27 End
 # =============================================================================
+
+
+
+# =============================================================================
+# Team M.E v29：房產查詢 / 新上架物件後台頁面
+# - 新增 /assistant/new-properties：只看網址解析 / 新上架物件查詢
+# - 新增 /assistant/property-results：看全部房產查詢結果，含地址、實價、歷史、網址
+# - 不改動原本 /result/<token> 單筆結果頁
+# =============================================================================
+
+TEAMME_DASHBOARD_RESULT_LIMIT = int(os.environ.get("TEAMME_DASHBOARD_RESULT_LIMIT", "200") or "200")
+
+def _v29_safe_text(value, default=""):
+    if value is None:
+        return default
+    try:
+        text = str(value)
+    except Exception:
+        return default
+    return text.strip() if text.strip() else default
+
+
+def _v29_get_nested(data, *keys, default=""):
+    cur = data
+    for key in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return default if cur is None else cur
+
+
+def _v29_result_link(token):
+    token = _v29_safe_text(token)
+    if not token:
+        return ""
+    try:
+        return url_for("teamme_property_result", token=token)
+    except Exception:
+        return f"/result/{token}"
+
+
+def _v29_result_kind_label(kind, command=""):
+    kind = _v29_safe_text(kind)
+    command = _v29_safe_text(command)
+    mapping = {
+        "url": "網址解析",
+        "address": "地址行情",
+        "nearby": "附近行情",
+        "history": "本戶成交",
+        "status": "資料庫狀態",
+        "settings": "查詢設定",
+        "recent": "最近查詢",
+    }
+    if kind in mapping:
+        return mapping[kind]
+    command_mapping = {
+        "url_lookup": "網址解析",
+        "address_lookup": "地址行情",
+        "nearby": "附近行情",
+        "history": "本戶成交",
+        "db_status": "資料庫狀態",
+    }
+    return command_mapping.get(command, kind or command or "房產查詢")
+
+
+def _v29_result_area_text(row):
+    parts = []
+    for key in ("district", "public_address", "address", "query"):
+        val = _v29_safe_text(row.get(key))
+        if val and val not in parts:
+            parts.append(val)
+    return "｜".join(parts[:2]) or "-"
+
+
+def _v29_extract_property_result_row(doc):
+    data = doc.to_dict() or {}
+    result = data.get("result") or {}
+    parsed = result.get("parsed") or {}
+    summary = result.get("summary") or {}
+    payload = data.get("payload") or {}
+    source = data.get("source") or {}
+
+    command = (
+        _v29_safe_text(data.get("command"))
+        or _v29_safe_text(_v29_get_nested(data, "task", "command"))
+        or _v29_safe_text(result.get("command"))
+    )
+    kind = (
+        _v29_safe_text(result.get("kind"))
+        or ("url" if command == "url_lookup" else "")
+        or ("address" if command == "address_lookup" else "")
+        or command
+    )
+
+    token = (
+        _v29_safe_text(data.get("result_token"))
+        or _v29_safe_text(data.get("token"))
+        or _v29_safe_text(result.get("result_token"))
+    )
+
+    title = (
+        _v29_safe_text(parsed.get("title"))
+        or _v29_safe_text(result.get("title"))
+        or _v29_safe_text(result.get("query"))
+        or _v29_safe_text(payload.get("address"))
+        or _v29_safe_text(payload.get("url"))
+        or _v29_safe_text(data.get("task_id"))
+        or doc.id
+    )
+
+    row = {
+        "id": doc.id,
+        "task_id": _v29_safe_text(data.get("task_id")) or doc.id,
+        "created_at": _v29_safe_text(data.get("created_at")) or _v29_safe_text(result.get("created_at")),
+        "updated_at": _v29_safe_text(data.get("updated_at")),
+        "kind": kind,
+        "kind_label": _v29_result_kind_label(kind, command),
+        "command": command,
+        "title": title,
+        "url": _v29_safe_text(payload.get("url")) or _v29_safe_text(parsed.get("url")) or _v29_safe_text(parsed.get("source_url")),
+        "query": _v29_safe_text(result.get("query")) or _v29_safe_text(payload.get("address")),
+        "district": _v29_safe_text(parsed.get("district")) or _v29_safe_text(result.get("district")),
+        "public_address": _v29_safe_text(parsed.get("public_address")) or _v29_safe_text(parsed.get("address")),
+        "building_area_ping": _v29_safe_text(parsed.get("building_area_ping")),
+        "main_area_ping": _v29_safe_text(parsed.get("main_area_ping")),
+        "land_area_ping": _v29_safe_text(parsed.get("land_area_ping")),
+        "floor_text": _v29_safe_text(parsed.get("floor_text")) or _v29_safe_text(parsed.get("total_floors")),
+        "building_age": _v29_safe_text(parsed.get("building_age")),
+        "summary_count": _v29_safe_text(summary.get("count")),
+        "median_unit": _v29_safe_text(summary.get("median_unit")),
+        "average_unit": _v29_safe_text(summary.get("average_unit")),
+        "median_total": _v29_safe_text(summary.get("median_total")),
+        "candidate_count": len(result.get("candidates") or []) if isinstance(result.get("candidates"), list) else 0,
+        "result_link": _v29_result_link(token),
+        "target_id": _v29_safe_text(source.get("target_id")),
+        "source_type": _v29_safe_text(source.get("type")),
+    }
+    row["area_text"] = _v29_result_area_text(row)
+    return row
+
+
+def _v29_fetch_property_results(kind_filter="", limit=None):
+    collection_name = globals().get("TEAMME_PROPERTY_RESULT_COLLECTION", "team_me_line_results")
+    limit = limit or TEAMME_DASHBOARD_RESULT_LIMIT
+    rows = []
+    try:
+        docs = list(db.collection(collection_name).stream())
+    except Exception as e:
+        print("⚠️ v29 讀取房產查詢結果失敗：", e)
+        docs = []
+
+    for doc in docs:
+        try:
+            row = _v29_extract_property_result_row(doc)
+            kind = row.get("kind") or ""
+            command = row.get("command") or ""
+            if kind_filter:
+                if kind_filter == "url":
+                    if not (kind == "url" or command == "url_lookup"):
+                        continue
+                elif kind_filter == "address":
+                    if not (kind == "address" or command == "address_lookup"):
+                        continue
+                elif kind_filter not in {kind, command}:
+                    continue
+            rows.append(row)
+        except Exception as e:
+            print("⚠️ v29 解析房產結果列失敗：", e)
+
+    rows.sort(key=lambda r: r.get("created_at") or r.get("updated_at") or "", reverse=True)
+    return rows[:limit]
+
+
+_TEAMME_V29_PROPERTY_DASHBOARD_TEMPLATE = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ page_title }}</title>
+  <style>
+    body{font-family:Arial,"Microsoft JhengHei",sans-serif;background:#f7f3ee;color:#382d25;margin:0;padding:18px}
+    .wrap{max-width:1180px;margin:0 auto}
+    .top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+    h1{font-size:24px;margin:0}.muted{color:#7c6b5c;font-size:13px}
+    .tabs{display:flex;gap:8px;flex-wrap:wrap}
+    .btn{display:inline-block;padding:8px 12px;border-radius:10px;border:1px solid #e2c5a2;background:#fff;color:#704719;text-decoration:none;font-size:14px}
+    .btn.active{background:#ffb300;border-color:#ffb300;color:#fff;font-weight:bold}
+    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:12px 0}
+    .stat{background:#fff;border:1px solid #eadbc9;border-radius:16px;padding:14px;box-shadow:0 6px 18px rgba(85,55,25,.05)}
+    .stat b{display:block;font-size:24px;margin-bottom:3px}
+    .card{background:#fff;border:1px solid #eadbc9;border-radius:18px;padding:16px;margin-bottom:12px;box-shadow:0 8px 24px rgba(85,55,25,.06)}
+    .row{display:grid;grid-template-columns:1.2fr .8fr .8fr .8fr auto;gap:10px;align-items:start}
+    .title{font-size:16px;font-weight:bold;line-height:1.45}.tag{display:inline-block;background:#fff2df;border:1px solid #f0d2b1;color:#704719;padding:3px 8px;border-radius:999px;font-size:12px;margin-bottom:6px}
+    .small{font-size:13px;color:#5f5044;line-height:1.6;word-break:break-word}
+    .empty{background:#fff;border:1px dashed #d9c3a9;border-radius:18px;padding:28px;text-align:center;color:#806e5f}
+    @media(max-width:850px){.row{grid-template-columns:1fr}.top{display:block}.tabs{margin-top:10px}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>{{ page_title }}</h1>
+      <div class="muted">{{ page_desc }}</div>
+    </div>
+    <div class="tabs">
+      <a class="btn {% if active=='new' %}active{% endif %}" href="{{ url_for('assistant_new_properties') }}">新上架物件</a>
+      <a class="btn {% if active=='all' %}active{% endif %}" href="{{ url_for('assistant_property_results') }}">全部房產查詢</a>
+      <a class="btn" href="{{ url_for('buyers') }}">回後台</a>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><b>{{ rows|length }}</b><span>目前顯示</span></div>
+    <div class="stat"><b>{{ url_count }}</b><span>網址 / 物件查詢</span></div>
+    <div class="stat"><b>{{ address_count }}</b><span>地址 / 實價查詢</span></div>
+  </div>
+
+  {% if not rows %}
+    <div class="empty">
+      目前沒有可顯示的資料。<br>
+      你可以先從 LINE 貼樂屋 / 591 網址，或查詢台中市地址；本機 Agent 完成後，資料會出現在這裡。
+    </div>
+  {% endif %}
+
+  {% for r in rows %}
+    <div class="card">
+      <div class="row">
+        <div>
+          <span class="tag">{{ r.kind_label }}</span>
+          <div class="title">{{ r.title }}</div>
+          <div class="small">
+            {{ r.area_text }}<br>
+            {% if r.url %}<a href="{{ r.url }}" target="_blank">原始物件網址</a>{% endif %}
+          </div>
+        </div>
+        <div class="small">
+          <b>物件資訊</b><br>
+          總建坪：{{ r.building_area_ping or "-" }}<br>
+          主建物：{{ r.main_area_ping or "-" }}<br>
+          地坪：{{ r.land_area_ping or "-" }}
+        </div>
+        <div class="small">
+          <b>實價摘要</b><br>
+          成交筆數：{{ r.summary_count or r.candidate_count or "-" }}<br>
+          單價中位：{{ r.median_unit or "-" }}<br>
+          總價中位：{{ r.median_total or "-" }}
+        </div>
+        <div class="small">
+          <b>時間</b><br>
+          {{ r.created_at or "-" }}<br>
+          <span class="muted">任務：{{ r.task_id[:12] }}</span>
+        </div>
+        <div>
+          {% if r.result_link %}
+            <a class="btn active" href="{{ r.result_link }}" target="_blank">查看結果</a>
+          {% else %}
+            <span class="muted">無連結</span>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/assistant/new-properties")
+@login_required
+def assistant_new_properties():
+    rows = _v29_fetch_property_results(kind_filter="url")
+    all_rows = _v29_fetch_property_results(kind_filter="")
+    url_count = len([r for r in all_rows if r.get("kind") == "url" or r.get("command") == "url_lookup"])
+    address_count = len([r for r in all_rows if r.get("kind") == "address" or r.get("command") == "address_lookup"])
+    return render_template_string(
+        _TEAMME_V29_PROPERTY_DASHBOARD_TEMPLATE,
+        page_title="新上架物件查詢後台",
+        page_desc="這裡會集中顯示 LINE 貼上的樂屋 / 591 物件網址解析結果。",
+        rows=rows,
+        url_count=url_count,
+        address_count=address_count,
+        active="new",
+    )
+
+
+@app.route("/assistant/property-results")
+@login_required
+def assistant_property_results():
+    kind = (request.args.get("kind") or "").strip()
+    rows = _v29_fetch_property_results(kind_filter=kind)
+    all_rows = _v29_fetch_property_results(kind_filter="")
+    url_count = len([r for r in all_rows if r.get("kind") == "url" or r.get("command") == "url_lookup"])
+    address_count = len([r for r in all_rows if r.get("kind") == "address" or r.get("command") == "address_lookup"])
+    return render_template_string(
+        _TEAMME_V29_PROPERTY_DASHBOARD_TEMPLATE,
+        page_title="房產查詢結果後台",
+        page_desc="集中顯示網址解析、地址行情、本戶成交、附近行情等查詢結果。",
+        rows=rows,
+        url_count=url_count,
+        address_count=address_count,
+        active="all",
+    )
+
+
+print("✅ v29 房產查詢後台已啟用：/assistant/new-properties、/assistant/property-results")
+# =============================================================================
+# v29 End
+# =============================================================================
