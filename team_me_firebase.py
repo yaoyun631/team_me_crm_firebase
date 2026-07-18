@@ -32759,3 +32759,265 @@ print("✅ v25 AI屋主回報簡潔介面已啟用：/assistant/owner-report-ai"
 # =============================================================================
 # v25 End
 # =============================================================================
+
+
+# =============================================================================
+# v26：AI屋主回報單欄位 + 同頁顯示結果
+# - 舊的 /sellers/<seller_id>/owner-report/ai 送出後，不再只跳回委託頁導致看不到草稿
+# - 改成生成草稿後，直接導到 /assistant/owner-report-ai?seller_id=...&draft_id=...
+# - /assistant/owner-report-ai 介面改成只保留「這次希望 AI 著重什麼？」
+# - 不再顯示回報目的 / 回報區間起 / 回報區間迄
+# =============================================================================
+
+def _v26_load_owner_report_draft(draft_id, seller_id=""):
+    draft_id = str(draft_id or "").strip()
+    seller_id = str(seller_id or "").strip()
+    if not draft_id:
+        return {}
+    try:
+        snap = db.collection(OWNER_REPORT_DRAFT_COLLECTION).document(draft_id).get()
+        if not snap.exists:
+            return {}
+        data = snap.to_dict() or {}
+        data["id"] = draft_id
+        # 有帶 seller_id 時，避免讀到別筆委託的草稿。
+        if seller_id and str(data.get("seller_id") or "") not in ("", seller_id):
+            return {}
+        return data
+    except Exception as e:
+        print("⚠️ v26 讀取屋主回報草稿失敗：", e)
+        return {}
+
+
+def _v26_build_focus_note_from_form(form):
+    """相容舊表單與新表單，統一轉成一個欄位。"""
+    candidates = [
+        form.get("focus_note"),
+        form.get("report_content"),
+        form.get("extra_note"),
+        form.get("progress_summary"),
+        form.get("customer_feedback"),
+        form.get("note"),
+        form.get("content"),
+    ]
+    for value in candidates:
+        value = str(value or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _v26_save_owner_report_draft(result, seller_id, seller, focus_note, source="v26_one_field_owner_report_ai"):
+    draft_payload = dict(result or {})
+    draft_payload.update({
+        "seller_id": seller_id or "",
+        "seller_name": seller.get("name", "") if seller else "",
+        "seller_phone": seller.get("phone", "") if seller else "",
+        "seller_address": seller.get("address", "") if seller else "",
+        "focus_note": focus_note or "",
+        "report_goal": "屋主回報",
+        "report_content": focus_note or "",
+        "report_type": "simple_ai",
+        "report_date": _owner_report_today(),
+        "source": source,
+        "created_at": now_taipei().isoformat(),
+        "created_by_id": session.get("user_id"),
+        "created_by_name": session.get("user_name"),
+    })
+    ref = db.collection(OWNER_REPORT_DRAFT_COLLECTION).document()
+    ref.set(draft_payload)
+    return ref.id
+
+
+def v26_assistant_owner_report_ai():
+    """v26 單欄位頁：只輸入這次希望 AI 著重什麼，結果直接顯示在同頁。"""
+    seller_id = (request.values.get("seller_id") or "").strip()
+    seller = _v25_get_optional_seller(seller_id)
+    draft_id = (request.values.get("draft_id") or "").strip()
+    loaded_draft = _v26_load_owner_report_draft(draft_id, seller_id=seller_id)
+
+    focus_note = ""
+    result = {}
+
+    if loaded_draft:
+        result = loaded_draft
+        focus_note = loaded_draft.get("focus_note") or loaded_draft.get("report_content") or loaded_draft.get("extra_note") or ""
+        if not seller and loaded_draft.get("seller_id"):
+            seller_id = loaded_draft.get("seller_id") or seller_id
+            seller = _v25_get_optional_seller(seller_id)
+
+    if request.method == "POST":
+        seller_id = (request.form.get("seller_id") or seller_id or "").strip()
+        seller = _v25_get_optional_seller(seller_id)
+        focus_note = _v26_build_focus_note_from_form(request.form)
+        result = {}
+        draft_id = ""
+        if not focus_note:
+            flash("請輸入這次希望 AI 著重什麼", "warning")
+        else:
+            result = generate_owner_report_simple_ai(
+                report_goal="屋主回報",
+                report_content=focus_note,
+                seller=seller,
+            )
+            try:
+                draft_id = _v26_save_owner_report_draft(result, seller_id, seller, focus_note)
+                flash("AI 已生成屋主回報，結果已顯示在右側", "success")
+            except Exception as e:
+                print("⚠️ v26 儲存屋主回報草稿失敗：", e)
+                flash("AI 已生成，但草稿沒有成功存入 Firebase；仍可先複製畫面文字", "warning")
+
+    html = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 生成屋主回報</title>
+  <style>
+    :root{--bg:#f8f5ef;--card:#fffdf9;--ink:#2f2a25;--muted:#8a7b6b;--brand:#f59a23;--line:#eadfce;--soft:#fff6e8;}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft JhengHei",Arial,sans-serif;}
+    .wrap{max-width:1120px;margin:0 auto;padding:24px 16px 56px;}
+    .top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px;}
+    h1{font-size:24px;margin:0 0 6px;font-weight:850;letter-spacing:.02em;}
+    .sub{color:var(--muted);font-size:14px;line-height:1.6;}
+    .grid{display:grid;grid-template-columns:0.9fr 1.1fr;gap:16px;align-items:start;}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 8px 22px rgba(80,55,20,.05);}
+    label{display:block;font-weight:850;margin:8px 0 10px;font-size:15px;}
+    textarea{width:100%;border:1px solid var(--line);border-radius:14px;background:#fff;padding:13px 14px;font-size:15px;line-height:1.7;outline:none;resize:vertical;min-height:250px;}
+    textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(245,154,35,.14);}
+    .btn{border:0;border-radius:999px;background:var(--brand);color:#fff;padding:12px 18px;font-weight:850;cursor:pointer;font-size:15px;text-decoration:none;display:inline-block;text-align:center;}
+    .btn.secondary{background:#7d6a58}.btn.light{background:#fff;color:var(--ink);border:1px solid var(--line)}
+    .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px;}
+    .resultBox{min-height:330px;white-space:pre-wrap;background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px;font-size:16px;line-height:1.8;}
+    .empty{color:#9a8a78}.hint{font-size:13px;color:var(--muted);margin-top:8px;line-height:1.5;}
+    .seller{font-size:14px;background:var(--soft);border:1px solid var(--line);border-radius:14px;padding:12px;line-height:1.7;color:#5f5144;margin-bottom:14px;}
+    .flash{margin:10px 0 14px;padding:11px 13px;border-radius:14px;background:#fff;border:1px solid var(--line);color:#6b4b2e;}
+    .smallTitle{font-size:14px;color:var(--muted);font-weight:800;margin-bottom:8px;}
+    @media(max-width:880px){.grid{grid-template-columns:1fr}.top{display:block}.wrap{padding:18px 12px 40px}.resultBox{min-height:220px}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>AI 生成屋主回報</h1>
+      <div class="sub">只要輸入「這次希望 AI 著重什麼」，AI 會整理成可以直接貼給屋主的 LINE 對話。</div>
+    </div>
+    <div class="actions" style="margin-top:0">
+      <a class="btn light" href="{{ url_for('sellers') }}">回委託列表</a>
+      {% if seller and seller.id %}<a class="btn light" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回這筆委託</a>{% endif %}
+    </div>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}{% for category, message in messages %}<div class="flash">{{ message }}</div>{% endfor %}{% endif %}
+  {% endwith %}
+
+  <div class="grid">
+    <form class="card" method="post">
+      <input type="hidden" name="seller_id" value="{{ seller.id if seller else seller_id }}">
+      {% if seller and seller.id %}
+      <div class="seller">
+        <b>目前委託：</b>{{ seller.name or '-' }}<br>
+        <b>物件：</b>{{ seller.address or '-' }}<br>
+        <b>開價：</b>{{ seller.expected_price or seller.price or '-' }}
+      </div>
+      {% endif %}
+
+      <label>這次希望 AI 著重什麼？</label>
+      <textarea name="focus_note" placeholder="例：這次要委婉跟屋主說明詢問量偏少，客人普遍覺得價格稍高，但不要讓屋主覺得我們沒有在做事。可以提到目前仍有持續曝光，也會再整理同區競品和近期回饋，建議後續可以討論價格或行銷方向。">{{ focus_note }}</textarea>
+      <div class="hint">可以直接貼雜亂筆記，例如：詢問幾組、帶看幾組、客人嫌價格高、喜歡格局、下一步想約屋主討論。</div>
+
+      <div class="actions">
+        <button class="btn" type="submit">AI 生成屋主回報</button>
+        <a class="btn light" href="{{ url_for('assistant_owner_report_ai', seller_id=seller.id) if seller and seller.id else url_for('assistant_owner_report_ai') }}">清空</a>
+      </div>
+    </form>
+
+    <div class="card">
+      <div class="smallTitle">生成結果：可直接傳給屋主</div>
+      {% if result and result.report_message %}
+        <div id="reportText" class="resultBox">{{ result.report_message }}</div>
+        <div class="actions">
+          <button class="btn" onclick="copyReport()" type="button">複製文字</button>
+          {% if seller and seller.id %}
+          <form method="post" action="{{ url_for('seller_owner_report_create', seller_id=seller.id) }}" style="display:inline">
+            <input type="hidden" name="report_type" value="simple_ai">
+            <input type="hidden" name="report_date" value="{{ today_date }}">
+            <input type="hidden" name="progress_summary" value="{{ result.progress_summary }}">
+            <input type="hidden" name="customer_feedback" value="{{ result.customer_feedback }}">
+            <input type="hidden" name="next_action" value="{{ result.next_action }}">
+            <input type="hidden" name="ai_suggestion" value="{{ result.ai_suggestion }}">
+            <input type="hidden" name="report_message" value="{{ result.report_message }}">
+            <button class="btn secondary" type="submit">儲存到屋主回報紀錄</button>
+          </form>
+          {% endif %}
+        </div>
+        <div class="hint">草稿ID：{{ draft_id or result.id or '未儲存' }}</div>
+      {% else %}
+        <div class="resultBox empty">生成後會直接顯示在這裡，不需要再跳其他頁面找草稿。</div>
+      {% endif %}
+
+      {% if result and result.ai_suggestion %}
+      <div class="smallTitle" style="margin-top:18px">給房仲看的建議</div>
+      <div class="resultBox" style="min-height:78px;font-size:14px;color:#5f5144">{{ result.ai_suggestion }}</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+<script>
+function copyReport(){
+  const el=document.getElementById('reportText');
+  if(!el) return;
+  navigator.clipboard.writeText(el.innerText).then(()=>alert('已複製屋主回報文字'));
+}
+</script>
+</body>
+</html>
+"""
+    return render_template_string(
+        html,
+        seller=seller,
+        seller_id=seller_id,
+        focus_note=focus_note,
+        result=result,
+        draft_id=draft_id,
+        today_date=_owner_report_today(),
+    )
+
+
+def v26_seller_owner_report_ai_generate(seller_id):
+    """相容舊委託詳細頁表單：送出後導到 v26 單欄位頁並直接顯示結果。"""
+    seller, resp = _get_seller_or_redirect(seller_id)
+    if resp:
+        return resp
+    focus_note = _v26_build_focus_note_from_form(request.form)
+    if not focus_note:
+        flash("請輸入這次希望 AI 著重什麼", "warning")
+        return redirect(url_for("assistant_owner_report_ai", seller_id=seller_id))
+
+    result = generate_owner_report_simple_ai(
+        report_goal="屋主回報",
+        report_content=focus_note,
+        seller=seller,
+    )
+    try:
+        draft_id = _v26_save_owner_report_draft(result, seller_id, seller, focus_note, source="v26_seller_detail_ai_redirect")
+        flash("AI 已生成屋主回報，結果已顯示在頁面上", "success")
+        return redirect(url_for("assistant_owner_report_ai", seller_id=seller_id, draft_id=draft_id))
+    except Exception as e:
+        print("⚠️ v26 儲存舊表單屋主回報草稿失敗：", e)
+        flash("AI 已生成，但草稿沒有成功存入 Firebase，請改用簡潔頁重新生成", "warning")
+        return redirect(url_for("assistant_owner_report_ai", seller_id=seller_id))
+
+
+try:
+    app.view_functions["assistant_owner_report_ai"] = login_required(v26_assistant_owner_report_ai)
+    app.view_functions["seller_owner_report_ai_generate"] = login_required(v26_seller_owner_report_ai_generate)
+    print("✅ v26 AI屋主回報單欄位介面已啟用：只顯示『這次希望 AI 著重什麼？』，結果同頁顯示")
+except Exception as e:
+    print("⚠️ v26 AI屋主回報介面套用失敗：", e)
+# =============================================================================
+# v26 End
+# =============================================================================
