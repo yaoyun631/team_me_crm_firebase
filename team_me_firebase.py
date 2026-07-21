@@ -23265,11 +23265,12 @@ def seller_case_form_filled_pdf(seller_id):
     case_data = _case_merge_seller_and_case_data(seller)
 
     try:
-        from deed_case_form_tool import fill_case_form_pdf_bytes
+        # v6：使用原始 PDF 當背景，只把資料以相同大小文字 key 到欄位裡，版型與原 PDF 保持一致。
+        from case_form_pdf_exact_tool import fill_case_form_exact_pdf_bytes
         template_path = _seller_case_form_template_pdf_path()
-        pdf_bytes = fill_case_form_pdf_bytes(template_path, case_data, seller=seller)
+        pdf_bytes = fill_case_form_exact_pdf_bytes(template_path, case_data, seller=seller)
     except Exception as e:
-        flash(f"產生填好的案件輸入表失敗：{e}", "danger")
+        flash(f"產生同版型案件輸入表 PDF 失敗：{e}", "danger")
         return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
 
     filename = f"填好案件輸入表_{seller.get('name') or seller_id}.pdf"
