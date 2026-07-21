@@ -29500,6 +29500,694 @@ print("✅ Firebase 物件庫：後台 CSV 直接上傳頁已啟用 /tools/prope
 # =============================================================================
 
 
+
+# =============================================================================
+# Team M.E 開發路線安排 Patch v20260721
+# - 新增 /developments/route-planner
+# - 從開發名單勾選要跑的點
+# - 自動排序成 Google Maps 路線
+# - 支援有經緯度時用距離排序；沒有經緯度時用區域 / 分數排序
+# =============================================================================
+
+DEVELOPMENT_ROUTE_GOOGLE_MAX_STOPS = int(
+    os.environ.get("DEVELOPMENT_ROUTE_GOOGLE_MAX_STOPS", "10") or 10
+)
+
+DEVELOPMENT_ROUTE_AREA_ORDER = [
+    "沙鹿", "清水", "梧棲", "龍井", "大甲", "大肚", "外埔", "大安",
+    "西屯", "南屯", "北屯", "北區", "西區", "南區", "東區", "中區",
+]
+
+DEVELOPMENT_ROUTE_PLANNER_HTML = r"""
+{% extends "base.html" %}
+{% block content %}
+<div class="container-fluid py-3">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <div>
+      <h3 class="mb-1">開發路線安排</h3>
+      <div class="text-muted small">勾選今天要跑的開發點，系統會自動排序並產生 Google Maps 路線。</div>
+    </div>
+    <div class="d-flex gap-2 flex-wrap">
+      <a class="btn btn-outline-secondary" href="{{ url_for('developments') }}">回開發列表</a>
+    </div>
+  </div>
+
+  <div class="alert alert-info small">
+    <strong>排序邏輯：</strong>
+    有經緯度資料時會用距離做最近點排序；沒有經緯度時，會依區域順序、開發分數、下次行動日期排序。
+    若有設定 <span class="code">GOOGLE_MAPS_API_KEY</span>，系統會嘗試把地址轉經緯度後再排序。
+  </div>
+
+  {% if route_result %}
+  <div class="card mb-4">
+    <div class="card-header fw-bold">今日開發路線結果</div>
+    <div class="card-body">
+      <div class="d-flex gap-2 flex-wrap mb-3">
+        {% if route_result.google_url %}
+          <a class="btn btn-success" target="_blank" href="{{ route_result.google_url }}">開啟 Google Maps 路線</a>
+        {% endif %}
+        <button class="btn btn-outline-secondary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('routeText').value); alert('已複製今日開發路線');">複製路線文字</button>
+      </div>
+
+      {% if route_result.warning %}
+        <div class="alert alert-warning small">{{ route_result.warning }}</div>
+      {% endif %}
+
+      <textarea id="routeText" class="form-control mb-3" rows="10" readonly>{{ route_result.share_text }}</textarea>
+
+      <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle">
+          <thead>
+            <tr>
+              <th style="width:70px;">順序</th>
+              <th>名稱</th>
+              <th>地址</th>
+              <th>電話</th>
+              <th>開發原因</th>
+              <th>導航</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in route_result.ordered_items %}
+            <tr>
+              <td class="fw-bold">第 {{ loop.index }} 站</td>
+              <td>
+                <a href="{{ url_for('development_detail', development_id=item.id) }}">{{ item.name or "未命名" }}</a>
+                <div class="text-muted small">{{ item.current_stage or item.stage or "-" }}｜{{ item.next_action or "-" }}</div>
+              </td>
+              <td>{{ item.route_address }}</td>
+              <td>{{ item.phone or "-" }}</td>
+              <td class="small">{{ item.route_reason }}</td>
+              <td>
+                {% if item.route_nav_url %}
+                  <a class="btn btn-sm btn-outline-primary" target="_blank" href="{{ item.route_nav_url }}">導航</a>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <form method="get" class="card mb-3">
+    <div class="card-header fw-bold">篩選開發名單</div>
+    <div class="card-body">
+      <div class="row g-2">
+        <div class="col-md-3">
+          <label class="form-label">關鍵字</label>
+          <input name="q" class="form-control" value="{{ filters.q }}" placeholder="姓名 / 電話 / 地址">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label">目前狀態</label>
+          <select name="current_stage" class="form-select">
+            <option value="">全部</option>
+            {% for opt in stage_options %}
+              <option value="{{ opt }}" {% if filters.current_stage == opt %}selected{% endif %}>{{ opt }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label">下一動作</label>
+          <select name="next_action" class="form-select">
+            <option value="">全部</option>
+            {% for opt in action_options %}
+              <option value="{{ opt }}" {% if filters.next_action == opt %}selected{% endif %}>{{ opt }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label">來源</label>
+          <select name="source" class="form-select">
+            <option value="">全部</option>
+            {% for opt in source_options %}
+              <option value="{{ opt }}" {% if filters.source == opt %}selected{% endif %}>{{ opt }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label">區域</label>
+          <input name="area" class="form-control" value="{{ filters.area }}" placeholder="沙鹿 / 清水">
+        </div>
+        <div class="col-md-1 d-flex align-items-end">
+          <button class="btn btn-outline-primary w-100" type="submit">篩選</button>
+        </div>
+      </div>
+    </div>
+  </form>
+
+  <form method="post" class="card">
+    <div class="card-header fw-bold d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <span>勾選今天要跑的開發點</span>
+      <span class="text-muted small">目前顯示 {{ items|length }} 筆</span>
+    </div>
+
+    <div class="card-body">
+      <input type="hidden" name="q" value="{{ filters.q }}">
+      <input type="hidden" name="current_stage" value="{{ filters.current_stage }}">
+      <input type="hidden" name="next_action" value="{{ filters.next_action }}">
+      <input type="hidden" name="source" value="{{ filters.source }}">
+      <input type="hidden" name="area" value="{{ filters.area }}">
+
+      <div class="row g-2 mb-3">
+        <div class="col-md-5">
+          <label class="form-label">出發地</label>
+          <input name="start_address" class="form-control" value="{{ start_address or '' }}" placeholder="例：公司、沙鹿靜宜店、目前位置地址">
+          <div class="form-text">Google Maps 可接受「目前位置」，但後台排序要有地址或經緯度才會更準。</div>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label">路線模式</label>
+          <select name="return_mode" class="form-select">
+            <option value="last">最後一站結束</option>
+            <option value="round_trip">最後回到出發地</option>
+          </select>
+        </div>
+        <div class="col-md-4 d-flex align-items-end gap-2">
+          <button class="btn btn-success" type="submit">產生最佳開發路線</button>
+          <button class="btn btn-outline-secondary" type="button" onclick="document.querySelectorAll('.dev-check').forEach(x=>x.checked=true)">全選</button>
+          <button class="btn btn-outline-secondary" type="button" onclick="document.querySelectorAll('.dev-check').forEach(x=>x.checked=false)">取消全選</button>
+        </div>
+      </div>
+
+      <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle">
+          <thead>
+            <tr>
+              <th style="width:44px;">選</th>
+              <th>名稱</th>
+              <th>地址</th>
+              <th>電話</th>
+              <th>狀態 / 下一步</th>
+              <th>分數</th>
+              <th>來源</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for item in items %}
+            <tr>
+              <td><input class="form-check-input dev-check" type="checkbox" name="development_ids" value="{{ item.id }}"></td>
+              <td>
+                <a href="{{ url_for('development_detail', development_id=item.id) }}">{{ item.name or "未命名" }}</a>
+                <div class="text-muted small">{{ item.created_at or "" }}</div>
+              </td>
+              <td>
+                {{ item.route_address or "-" }}
+                {% if not item.route_address %}
+                  <div class="text-danger small">缺地址，無法排導航</div>
+                {% endif %}
+              </td>
+              <td>{{ item.phone or "-" }}</td>
+              <td class="small">
+                {{ item.current_stage or item.stage or "-" }}<br>
+                <span class="text-muted">{{ item.next_action or "-" }} {{ item.next_action_date or "" }}</span>
+              </td>
+              <td><span class="badge text-bg-primary">{{ item.route_score }}</span></td>
+              <td>{{ item.source or "-" }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </form>
+</div>
+{% endblock %}
+"""
+
+
+def _development_route_safe(value):
+    try:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if text.lower() in {"nan", "none", "null"}:
+            return ""
+        return text
+    except Exception:
+        return ""
+
+
+def _development_route_address(item: dict) -> str:
+    for key in (
+        "address",
+        "registered_address",
+        "route_address",
+        "property_address",
+        "object_address",
+        "contact_address",
+    ):
+        value = _development_route_safe(item.get(key))
+        if value:
+            return value
+
+    content = _development_route_safe(item.get("content") or item.get("note") or item.get("internal_note"))
+    if content:
+        m = re.search(r"((?:台中市|臺中市|嘉義市|彰化縣|苗栗縣|南投縣|雲林縣|台北市|新北市|桃園市|高雄市|台南市)[^\n，,。]{3,80})", content)
+        if m:
+            return m.group(1).strip()
+
+    return ""
+
+
+def _development_route_area(item: dict) -> str:
+    for key in ("area", "district", "region"):
+        value = _development_route_safe(item.get(key))
+        if value:
+            return value
+
+    address = _development_route_address(item)
+    m = re.search(r"(沙鹿|清水|梧棲|龍井|大甲|大肚|外埔|大安|西屯|南屯|北屯|北區|西區|南區|東區|中區)", address)
+    if m:
+        return m.group(1)
+
+    return ""
+
+
+def _development_route_area_rank(item: dict) -> int:
+    area = _development_route_area(item)
+    for idx, name in enumerate(DEVELOPMENT_ROUTE_AREA_ORDER):
+        if name and name in area:
+            return idx
+    return 999
+
+
+def _development_route_score(item: dict) -> int:
+    score = 0
+    source = _development_route_safe(item.get("source"))
+    address = _development_route_address(item)
+    phone = _development_route_safe(item.get("phone"))
+    url = _development_route_safe(item.get("url"))
+    current_stage = _development_route_safe(item.get("current_stage") or item.get("stage"))
+    next_action = _development_route_safe(item.get("next_action"))
+    next_action_date = _development_route_safe(item.get("next_action_date"))
+
+    if address:
+        score += 25
+    if phone:
+        score += 20
+    if url:
+        score += 8
+
+    if "屋主" in source or "自刊" in source:
+        score += 30
+    if "謄本" in source:
+        score += 20
+    if "FB" in source.upper() or "臉書" in source:
+        score += 12
+
+    if current_stage in {"待聯繫", "待開發", "開發中"}:
+        score += 15
+    if next_action in {"現場拜訪", "跑開發", "寄開發信", "電聯", "回訪"}:
+        score += 15
+    if next_action_date:
+        score += 10
+
+    area_rank = _development_route_area_rank(item)
+    if area_rank <= 3:
+        score += 10
+    elif area_rank <= 7:
+        score += 6
+
+    return score
+
+
+def _development_route_latlng(item: dict):
+    lat_keys = ("lat", "latitude", "緯度")
+    lng_keys = ("lng", "lon", "longitude", "經度")
+    lat = None
+    lng = None
+    for key in lat_keys:
+        try:
+            value = item.get(key)
+            if value not in (None, ""):
+                lat = float(value)
+                break
+        except Exception:
+            pass
+    for key in lng_keys:
+        try:
+            value = item.get(key)
+            if value not in (None, ""):
+                lng = float(value)
+                break
+        except Exception:
+            pass
+    if lat is None or lng is None:
+        return None
+    return (lat, lng)
+
+
+def _development_route_geocode(address: str):
+    address = _development_route_safe(address)
+    if not address:
+        return None
+
+    api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    try:
+        import requests
+        res = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": address, "key": api_key, "language": "zh-TW", "region": "tw"},
+            timeout=8,
+        )
+        data = res.json()
+        if data.get("status") == "OK" and data.get("results"):
+            loc = data["results"][0]["geometry"]["location"]
+            return (float(loc["lat"]), float(loc["lng"]))
+    except Exception as exc:
+        print("⚠️ 開發路線 geocode 失敗：", address, exc)
+
+    return None
+
+
+def _development_route_distance_km(a, b) -> float:
+    if not a or not b:
+        return 999999.0
+    import math
+    lat1, lng1 = a
+    lat2, lng2 = b
+    r = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lng2 - lng1)
+    x = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(x), math.sqrt(1 - x))
+
+
+def _development_route_nav_url(address: str) -> str:
+    from urllib.parse import quote_plus
+    address = _development_route_safe(address)
+    if not address:
+        return ""
+    return "https://www.google.com/maps/search/?api=1&query=" + quote_plus(address)
+
+
+def _development_route_google_url(start_address: str, ordered_items: list, return_to_start=False) -> str:
+    from urllib.parse import quote_plus
+    stops = [_development_route_address(x) for x in ordered_items if _development_route_address(x)]
+    start_address = _development_route_safe(start_address)
+
+    if not stops:
+        return ""
+
+    travelmode = "driving"
+
+    if start_address:
+        origin = start_address
+        if return_to_start:
+            destination = start_address
+            waypoints = stops
+        else:
+            destination = stops[-1]
+            waypoints = stops[:-1]
+    else:
+        if len(stops) == 1:
+            return _development_route_nav_url(stops[0])
+        origin = stops[0]
+        destination = stops[-1]
+        waypoints = stops[1:-1]
+
+    url = (
+        "https://www.google.com/maps/dir/?api=1"
+        + "&travelmode=" + travelmode
+        + "&origin=" + quote_plus(origin)
+        + "&destination=" + quote_plus(destination)
+    )
+
+    if waypoints:
+        url += "&waypoints=" + quote_plus("|".join(waypoints))
+
+    return url
+
+
+def _development_route_order_items(items: list, start_address: str = "") -> tuple[list, str]:
+    # 先補每筆資料的 route 欄位。
+    enriched = []
+    for item in items:
+        data = dict(item)
+        data["route_address"] = _development_route_address(data)
+        data["route_area"] = _development_route_area(data)
+        data["route_score"] = _development_route_score(data)
+        data["route_nav_url"] = _development_route_nav_url(data["route_address"])
+        data["route_reason"] = _development_route_reason(data)
+        enriched.append(data)
+
+    usable = [x for x in enriched if x.get("route_address")]
+    no_address = [x for x in enriched if not x.get("route_address")]
+
+    # 有經緯度才做最近點排序。
+    start_point = _development_route_geocode(start_address)
+    for item in usable:
+        point = _development_route_latlng(item)
+        if not point:
+            point = _development_route_geocode(item.get("route_address"))
+        item["_route_point"] = point
+
+    with_points = [x for x in usable if x.get("_route_point")]
+
+    if start_point and len(with_points) >= max(2, len(usable) // 2):
+        remaining = list(usable)
+        ordered = []
+        current = start_point
+
+        while remaining:
+            remaining.sort(
+                key=lambda x: (
+                    _development_route_distance_km(current, x.get("_route_point")),
+                    -int(x.get("route_score") or 0),
+                )
+            )
+            nxt = remaining.pop(0)
+            ordered.append(nxt)
+            if nxt.get("_route_point"):
+                current = nxt["_route_point"]
+
+        return ordered + no_address, "經緯度距離排序"
+
+    # 沒有 API key / 沒經緯度：用區域順序 + 分數 + 下次日期。
+    usable.sort(
+        key=lambda x: (
+            _development_route_area_rank(x),
+            _development_route_safe(x.get("next_action_date")) or "9999-99-99",
+            -int(x.get("route_score") or 0),
+            _development_route_safe(x.get("created_at")),
+        )
+    )
+    return usable + no_address, "區域與開發分數排序"
+
+
+def _development_route_reason(item: dict) -> str:
+    parts = []
+    if _development_route_safe(item.get("phone")):
+        parts.append("有電話")
+    if _development_route_address(item):
+        parts.append("有地址")
+    source = _development_route_safe(item.get("source"))
+    if source:
+        parts.append(f"來源：{source}")
+    next_action = _development_route_safe(item.get("next_action"))
+    if next_action:
+        parts.append(f"下一步：{next_action}")
+    if _development_route_safe(item.get("next_action_date")):
+        parts.append(f"日期：{item.get('next_action_date')}")
+    if not parts:
+        parts.append("待開發名單")
+    return "、".join(parts[:5])
+
+
+def _development_route_filter_items(args):
+    q = (args.get("q") or "").strip()
+    current_stage = (args.get("current_stage") or "").strip()
+    next_action = (args.get("next_action") or "").strip()
+    source = (args.get("source") or "").strip()
+    area = (args.get("area") or "").strip()
+
+    docs = db.collection("developments").stream()
+    all_items = [doc_to_dict(d) for d in docs]
+
+    source_options = sorted({
+        (x.get("source") or "").strip()
+        for x in all_items
+        if (x.get("source") or "").strip()
+    })
+
+    items = list(all_items)
+
+    if q:
+        items = [
+            x for x in items
+            if q in (x.get("name") or "")
+            or q in (x.get("phone") or "")
+            or q in (_development_route_address(x) or "")
+            or q in (x.get("content") or "")
+            or q in (x.get("note") or "")
+        ]
+
+    if current_stage:
+        items = [x for x in items if (x.get("current_stage") or x.get("stage") or "") == current_stage]
+
+    if next_action:
+        items = [x for x in items if (x.get("next_action") or "") == next_action]
+
+    if source:
+        items = [x for x in items if (x.get("source") or "") == source]
+
+    if area:
+        items = [x for x in items if area in (_development_route_area(x) or "") or area in (_development_route_address(x) or "")]
+
+    hidden_done = set(globals().get("DEVELOPMENT_HIDDEN_BY_DEFAULT", []))
+    items = [
+        x for x in items
+        if (x.get("current_stage") or x.get("stage") or "") not in hidden_done
+    ]
+
+    enriched = []
+    for item in items:
+        data = dict(item)
+        data["route_address"] = _development_route_address(data)
+        data["route_area"] = _development_route_area(data)
+        data["route_score"] = _development_route_score(data)
+        enriched.append(data)
+
+    enriched.sort(
+        key=lambda x: (
+            _development_route_area_rank(x),
+            -int(x.get("route_score") or 0),
+            _development_route_safe(x.get("next_action_date")) or "9999-99-99",
+        )
+    )
+
+    return enriched, source_options
+
+
+def _development_route_share_text(start_address: str, ordered_items: list, method: str, google_url: str) -> str:
+    lines = []
+    lines.append("📍 今日開發路線")
+    if start_address:
+        lines.append(f"出發地：{start_address}")
+    lines.append(f"排序方式：{method}")
+    lines.append("")
+
+    for idx, item in enumerate(ordered_items, start=1):
+        lines.append(f"{idx}. {item.get('name') or '未命名'}")
+        lines.append(f"地址：{item.get('route_address') or '-'}")
+        if item.get("phone"):
+            lines.append(f"電話：{item.get('phone')}")
+        lines.append(f"原因：{item.get('route_reason') or '-'}")
+        lines.append("")
+
+    if google_url:
+        lines.append("Google Maps 路線：")
+        lines.append(google_url)
+
+    return "\n".join(lines).strip()
+
+
+@app.route("/developments/route-planner", methods=["GET", "POST"])
+@login_required
+def development_route_planner():
+    filters = {
+        "q": (request.values.get("q") or "").strip(),
+        "current_stage": (request.values.get("current_stage") or "").strip(),
+        "next_action": (request.values.get("next_action") or "").strip(),
+        "source": (request.values.get("source") or "").strip(),
+        "area": (request.values.get("area") or "").strip(),
+    }
+
+    items, source_options = _development_route_filter_items(request.values)
+
+    route_result = None
+    start_address = (request.values.get("start_address") or "").strip()
+
+    if request.method == "POST":
+        selected_ids = request.form.getlist("development_ids")
+        return_mode = (request.form.get("return_mode") or "last").strip()
+        return_to_start = return_mode == "round_trip"
+
+        selected_items = []
+        if selected_ids:
+            id_set = set(selected_ids)
+            for item in items:
+                if item.get("id") in id_set:
+                    selected_items.append(item)
+
+            # 若篩選後 items 沒包含被選 id，直接補抓。
+            found_ids = {x.get("id") for x in selected_items}
+            missing_ids = [x for x in selected_ids if x not in found_ids]
+            for dev_id in missing_ids:
+                try:
+                    snap = db.collection("developments").document(dev_id).get()
+                    if snap.exists:
+                        selected_items.append(doc_to_dict(snap))
+                except Exception:
+                    pass
+
+        if not selected_items:
+            flash("請先勾選至少一筆開發資料。", "warning")
+        else:
+            ordered, method = _development_route_order_items(selected_items, start_address=start_address)
+            google_url = _development_route_google_url(start_address, ordered, return_to_start=return_to_start)
+
+            warning = ""
+            stop_count = len([x for x in ordered if x.get("route_address")])
+            if stop_count > DEVELOPMENT_ROUTE_GOOGLE_MAX_STOPS:
+                warning = (
+                    f"你選了 {stop_count} 個有地址的點，Google Maps 一次可使用的中途點可能有限。"
+                    f"建議分成每 {DEVELOPMENT_ROUTE_GOOGLE_MAX_STOPS} 個點一趟。"
+                )
+
+            share_text = _development_route_share_text(start_address, ordered, method, google_url)
+
+            route_result = {
+                "ordered_items": ordered,
+                "method": method,
+                "google_url": google_url,
+                "share_text": share_text,
+                "warning": warning,
+            }
+
+            try:
+                db.collection("development_routes").add({
+                    "start_address": start_address,
+                    "return_to_start": return_to_start,
+                    "method": method,
+                    "target_ids": selected_ids,
+                    "ordered_target_ids": [x.get("id") for x in ordered],
+                    "google_url": google_url,
+                    "share_text": share_text,
+                    "created_at": now_taipei().isoformat(),
+                    "created_by_id": session.get("user_id") or "",
+                    "created_by_name": session.get("user_name") or "",
+                })
+            except Exception as exc:
+                print("⚠️ 儲存 development_routes 失敗：", exc)
+
+    return render_template_string(
+        DEVELOPMENT_ROUTE_PLANNER_HTML,
+        items=items,
+        filters=filters,
+        source_options=source_options,
+        stage_options=globals().get("DEVELOPMENT_STATUS_OPTIONS", []),
+        action_options=globals().get("DEVELOPMENT_NEXT_ACTION_OPTIONS", []),
+        route_result=route_result,
+        start_address=start_address,
+    )
+
+
+print("✅ 開發路線安排已啟用：/developments/route-planner")
+
+# =============================================================================
+# Team M.E 開發路線安排 Patch End
+# =============================================================================
+
+
+
 # =============================================================================
 # CRM 追蹤紀錄顯示優化 Patch v20260712
 # - 買方 / 賣方 detail 頁面新增「整理版內部備註」與「日期分組追蹤紀錄」
