@@ -27590,6 +27590,7 @@ _PROPERTY_LIBRARY_STATUS_CARD = """
           </div>
 
           <div class="d-flex gap-2 mt-3 flex-wrap">
+            <a class="btn btn-success" href="{{ url_for('property_csv_backend_upload') }}">後台上傳 CSV 到 Firebase</a>
             <button class="btn btn-outline-secondary" type="submit" name="_property_maintenance_action" value="refresh_property_status">重新整理統計</button>
             <button class="btn btn-warning" type="submit" name="_property_maintenance_action" value="archive_duplicate_properties" onclick="return confirm('確定要刪除重複舊版物件？系統會只保留每組最新版本，其餘舊版 Firestore 文件會直接刪除，這個動作不可復原。')">刪除重複舊版，只保留最新</button>
           </div>
@@ -28993,6 +28994,373 @@ except Exception as exc:
 
 # =============================================================================
 # Firebase 物件庫：最新 CSV 快照模式 Patch End
+# =============================================================================
+
+
+# =============================================================================
+# Firebase 物件庫：後台 CSV 直接上傳 Patch v20260721
+# - 新增 /tools/property-csv-upload
+# - 可直接從後台上傳出售 / 出租 CSV 到 Firestore properties
+# - 自動寫入 property_import_logs，讓「最新 CSV 筆數」不再顯示 0
+# - 可選擇匯入後只保留最新 CSV，同步清理舊批次
+# =============================================================================
+
+PROPERTY_CSV_BACKEND_UPLOAD_HTML = r"""
+{% extends "base.html" %}
+{% block content %}
+<div class="container-fluid py-3">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <div>
+      <h3 class="mb-1">後台上傳 CSV 到 Firebase</h3>
+      <div class="text-muted small">直接把愛屋 / 樂屋整理好的 CSV 匯入 Firestore <span class="code">properties</span>，並建立最新 CSV 批次紀錄。</div>
+    </div>
+    <div class="d-flex gap-2 flex-wrap">
+      <a class="btn btn-outline-secondary" href="{{ url_for('line_card_settings') }}#property-library">回物件庫狀態</a>
+    </div>
+  </div>
+
+  <div class="alert alert-warning small">
+    <strong>提醒：</strong>
+    上傳後會寫入 <span class="code">property_import_logs</span>，後台狀態頁會用這批紀錄判斷「最新 CSV」。
+    若勾選「匯入後只保留最新 CSV」，系統會刪除同類型舊 CSV 留下的物件，請確認你上傳的是完整清單。
+  </div>
+
+  <div class="row g-4">
+    <div class="col-lg-7">
+      <form method="post" enctype="multipart/form-data" class="card">
+        <div class="card-header fw-bold">上傳 CSV</div>
+        <div class="card-body">
+          <div class="mb-3">
+            <label class="form-label">物件類型</label>
+            <select name="deal_type" class="form-select">
+              <option value="sale">出售</option>
+              <option value="rent">出租</option>
+              <option value="auto">自動判斷（依檔名 / 欄位）</option>
+            </select>
+            <div class="form-text">建議直接選出售或出租，避免檔名不明時判斷錯誤。</div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label">CSV 檔案</label>
+            <input type="file" name="property_csv" class="form-control" accept=".csv,text/csv">
+            <div class="form-text">支援 UTF-8 / Big5 / CP950。可直接上傳愛屋匯出的出售或出租 CSV。</div>
+          </div>
+
+          <div class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" name="keep_latest_only" value="1" id="keepLatestOnly" checked>
+            <label class="form-check-label" for="keepLatestOnly">
+              匯入後只保留這份最新 CSV 的物件，刪除同類型舊 CSV 資料
+            </label>
+          </div>
+
+          <div class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" name="refresh_status" value="1" id="refreshStatus" checked>
+            <label class="form-check-label" for="refreshStatus">
+              匯入後重新整理 Firebase 物件庫統計
+            </label>
+          </div>
+
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" name="dry_run" value="1" id="dryRun">
+            <label class="form-check-label" for="dryRun">
+              只讀取 CSV 檢查，不寫入 Firebase
+            </label>
+          </div>
+        </div>
+
+        <div class="card-footer d-flex gap-2 flex-wrap">
+          <button class="btn btn-success" type="submit" onclick="return confirm('確定要上傳 CSV 並更新 Firebase 物件庫？')">上傳並匯入 Firebase</button>
+          <a class="btn btn-outline-secondary" href="{{ url_for('line_card_settings') }}#property-library">取消</a>
+        </div>
+      </form>
+    </div>
+
+    <div class="col-lg-5">
+      <div class="card h-100">
+        <div class="card-header fw-bold">目前狀態</div>
+        <div class="card-body small">
+          <div class="row g-3">
+            {% for key in ["sale", "rent"] %}
+              {% set s = property_status[key] %}
+              <div class="col-12">
+                <div class="border rounded-3 p-3 bg-light">
+                  <div class="fw-bold">{{ s.label }}</div>
+                  <div class="text-muted">最新 CSV 筆數</div>
+                  <div class="fs-5 fw-bold">{{ s.active_count or 0 }}</div>
+                  <div class="text-muted mt-2">最新 CSV 檔案</div>
+                  <div class="text-truncate">{{ s.latest_import_log.file_name or "-" }}</div>
+                  <div class="text-muted">最新匯入時間</div>
+                  <div>{{ s.latest_import_log.created_at or "-" }}</div>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {% if result %}
+  <div class="card mt-4">
+    <div class="card-header fw-bold">匯入結果</div>
+    <div class="card-body">
+      <div class="row g-3">
+        <div class="col-md-3"><div class="text-muted small">類型</div><div class="fs-5 fw-bold">{{ "出租" if result.deal_type == "rent" else "出售" }}</div></div>
+        <div class="col-md-3"><div class="text-muted small">CSV 列數</div><div class="fs-5 fw-bold">{{ result.total_count }}</div></div>
+        <div class="col-md-3"><div class="text-muted small">成功匯入</div><div class="fs-5 fw-bold">{{ result.imported_count }}</div></div>
+        <div class="col-md-3"><div class="text-muted small">略過 / 失敗</div><div class="fs-5 fw-bold">{{ result.skipped_count }}</div></div>
+      </div>
+      <div class="small mt-3">
+        <div>檔案：{{ result.file_name }}</div>
+        <div>編碼：{{ result.encoding }}</div>
+        <div>批次ID：{{ result.import_batch_id or "-" }}</div>
+      </div>
+      {% if result.error_samples %}
+        <div class="alert alert-warning mt-3 mb-0 small">
+          <strong>前幾筆錯誤：</strong><br>
+          {{ result.error_samples|join("<br>")|safe }}
+        </div>
+      {% endif %}
+      {% if cleanup_result %}
+        <div class="alert alert-info mt-3 mb-0 small">
+          <strong>最新 CSV 清理：</strong>
+          刪除 {{ cleanup_result.deleted_docs or 0 }} 筆，保留 {{ cleanup_result.kept_docs or 0 }} 筆。
+          {% if cleanup_result.errors %}<br>警告：{{ cleanup_result.errors[:3]|join("；") }}{% endif %}
+        </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+"""
+
+
+def _property_csv_backend_filename(filename: str, deal_type: str) -> str:
+    filename = _property_csv_safe_text(filename) or "property.csv"
+    filename = filename.replace("\\", "_").replace("/", "_")
+    if deal_type == "rent":
+        prefix = "後台出租_"
+    elif deal_type == "sale":
+        prefix = "後台出售_"
+    else:
+        prefix = "後台物件_"
+    if filename.startswith(prefix):
+        return filename
+    return prefix + filename
+
+
+def _property_backend_csv_import_bytes(
+    csv_bytes: bytes,
+    filename: str,
+    *,
+    deal_type_override: str = "",
+    dry_run: bool = False,
+) -> dict:
+    """後台直接上傳 CSV 到 Firestore properties。
+
+    與 LINE 丟 CSV 的差異：
+    - 可以在後台指定 sale/rent
+    - source 寫 backend_upload
+    - property_import_logs 一定寫入，讓設定頁可讀到最新 CSV 筆數
+    - 每筆 property 會帶 import_batch_id，方便追蹤
+    """
+    headers, rows, encoding = _property_csv_read_rows(csv_bytes)
+
+    if deal_type_override in ("sale", "rent"):
+        deal_type = deal_type_override
+    else:
+        deal_type = _property_csv_detect_deal_type(filename, headers=headers)
+
+    safe_filename = _property_csv_backend_filename(filename, deal_type)
+    now_iso = now_taipei().isoformat()
+    import_batch_id = (
+        f"backend_{deal_type}_"
+        + re.sub(r"[^0-9A-Za-z]", "", now_iso)[:18]
+    )
+
+    total = 0
+    imported = 0
+    skipped = 0
+    errors = []
+    touched_ids = []
+
+    batch = db.batch()
+    batch_count = 0
+
+    def commit_if_needed(force=False):
+        nonlocal batch
+        nonlocal batch_count
+        if batch_count and (force or batch_count >= 400):
+            if not dry_run:
+                batch.commit()
+            batch = db.batch()
+            batch_count = 0
+
+    for idx, row in enumerate(rows, start=2):
+        total += 1
+        try:
+            if not any(_property_csv_safe_text(v) for v in row.values()):
+                skipped += 1
+                continue
+
+            prop = _property_csv_row_to_property(row, deal_type, safe_filename)
+            if not (prop.get("title") or prop.get("address") or prop.get("url")):
+                skipped += 1
+                continue
+
+            doc_id = _property_csv_doc_id(row, deal_type)
+            prop.update({
+                "id": doc_id,
+                "active": True,
+                "deal_type": deal_type,
+                "source_platform": "後台 CSV 上傳",
+                "source_file": safe_filename,
+                "import_batch_id": import_batch_id,
+                "import_source": "backend_upload",
+                "imported_at": now_iso,
+                "updated_at": now_iso,
+                "updated_by_id": session.get("user_id") or "backend",
+                "updated_by_name": session.get("user_name") or "後台上傳",
+            })
+
+            touched_ids.append(doc_id)
+            imported += 1
+
+            if not dry_run:
+                ref = db.collection(PROPERTY_LIBRARY_COLLECTION).document(doc_id)
+                batch.set(ref, prop, merge=True)
+                batch_count += 1
+                commit_if_needed()
+
+        except Exception as exc:
+            skipped += 1
+            if len(errors) < 8:
+                errors.append(f"第{idx}列：{exc}")
+
+    commit_if_needed(force=True)
+
+    log_data = {
+        "deal_type": deal_type,
+        "file_name": safe_filename,
+        "original_file_name": filename,
+        "encoding": encoding,
+        "total_count": total,
+        "imported_count": imported,
+        "skipped_count": skipped,
+        "error_samples": errors,
+        "created_at": now_iso,
+        "imported_at": now_iso,
+        "uploaded_at": now_iso,
+        "source": "backend_upload",
+        "import_batch_id": import_batch_id,
+        "touched_count": len(touched_ids),
+        "touched_ids_sample": touched_ids[:20],
+        "dry_run": bool(dry_run),
+        "uploaded_by_id": session.get("user_id") or "",
+        "uploaded_by_name": session.get("user_name") or "",
+    }
+
+    if not dry_run:
+        try:
+            db.collection(PROPERTY_IMPORT_LOG_COLLECTION).add(log_data)
+        except Exception as exc:
+            errors.append(f"寫入 property_import_logs 失敗：{exc}")
+
+        try:
+            if "clear_ai_property_memory_cache" in globals():
+                clear_ai_property_memory_cache(deal_type)
+        except Exception as exc:
+            errors.append(f"清除物件推薦快取失敗：{exc}")
+
+    return {
+        "deal_type": deal_type,
+        "file_name": safe_filename,
+        "original_file_name": filename,
+        "encoding": encoding,
+        "total_count": total,
+        "imported_count": imported,
+        "skipped_count": skipped,
+        "error_samples": errors,
+        "import_batch_id": import_batch_id,
+        "dry_run": bool(dry_run),
+    }
+
+
+@app.route("/tools/property-csv-upload", methods=["GET", "POST"])
+@login_required
+def property_csv_backend_upload():
+    result = None
+    cleanup_result = None
+
+    if request.method == "POST":
+        upload = request.files.get("property_csv")
+        deal_type = (request.form.get("deal_type") or "auto").strip()
+        keep_latest_only = request.form.get("keep_latest_only") == "1"
+        refresh_status = request.form.get("refresh_status") == "1"
+        dry_run = request.form.get("dry_run") == "1"
+
+        try:
+            if not upload or not getattr(upload, "filename", ""):
+                raise RuntimeError("請選擇 CSV 檔案。")
+
+            filename = upload.filename
+            if not filename.lower().endswith(".csv"):
+                raise RuntimeError("只支援 CSV 檔案。")
+
+            content = upload.read()
+            if not content:
+                raise RuntimeError("CSV 檔案是空的。")
+
+            result = _property_backend_csv_import_bytes(
+                content,
+                filename,
+                deal_type_override=deal_type if deal_type in ("sale", "rent") else "",
+                dry_run=dry_run,
+            )
+
+            if dry_run:
+                flash(
+                    f"CSV 檢查完成：讀到 {result.get('total_count', 0)} 列，可匯入 {result.get('imported_count', 0)} 筆；未寫入 Firebase。",
+                    "info",
+                )
+            else:
+                if keep_latest_only:
+                    cleanup_result = _property_import_auto_cleanup_keep_latest(
+                        deal_type=result.get("deal_type", ""),
+                        import_result=result,
+                        source_label="backend_csv_upload",
+                    )
+
+                if refresh_status:
+                    try:
+                        refresh_property_library_status_cache()
+                    except Exception as exc:
+                        flash(f"已匯入，但重新整理統計失敗：{exc}", "warning")
+
+                label = "出租" if result.get("deal_type") == "rent" else "出售"
+                flash(
+                    f"已從後台匯入{label} CSV：成功 {result.get('imported_count', 0)} 筆，略過 {result.get('skipped_count', 0)} 筆。",
+                    "success",
+                )
+
+        except Exception as exc:
+            flash(f"CSV 後台匯入失敗：{exc}", "danger")
+
+    property_status = get_property_library_status()
+
+    return render_template_string(
+        PROPERTY_CSV_BACKEND_UPLOAD_HTML,
+        property_status=property_status,
+        result=result,
+        cleanup_result=cleanup_result,
+    )
+
+
+print("✅ Firebase 物件庫：後台 CSV 直接上傳頁已啟用 /tools/property-csv-upload")
+
+# =============================================================================
+# Firebase 物件庫：後台 CSV 直接上傳 Patch End
 # =============================================================================
 
 
