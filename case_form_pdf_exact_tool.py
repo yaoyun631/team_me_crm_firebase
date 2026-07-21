@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Team M.E｜案件輸入表 PDF 同版型精準填寫工具 v6
+Team M.E｜案件輸入表 PDF 同版型精準填寫工具 v11 - 不重疊精準版
 
 核心目標：
 - 保留原本「案件輸入表-使用中.pdf」作為背景，不重新畫表格。
-- 用相同大小的文字把資料填到空格中。
+- 用統一字級把資料填進空格中，不壓到格線、不壓到原本欄位文字。
 - 產生 PDF，因此版型會跟原始 PDF 一模一樣。
 
 安裝：
@@ -55,6 +55,119 @@ def fmt_num(value: Any, digits: int = 2) -> str:
         return text
 
 
+CASE_FORM_NORMAL_SIZE = float(os.environ.get("CASE_FORM_NORMAL_SIZE", "8.2") or 8.2)
+CASE_FORM_NUM_SIZE = float(os.environ.get("CASE_FORM_NUM_SIZE", "8.0") or 8.0)
+CASE_FORM_NOTE_SIZE = float(os.environ.get("CASE_FORM_NOTE_SIZE", "6.2") or 6.2)
+
+
+def parse_tw_address(value: Any) -> dict[str, str]:
+    """把台灣地址拆成表格上的市/區/路/段/巷/弄/號/樓。
+
+    目的不是完整地址標準化，而是避免把整串地址塞進一條空格造成重疊。
+    """
+    text = clean(value)
+    text = text.translate(str.maketrans({
+        "臺": "台",
+        "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+        "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+        "－": "-", "—": "-",
+    }))
+    text = re.sub(r"\s+", "", text)
+
+    result = {
+        "city": "", "district": "", "road": "", "section": "",
+        "lane": "", "alley": "", "no": "", "floor": "", "floor_extra": "",
+        "raw": text,
+    }
+
+    if not text:
+        return result
+
+    m = re.match(r"^(.*?[縣市])", text)
+    if m:
+        result["city"] = m.group(1)
+        text = text[len(m.group(1)):]
+
+    m = re.match(r"^(.*?(?:區|鄉|鎮|市))", text)
+    if m:
+        result["district"] = m.group(1)
+        text = text[len(m.group(1)):]
+
+    # 路街大道等
+    m = re.match(r"^(.*?(?:大道|路|街|巷|弄))", text)
+    if m:
+        road_part = m.group(1)
+        # 如果直接遇到巷/弄，路名留空，後面再抓。
+        if road_part.endswith(("路", "街", "大道")):
+            result["road"] = re.sub(r"(大道|路|街)$", "", road_part)
+            text = text[len(road_part):]
+
+    m = re.match(r"^(.+?)段", text)
+    if m:
+        result["section"] = m.group(1)
+        text = text[len(m.group(0)):]
+
+    m = re.match(r"^(\d+(?:-\d+)?)巷", text)
+    if m:
+        result["lane"] = m.group(1)
+        text = text[len(m.group(0)):]
+
+    m = re.match(r"^(\d+(?:-\d+)?)弄", text)
+    if m:
+        result["alley"] = m.group(1)
+        text = text[len(m.group(0)):]
+
+    m = re.match(r"^(\d+(?:-\d+)?(?:之\d+)?)號?", text)
+    if m:
+        result["no"] = m.group(1)
+        # 有「號」就一起吃掉；沒有號也只吃數字。
+        consume = m.group(0)
+        text = text[len(consume):]
+
+    m = re.search(r"(\d+(?:-\d+)?)樓(?:之(\d+))?", text)
+    if m:
+        result["floor"] = m.group(1)
+        result["floor_extra"] = m.group(2) or ""
+
+    return result
+
+
+def fill_address_components(fields: dict[str, str], prefix: str, address: Any):
+    parsed = parse_tw_address(address)
+    if not parsed.get("raw"):
+        return
+
+    # 有成功拆出縣市/行政區/路名，就用分欄位填；這樣一定不會蓋到原本表格文字。
+    if parsed.get("city") or parsed.get("district") or parsed.get("road"):
+        mapping = {
+            "city": "city",
+            "district": "district",
+            "road": "road",
+            "section": "section",
+            "lane": "lane",
+            "alley": "alley",
+            "no": "no",
+            "floor": "floor",
+        }
+        for src, dst in mapping.items():
+            value = parsed.get(src, "")
+            if value:
+                # 表格本身已經印好「市、區、路(街)、段、巷、弄、號、樓之」，
+                # 所以填進空格的資料要去掉這些單位字，避免變成「台中市 市」「大雅區 區」。
+                if src == "city":
+                    value = re.sub(r"[縣市]$", "", value)
+                elif src == "district":
+                    value = re.sub(r"[區鄉鎮市]$", "", value)
+                fields[f"{prefix}_{dst}"] = value
+        if parsed.get("floor_extra"):
+            fields[f"{prefix}_floor_extra"] = parsed["floor_extra"]
+        return
+
+    # 解析失敗時才放完整地址，但用很小字、指定短寬，避免壓爆整列。
+    if len(parsed["raw"]) <= 22:
+        fields[f"{prefix}_full"] = parsed["raw"]
+
+
 def pt_from_top(x: float, y_top: float, page_h: float = A4_H) -> tuple[float, float]:
     """PDF 座標是左下角原點；這裡讓你用比較直覺的左上角 y_top。"""
     return x, page_h - y_top
@@ -97,66 +210,90 @@ def register_case_font():
 # 用原 PDF 當背景，所以只需要填資料位置。
 # x, y_top, font_size, width, max_lines
 TEXT_POS = {
-    # 客戶資料
-    "owner_name": (46, 122, 9.5, 90, 1),
-    "owner_id": (185, 122, 9.5, 120, 1),
-    "owner_mobile": (420, 151, 9.5, 120, 1),
-    "owner_address": (60, 176, 9.0, 465, 1),
+    # 客戶資料：全部對準空白線中間，使用統一字級。
+    "owner_name": (46, 122, CASE_FORM_NORMAL_SIZE, 72, 1),
+    "owner_id": (185, 122, CASE_FORM_NORMAL_SIZE, 112, 1),
+    "owner_mobile": (425, 151, CASE_FORM_NORMAL_SIZE, 95, 1),
+
+    # 客戶地址拆欄位：地址：____市____區____路(街)____段____巷____弄____號____樓之____
+    "owner_city": (58, 176, CASE_FORM_NORMAL_SIZE, 43, 1),
+    "owner_district": (119, 176, CASE_FORM_NORMAL_SIZE, 47, 1),
+    "owner_road": (183, 176, CASE_FORM_NORMAL_SIZE, 38, 1),
+    "owner_section": (262, 176, CASE_FORM_NORMAL_SIZE, 42, 1),
+    "owner_lane": (322, 176, CASE_FORM_NORMAL_SIZE, 31, 1),
+    "owner_alley": (370, 176, CASE_FORM_NORMAL_SIZE, 31, 1),
+    "owner_no": (418, 176, CASE_FORM_NORMAL_SIZE, 26, 1),
+    "owner_floor": (459, 176, CASE_FORM_NORMAL_SIZE, 26, 1),
+    "owner_floor_extra": (512, 176, CASE_FORM_NORMAL_SIZE, 25, 1),
+    "owner_full": (58, 176, 6.2, 450, 1),
 
     # 1. 基本資料
-    "property_title": (86, 215, 9.5, 210, 1),
-    "community_name": (500, 215, 9.5, 72, 1),
-    "case_address": (70, 297, 9.0, 480, 1),
-    "floor_total": (91, 303, 9.5, 32, 1),
-    "basement_total": (184, 303, 9.5, 28, 1),
-    "floor": (96, 322, 9.5, 40, 1),
-    "floor_end": (160, 322, 9.5, 40, 1),
-    "layout": (236, 322, 9.5, 190, 1),
-    "completed_year": (130, 340, 9.5, 24, 1),
-    "completed_month": (174, 340, 9.5, 18, 1),
-    "completed_day": (211, 340, 9.5, 18, 1),
-    "building_age": (303, 340, 9.5, 26, 1),
-    "facing": (512, 290, 9.5, 28, 1),
+    "property_title": (87, 215, 7.6, 200, 1),
+    "community_name": (490, 215, 7.8, 68, 1),
+
+    # 物件地址拆欄位：物件地址：____市____區____路(街)____段____巷____弄____號____樓之____
+    "case_city": (84, 297, CASE_FORM_NORMAL_SIZE, 42, 1),
+    "case_district": (142, 297, CASE_FORM_NORMAL_SIZE, 48, 1),
+    "case_road": (208, 297, CASE_FORM_NORMAL_SIZE, 48, 1),
+    "case_section": (297, 297, CASE_FORM_NORMAL_SIZE, 43, 1),
+    "case_lane": (358, 297, CASE_FORM_NORMAL_SIZE, 37, 1),
+    "case_alley": (412, 297, CASE_FORM_NORMAL_SIZE, 31, 1),
+    "case_no": (460, 297, CASE_FORM_NORMAL_SIZE, 31, 1),
+    "case_floor": (508, 297, CASE_FORM_NORMAL_SIZE, 25, 1),
+    "case_floor_extra": (562, 297, CASE_FORM_NORMAL_SIZE, 20, 1),
+    "case_full": (84, 297, 6.0, 475, 1),
+
+    "floor_total": (88, 313, CASE_FORM_NUM_SIZE, 15, 1),
+    "basement_total": (185, 313, CASE_FORM_NUM_SIZE, 14, 1),
+    "floor": (96, 331, CASE_FORM_NUM_SIZE, 24, 1),
+    "floor_end": (159, 331, CASE_FORM_NUM_SIZE, 24, 1),
+    "layout": (236, 331, CASE_FORM_NORMAL_SIZE, 190, 1),
+    "completed_year": (130, 350, CASE_FORM_NUM_SIZE, 22, 1),
+    "completed_month": (174, 350, CASE_FORM_NUM_SIZE, 16, 1),
+    "completed_day": (211, 350, CASE_FORM_NUM_SIZE, 16, 1),
+    "building_age": (303, 350, CASE_FORM_NUM_SIZE, 24, 1),
+    "facing": (512, 290, CASE_FORM_NORMAL_SIZE, 26, 1),
 
     # 2. 結構 / 車位
-    "road_width": (96, 405, 9.0, 30, 1),
-    "management_fee": (92, 442, 9.0, 54, 1),
-    "elevator_count": (392, 442, 9.0, 26, 1),
-    "households_per_floor": (516, 442, 9.0, 28, 1),
-    "parking_no": (96, 513, 9.0, 70, 1),
-    "motorcycle_no": (229, 513, 9.0, 72, 1),
-    "parking_fee": (360, 513, 9.0, 52, 1),
-    "parking_note": (488, 513, 8.5, 85, 1),
+    "road_width": (96, 405, CASE_FORM_NUM_SIZE, 28, 1),
+    "management_fee": (92, 442, CASE_FORM_NUM_SIZE, 52, 1),
+    "elevator_count": (392, 442, CASE_FORM_NUM_SIZE, 22, 1),
+    "households_per_floor": (516, 442, CASE_FORM_NUM_SIZE, 26, 1),
+    "parking_no": (96, 513, CASE_FORM_NORMAL_SIZE, 68, 1),
+    "motorcycle_no": (229, 513, CASE_FORM_NORMAL_SIZE, 70, 1),
+    "parking_fee": (360, 513, CASE_FORM_NUM_SIZE, 50, 1),
+    "parking_note": (488, 513, 7.4, 80, 1),
 
-    # 3. 面積 / 金額
-    "total_ping": (102, 579, 9.5, 44, 1),
-    "main_ping": (213, 579, 9.5, 44, 1),
-    "attached_ping": (320, 579, 9.5, 44, 1),
-    "public_ping": (425, 579, 9.5, 44, 1),
-    "parking_ping": (525, 579, 9.5, 42, 1),
-    "land_ping": (102, 598, 9.5, 44, 1),
-    "base_land_ping": (245, 598, 9.5, 44, 1),
-    "land_share_ping": (415, 598, 9.5, 44, 1),
-    "case_price": (68, 617, 9.5, 60, 1),
-    "rent_price": (227, 617, 9.5, 58, 1),
-    "deposit": (365, 617, 9.5, 55, 1),
-    "deposit_months": (522, 617, 9.5, 45, 1),
+    # 3. 面積 / 金額：縮小到每個【】空格內，不壓到右括號。
+    "total_ping": (101, 584, CASE_FORM_NUM_SIZE, 31, 1),
+    "main_ping": (214, 584, CASE_FORM_NUM_SIZE, 26, 1),
+    "attached_ping": (316, 584, CASE_FORM_NUM_SIZE, 20, 1),
+    "public_ping": (412, 584, CASE_FORM_NUM_SIZE, 20, 1),
+    "parking_ping": (508, 584, CASE_FORM_NUM_SIZE, 20, 1),
+
+    "land_ping": (101, 602, CASE_FORM_NUM_SIZE, 31, 1),
+    "base_land_ping": (244, 602, CASE_FORM_NUM_SIZE, 31, 1),
+    "land_share_ping": (382, 602, CASE_FORM_NUM_SIZE, 31, 1),
+
+    "case_price": (64, 620, CASE_FORM_NUM_SIZE, 32, 1),
+    "rent_price": (208, 620, CASE_FORM_NUM_SIZE, 32, 1),
+    "deposit": (352, 620, CASE_FORM_NUM_SIZE, 32, 1),
+    "deposit_months": (502, 620, CASE_FORM_NUM_SIZE, 30, 1),
 
     # 4. 學區 / 環境
-    "elementary_school": (95, 647, 9.0, 75, 1),
-    "junior_high_school": (260, 647, 9.0, 80, 1),
-    "market": (459, 647, 9.0, 80, 1),
-    "park": (95, 665, 9.0, 75, 1),
-    "medical": (260, 665, 9.0, 80, 1),
-    "station": (459, 665, 9.0, 80, 1),
-    "builder": (95, 686, 9.0, 75, 1),
-    "business_area": (260, 686, 9.0, 80, 1),
+    "elementary_school": (95, 647, CASE_FORM_NORMAL_SIZE, 75, 1),
+    "junior_high_school": (260, 647, CASE_FORM_NORMAL_SIZE, 80, 1),
+    "market": (459, 647, CASE_FORM_NORMAL_SIZE, 80, 1),
+    "park": (95, 665, CASE_FORM_NORMAL_SIZE, 75, 1),
+    "medical": (260, 665, CASE_FORM_NORMAL_SIZE, 80, 1),
+    "station": (459, 665, CASE_FORM_NORMAL_SIZE, 80, 1),
+    "builder": (95, 686, CASE_FORM_NORMAL_SIZE, 75, 1),
+    "business_area": (260, 686, CASE_FORM_NORMAL_SIZE, 80, 1),
 
-    # 5. 特色備註
-    "feature_note": (134, 728, 7.4, 425, 2),
-    "special_note": (134, 780, 6.8, 425, 2),
+    # 5. 特色備註：只有一條空白線，強制單行縮字/截斷，不壓到 PS.
+    "feature_note": (132, 731, CASE_FORM_NOTE_SIZE, 430, 1),
+    "special_note": (132, 785, CASE_FORM_NOTE_SIZE, 430, 1),
 }
-
 # 勾選框中心位置：x, y_top, size
 CHECK_POS = {
     "deal_sale": (84, 51, 7),
@@ -201,29 +338,29 @@ CHECK_POS = {
 }
 
 
-def text_units(text: str) -> float:
-    return sum(1.0 if ord(ch) > 127 else 0.55 for ch in text)
+def pdf_text_width(text: str, font_name: str, font_size: float) -> float:
+    try:
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        return stringWidth(text, font_name, font_size)
+    except Exception:
+        # fallback 粗估
+        return sum((font_size if ord(ch) > 127 else font_size * 0.55) for ch in text)
 
 
-def wrap_text(text: str, width_pt: float, font_size: float, max_lines: int) -> list[str]:
+def truncate_to_width(text: str, font_name: str, font_size: float, width: float) -> str:
     text = clean(text)
     if not text:
-        return []
-    # 中文約 0.95em，英數約 0.55em；這只是為了不要超出欄位。
-    max_units = max(1, int(width_pt / max(font_size * 0.92, 1)))
-    lines: list[str] = []
-    for raw_line in text.splitlines():
-        cur = ""
-        for ch in raw_line:
-            if text_units(cur + ch) > max_units:
-                if cur:
-                    lines.append(cur)
-                cur = ch
-            else:
-                cur += ch
-        if cur:
-            lines.append(cur)
-    return lines[:max_lines]
+        return ""
+    if pdf_text_width(text, font_name, font_size) <= width:
+        return text
+
+    ell = "…"
+    result = ""
+    for ch in text:
+        if pdf_text_width(result + ch + ell, font_name, font_size) > width:
+            break
+        result += ch
+    return (result + ell) if result else ""
 
 
 def draw_text(c, key: str, value: Any, page_h: float):
@@ -232,17 +369,31 @@ def draw_text(c, key: str, value: Any, page_h: float):
     value = clean(value)
     if not value:
         return
+
     x, y_top, size, width, max_lines = TEXT_POS[key]
     px, py = pt_from_top(x, y_top, page_h)
-    lines = wrap_text(value, width, size, max_lines)
-    if not lines:
-        return
-    c.setFont(c._case_font_name, size)
-    c.setFillColorRGB(0, 0, 0)
-    leading = size + 2.0
-    for i, line in enumerate(lines):
-        c.drawString(px, py - i * leading, line)
+    font_name = c._case_font_name
 
+    # 這張表大多都是單行空格，為了不重疊，一律先單行 fit。
+    # 長備註也只能進一條線，避免壓到下一行 PS 或產權注意事項。
+    line = value.replace("\n", " ").replace("\r", " ")
+    line = re.sub(r"\s+", " ", line).strip()
+
+    min_size = 5.6 if key in {"feature_note", "special_note", "owner_full", "case_full"} else 6.8
+    draw_size = float(size)
+
+    while draw_size > min_size and pdf_text_width(line, font_name, draw_size) > width:
+        draw_size -= 0.2
+
+    if pdf_text_width(line, font_name, draw_size) > width:
+        line = truncate_to_width(line, font_name, draw_size, width)
+
+    if not line:
+        return
+
+    c.setFont(font_name, draw_size)
+    c.setFillColorRGB(0, 0, 0)
+    c.drawString(px, py, line)
 
 def draw_check(c, key: str, page_h: float):
     if key not in CHECK_POS:
@@ -283,11 +434,11 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
     put("owner_name", seller.get("name"))
     put("owner_id", seller.get("id_no"), seller.get("identity_no"))
     put("owner_mobile", seller.get("phone"), seller.get("mobile"))
-    put("owner_address", seller.get("contact_address"), seller.get("address"))
+    fill_address_components(fields, "owner", seller.get("contact_address") or seller.get("address"))
 
     put("property_title", case_data.get("property_title"), case_data.get("ai_sales_title"))
     put("community_name", case_data.get("community_name"))
-    put("case_address", case_data.get("case_address"), seller.get("address"))
+    fill_address_components(fields, "case", case_data.get("case_address") or seller.get("address"))
     put("floor_total", case_data.get("floor_total"))
     put("basement_total", case_data.get("basement_total"))
     put("floor", case_data.get("floor"))
