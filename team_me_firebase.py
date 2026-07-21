@@ -22844,6 +22844,7 @@ CASE_TOOLS_HTML = r'''
   <div>
     <a class="btn btn-outline-success" href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}">上傳謄本填表</a>
     <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
+    <a class="btn btn-outline-success" target="_blank" href="{{ url_for('seller_case_form_filled_docx', seller_id=seller.id) }}">下載 Word 案件表</a>
     <a class="btn btn-outline-secondary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載原本案件表 PDF</a>
     <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
   </div>
@@ -23045,6 +23046,7 @@ DEED_CASE_FORM_HTML = r"""
   </div>
   <div class="d-flex gap-2 flex-wrap">
     <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
+    <a class="btn btn-outline-success" target="_blank" href="{{ url_for('seller_case_form_filled_docx', seller_id=seller.id) }}">下載 Word 案件表</a>
     <a class="btn btn-outline-secondary" href="{{ url_for('seller_case_tools', seller_id=seller.id) }}">案件表 / AI文案</a>
     <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
   </div>
@@ -23194,6 +23196,33 @@ def seller_deed_case_form(seller_id):
     case_data = _case_merge_seller_and_case_data(seller)
     return render_template_string(DEED_CASE_FORM_HTML, seller=seller, case_data=case_data)
 
+
+
+@app.route("/sellers/<seller_id>/case-form-filled.docx")
+@login_required
+def seller_case_form_filled_docx(seller_id):
+    snap = db.collection("sellers").document(seller_id).get()
+    if not snap.exists:
+        flash("找不到這筆委託", "danger")
+        return redirect(url_for("sellers"))
+
+    seller = doc_to_dict(snap)
+    case_data = _case_merge_seller_and_case_data(seller)
+
+    try:
+        from case_form_docx_tool import build_case_form_docx_bytes
+        docx_bytes = build_case_form_docx_bytes(case_data, seller=seller)
+    except Exception as e:
+        flash(f"產生 Word 案件輸入表失敗：{e}", "danger")
+        return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+
+    filename = f"Word案件輸入表_{seller.get('name') or seller_id}.docx"
+    return send_file(
+        BytesIO(docx_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        as_attachment=True,
+        download_name=filename,
+    )
 
 @app.route("/sellers/<seller_id>/case-form-filled.pdf")
 @login_required
