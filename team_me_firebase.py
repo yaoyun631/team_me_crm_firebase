@@ -22497,6 +22497,10 @@ CASE_DETAIL_FIELD_KEYS = [
     "total_ping", "main_ping", "attached_ping", "public_ping", "land_ping", "parking_ping",
     "floor", "floor_total", "building_age", "facing", "showing_method", "case_note",
     "life_note", "property_highlight_note", "target_customer_note", "raw_group_text", "source_url",
+    # 謄本 / 權狀解析欄位
+    "deed_raw_text", "deed_parsed_note", "deed_owner", "land_lot_no", "building_no",
+    "deed_completed_date", "deed_main_use", "deed_main_material", "deed_right_scope",
+    "deed_mortgage_note",
     "ai_sales_title", "ai_selling_points", "ai_group_copy", "ai_listing_description", "ai_feature_note",
 ]
 
@@ -22522,6 +22526,16 @@ CASE_BASIC_LABELS = {
     "property_highlight_note": "物件亮點補充",
     "target_customer_note": "適合客群",
     "source_url": "參考網址",
+    "deed_raw_text": "謄本/權狀文字",
+    "deed_parsed_note": "謄本解析摘要",
+    "deed_owner": "所有權人",
+    "land_lot_no": "地號",
+    "building_no": "建號",
+    "deed_completed_date": "建物完成日期",
+    "deed_main_use": "主要用途",
+    "deed_main_material": "主要建材",
+    "deed_right_scope": "權利範圍",
+    "deed_mortgage_note": "他項權利/抵押權備註",
 }
 
 
@@ -22597,6 +22611,156 @@ def _case_parse_raw_listing_text(raw_text: str):
     return {k: v for k, v in data.items() if str(v or "").strip()}
 
 
+
+def _case_number_to_ping_text(value: str):
+    """把謄本常見平方公尺數字換算成坪，回傳字串。"""
+    raw = str(value or "").replace(",", "").strip()
+    if not raw:
+        return ""
+    m = re.search(r"(\d+(?:\.\d+)?)", raw)
+    if not m:
+        return ""
+    try:
+        num = float(m.group(1))
+    except Exception:
+        return ""
+    # 謄本多數是平方公尺；若文字裡已明確寫坪，直接保留。
+    if "坪" in raw:
+        return str(round(num, 2)).rstrip("0").rstrip(".")
+    ping = num / 3.305785
+    return str(round(ping, 2)).rstrip("0").rstrip(".")
+
+
+def _case_first_area_to_ping(text: str, patterns, default=""):
+    text = _case_normalize_fullwidth(text)
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I | re.M | re.S)
+        if m:
+            return _case_number_to_ping_text(m.group(1))
+    return default
+
+
+def _case_parse_deed_text(deed_text: str):
+    """從謄本 / 權狀 / 地籍建物資料文字解析案件輸入表欄位。
+
+    第一版先支援「貼上文字」：
+    - 可貼電子謄本 PDF 複製出的文字
+    - 可貼 OCR 後文字
+    - 若格式不同，解析不到的欄位會保留空白，讓你人工確認
+    """
+    raw = str(deed_text or "").strip()
+    if not raw:
+        return {}
+
+    text = _case_normalize_fullwidth(raw)
+    compact = re.sub(r"[ \t]+", " ", text)
+
+    data = {
+        "deed_raw_text": raw,
+    }
+
+    data["case_address"] = _case_first_match(compact, [
+        r"(?:建物門牌|門牌|房屋門牌|建物坐落|房屋坐落|建物地址|標示部.*?門牌)\s*[:：]?\s*([^\n]+)",
+        r"(?:地址|坐落)\s*[:：]\s*([^\n]+)",
+    ])
+
+    data["land_lot_no"] = _case_first_match(compact, [
+        r"(?:土地標示|土地坐落|地號)\s*[:：]?\s*([^\n]*?\d+(?:[-之]\d+)?\s*地號)",
+        r"([^\n]{0,20}\d+(?:[-之]\d+)?\s*地號)",
+    ])
+
+    data["building_no"] = _case_first_match(compact, [
+        r"(?:建號|建物建號)\s*[:：]?\s*([^\n]*?\d+(?:[-之]\d+)?\s*建號)",
+        r"([^\n]{0,20}\d+(?:[-之]\d+)?\s*建號)",
+    ])
+
+    data["deed_owner"] = _case_first_match(compact, [
+        r"(?:所有權人|權利人)\s*[:：]?\s*([^\n ]{2,20})",
+    ])
+
+    data["deed_completed_date"] = _case_first_match(compact, [
+        r"(?:建築完成日期|建物完成日期|完成日期)\s*[:：]?\s*([^\n]+)",
+    ])
+
+    data["deed_main_use"] = _case_first_match(compact, [
+        r"(?:主要用途|用途)\s*[:：]?\s*([^\n]+)",
+    ])
+
+    data["deed_main_material"] = _case_first_match(compact, [
+        r"(?:主要建材|建材)\s*[:：]?\s*([^\n]+)",
+    ])
+
+    data["deed_right_scope"] = _case_first_match(compact, [
+        r"(?:權利範圍|持分)\s*[:：]?\s*([^\n]+)",
+    ])
+
+    data["deed_mortgage_note"] = _case_first_match(compact, [
+        r"(?:他項權利|抵押權|最高限額抵押權|擔保債權總金額)\s*[:：]?\s*([^\n]+)",
+    ])
+
+    data["floor"] = _case_first_match(compact, [
+        r"(?:層次|所在樓層|樓層)\s*[:：]?\s*([^\n]+)",
+    ])
+
+    data["floor_total"] = _case_first_match(compact, [
+        r"(?:總樓層|樓層總數|層數|總層數)\s*[:：]?\s*([^\n]+)",
+    ])
+
+    data["main_ping"] = _case_first_area_to_ping(compact, [
+        r"(?:主建物面積|主建物|主建)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:平方公尺|㎡|坪)?",
+    ])
+
+    data["attached_ping"] = _case_first_area_to_ping(compact, [
+        r"(?:附屬建物面積|附屬建物|附屬)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:平方公尺|㎡|坪)?",
+    ])
+
+    data["public_ping"] = _case_first_area_to_ping(compact, [
+        r"(?:共有部分面積|共有部分|公設|公設面積)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:平方公尺|㎡|坪)?",
+    ])
+
+    # 若沒有總建坪，先用主建 + 附屬 + 公設估算，方便案件表使用。
+    if not data.get("total_ping"):
+        try:
+            parts = []
+            for k in ("main_ping", "attached_ping", "public_ping"):
+                if data.get(k):
+                    parts.append(float(str(data[k]).replace(",", "")))
+            if parts:
+                data["total_ping"] = str(round(sum(parts), 2)).rstrip("0").rstrip(".")
+        except Exception:
+            pass
+
+    # 從完成日期粗估屋齡；民國年與西元年都盡量支援。
+    if data.get("deed_completed_date") and not data.get("building_age"):
+        try:
+            m = re.search(r"(\d{2,4})\s*[年/-]", data["deed_completed_date"])
+            if m:
+                year = int(m.group(1))
+                if year < 1911:
+                    year += 1911
+                age = now_taipei().year - year
+                if 0 <= age <= 150:
+                    data["building_age"] = str(age)
+        except Exception:
+            pass
+
+    note_lines = []
+    for key in [
+        "case_address", "land_lot_no", "building_no", "deed_owner", "deed_completed_date",
+        "deed_main_use", "deed_main_material", "deed_right_scope", "floor", "floor_total",
+        "main_ping", "attached_ping", "public_ping", "total_ping", "deed_mortgage_note",
+    ]:
+        value = data.get(key)
+        if value:
+            label = CASE_BASIC_LABELS.get(key, key)
+            note_lines.append(f"{label}：{value}")
+
+    if note_lines:
+        data["deed_parsed_note"] = "\n".join(note_lines)
+
+    return {k: v for k, v in data.items() if str(v or "").strip()}
+
+
 def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     incoming = incoming or {}
     data = {}
@@ -22622,6 +22786,16 @@ def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     data["target_customer_note"] = seller.get("target_customer_note") or ""
     data["raw_group_text"] = seller.get("raw_group_text") or ""
     data["source_url"] = seller.get("source_url") or ""
+    data["deed_raw_text"] = seller.get("deed_raw_text") or ""
+    data["deed_parsed_note"] = seller.get("deed_parsed_note") or ""
+    data["deed_owner"] = seller.get("deed_owner") or ""
+    data["land_lot_no"] = seller.get("land_lot_no") or ""
+    data["building_no"] = seller.get("building_no") or ""
+    data["deed_completed_date"] = seller.get("deed_completed_date") or ""
+    data["deed_main_use"] = seller.get("deed_main_use") or ""
+    data["deed_main_material"] = seller.get("deed_main_material") or ""
+    data["deed_right_scope"] = seller.get("deed_right_scope") or ""
+    data["deed_mortgage_note"] = seller.get("deed_mortgage_note") or ""
     data["ai_sales_title"] = seller.get("ai_sales_title") or ""
     data["ai_selling_points"] = seller.get("ai_selling_points") or []
     data["ai_group_copy"] = seller.get("ai_group_copy") or ""
@@ -22801,12 +22975,12 @@ def _case_missing_fields(case_data: dict):
 CASE_TOOLS_HTML = r'''
 {% extends "base.html" %}
 {% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3">
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <div>
-    <h3 class="mb-1">案件輸入表 / AI強銷文案</h3>
+    <h3 class="mb-1">案件輸入表 / AI 強銷文案</h3>
     <div class="text-muted small">委託：{{ seller.name or '-' }}｜{{ seller.phone or '-' }}</div>
   </div>
-  <div>
+  <div class="d-flex gap-2 flex-wrap">
     <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載案件輸入表 PDF</a>
     <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
   </div>
@@ -22818,30 +22992,142 @@ CASE_TOOLS_HTML = r'''
 </div>
 {% endif %}
 
+<div class="alert alert-info small">
+  <strong>使用方式：</strong>
+  先貼公司群組文案或謄本 / 權狀文字，按「解析謄本並儲存」或「AI 整理並生成強銷文案」。
+  系統會把可判斷的地址、坪數、樓層、屋齡、建號、地號等資料帶入案件輸入表。
+</div>
+
 <div class="row g-4">
   <div class="col-lg-7">
     <form method="post" class="card">
-      <div class="card-header fw-bold">案件資料</div>
+      <div class="card-header fw-bold">案件資料 / 謄本資料</div>
       <div class="card-body">
+
         <div class="mb-3">
-          <label class="form-label">貼上公司群組原始文案 / 補充資料</label>
-          <textarea name="raw_group_text" class="form-control" rows="8" placeholder="可直接貼公司群組整段物件資料，系統會先自動拆欄位，再交給 AI 生成標題與五點強銷。">{{ case_data.raw_group_text or '' }}</textarea>
-          <div class="form-text">送出時會自動解析：地址、售價、格局、坪數、屋齡、帶看方式、網址與條列特色。</div>
+          <label class="form-label fw-bold">貼上公司群組原始文案 / 補充資料</label>
+          <textarea name="raw_group_text" class="form-control" rows="7" placeholder="可直接貼公司群組整段物件資料，系統會先自動拆欄位，再交給 AI 生成標題與五點強銷。">{{ case_data.raw_group_text or '' }}</textarea>
+          <div class="form-text">可解析：地址、售價、格局、坪數、屋齡、帶看方式、網址與條列特色。</div>
         </div>
 
-        <div class="row g-2">
-          {% for key, label in field_labels.items() %}
-            {% if key not in ['life_note','property_highlight_note','target_customer_note','source_url'] %}
-              <div class="col-md-6">
-                <label class="form-label">{{ label }}</label>
-                <input type="text" name="{{ key }}" class="form-control" value="{{ case_data.get(key, '') }}">
-              </div>
-            {% endif %}
-          {% endfor %}
+        <div class="mb-3">
+          <label class="form-label fw-bold">貼上謄本 / 權狀 / 地籍建物資料文字</label>
+          <textarea name="deed_raw_text" class="form-control" rows="8" placeholder="可貼電子謄本複製出的文字、OCR文字，或權狀上的建物/土地資料。&#10;例：建物門牌、建號、地號、主要用途、主要建材、建物完成日期、主建物面積、附屬建物、共有部分、權利範圍、他項權利等。">{{ case_data.deed_raw_text or '' }}</textarea>
+          <div class="form-text">第一版先支援貼上文字。若是掃描 PDF / 圖片，請先轉 OCR 文字再貼上；解析後仍建議人工核對。</div>
         </div>
 
-        <hr>
-        <div class="row g-2">
+        {% if case_data.deed_parsed_note %}
+        <div class="mb-3">
+          <label class="form-label">謄本解析摘要</label>
+          <textarea class="form-control" rows="6" readonly>{{ case_data.deed_parsed_note }}</textarea>
+        </div>
+        {% endif %}
+
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label">物件標題</label>
+            <input name="property_title" class="form-control" value="{{ case_data.property_title or '' }}">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">社區名稱</label>
+            <input name="community_name" class="form-control" value="{{ case_data.community_name or '' }}">
+          </div>
+          <div class="col-md-8">
+            <label class="form-label">完整地址</label>
+            <input name="case_address" class="form-control" value="{{ case_data.case_address or '' }}">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">開價 / 售價</label>
+            <input name="case_price" class="form-control" value="{{ case_data.case_price or '' }}">
+          </div>
+
+          <div class="col-md-4">
+            <label class="form-label">格局</label>
+            <input name="layout" class="form-control" value="{{ case_data.layout or '' }}">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">所在樓層</label>
+            <input name="floor" class="form-control" value="{{ case_data.floor or '' }}">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">樓高 / 總樓層</label>
+            <input name="floor_total" class="form-control" value="{{ case_data.floor_total or '' }}">
+          </div>
+
+          <div class="col-md-3">
+            <label class="form-label">總建坪</label>
+            <input name="total_ping" class="form-control" value="{{ case_data.total_ping or '' }}">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">主建坪</label>
+            <input name="main_ping" class="form-control" value="{{ case_data.main_ping or '' }}">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">附屬坪</label>
+            <input name="attached_ping" class="form-control" value="{{ case_data.attached_ping or '' }}">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">公設坪</label>
+            <input name="public_ping" class="form-control" value="{{ case_data.public_ping or '' }}">
+          </div>
+
+          <div class="col-md-3">
+            <label class="form-label">地坪</label>
+            <input name="land_ping" class="form-control" value="{{ case_data.land_ping or '' }}">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">車位坪</label>
+            <input name="parking_ping" class="form-control" value="{{ case_data.parking_ping or '' }}">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">屋齡</label>
+            <input name="building_age" class="form-control" value="{{ case_data.building_age or '' }}">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">朝向 / 座向</label>
+            <input name="facing" class="form-control" value="{{ case_data.facing or '' }}">
+          </div>
+
+          <div class="col-md-4">
+            <label class="form-label">地號</label>
+            <input name="land_lot_no" class="form-control" value="{{ case_data.land_lot_no or '' }}">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">建號</label>
+            <input name="building_no" class="form-control" value="{{ case_data.building_no or '' }}">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">建物完成日期</label>
+            <input name="deed_completed_date" class="form-control" value="{{ case_data.deed_completed_date or '' }}">
+          </div>
+
+          <div class="col-md-4">
+            <label class="form-label">主要用途</label>
+            <input name="deed_main_use" class="form-control" value="{{ case_data.deed_main_use or '' }}">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">主要建材</label>
+            <input name="deed_main_material" class="form-control" value="{{ case_data.deed_main_material or '' }}">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">權利範圍</label>
+            <input name="deed_right_scope" class="form-control" value="{{ case_data.deed_right_scope or '' }}">
+          </div>
+
+          <div class="col-md-6">
+            <label class="form-label">帶看方式</label>
+            <input name="showing_method" class="form-control" value="{{ case_data.showing_method or '' }}">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">參考網址</label>
+            <input name="source_url" class="form-control" value="{{ case_data.source_url or '' }}">
+          </div>
+
+          <div class="col-12">
+            <label class="form-label">他項權利 / 抵押權備註</label>
+            <textarea name="deed_mortgage_note" class="form-control" rows="2">{{ case_data.deed_mortgage_note or '' }}</textarea>
+          </div>
+
           <div class="col-md-4">
             <label class="form-label">生活機能補充</label>
             <textarea name="life_note" class="form-control" rows="4" placeholder="例：中山路生活圈、近市場、近學校、近主要道路">{{ case_data.life_note or '' }}</textarea>
@@ -22854,14 +23140,16 @@ CASE_TOOLS_HTML = r'''
             <label class="form-label">適合客群</label>
             <textarea name="target_customer_note" class="form-control" rows="4" placeholder="例：在地換屋、大家庭、首購、自住整理型客戶">{{ case_data.target_customer_note or '' }}</textarea>
           </div>
+
           <div class="col-12">
-            <label class="form-label">參考網址</label>
-            <input type="text" name="source_url" class="form-control" value="{{ case_data.source_url or '' }}">
+            <label class="form-label">備註 / 產權注意事項</label>
+            <textarea name="case_note" class="form-control" rows="4">{{ case_data.case_note or '' }}</textarea>
           </div>
         </div>
       </div>
       <div class="card-footer d-flex gap-2 flex-wrap">
-        <button class="btn btn-primary" name="action" value="generate_ai" type="submit">AI整理並生成強銷文案</button>
+        <button class="btn btn-outline-success" name="action" value="parse_deed" type="submit">解析謄本並儲存</button>
+        <button class="btn btn-primary" name="action" value="generate_ai" type="submit">AI 整理並生成強銷文案</button>
         <button class="btn btn-outline-secondary" name="action" value="save_only" type="submit">只儲存資料</button>
         <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載案件輸入表 PDF</a>
       </div>
@@ -22873,7 +23161,7 @@ CASE_TOOLS_HTML = r'''
       <div class="card-header fw-bold">AI 強銷標題與五點特色</div>
       <div class="card-body">
         <label class="form-label">強銷標題</label>
-        <input class="form-control mb-3" readonly value="{{ case_data.ai_sales_title or '' }}">
+        <input id="aiSalesTitle" class="form-control mb-3" readonly value="{{ case_data.ai_sales_title or '' }}">
         <label class="form-label">五點特色</label>
         {% if case_data.ai_selling_points %}
           <ol class="mb-0">
@@ -22882,8 +23170,16 @@ CASE_TOOLS_HTML = r'''
             {% endfor %}
           </ol>
         {% else %}
-          <div class="text-muted">尚未生成。左側填資料後按「AI整理並生成強銷文案」。</div>
+          <div class="text-muted">尚未生成。左側填資料後按「AI 整理並生成強銷文案」。</div>
         {% endif %}
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header fw-bold">樂屋 / 591 刊登描述</div>
+      <div class="card-body">
+        <textarea id="aiListingDescription" class="form-control" rows="7" readonly>{{ case_data.ai_listing_description or '' }}</textarea>
+        <button class="btn btn-sm btn-outline-secondary mt-2" type="button" onclick="navigator.clipboard.writeText(document.getElementById('aiListingDescription').value); alert('已複製刊登描述');">複製刊登描述</button>
       </div>
     </div>
 
@@ -22891,7 +23187,7 @@ CASE_TOOLS_HTML = r'''
       <div class="card-header fw-bold">公司群組文案</div>
       <div class="card-body">
         <textarea id="aiGroupCopy" class="form-control" rows="16" readonly>{{ case_data.ai_group_copy or '' }}</textarea>
-        <button class="btn btn-sm btn-outline-secondary mt-2" onclick="navigator.clipboard.writeText(document.getElementById('aiGroupCopy').value); alert('已複製群組文案');">複製群組文案</button>
+        <button class="btn btn-sm btn-outline-secondary mt-2" type="button" onclick="navigator.clipboard.writeText(document.getElementById('aiGroupCopy').value); alert('已複製群組文案');">複製群組文案</button>
       </div>
     </div>
 
@@ -22915,28 +23211,53 @@ def seller_case_tools(seller_id):
     if not snap.exists:
         flash("找不到這筆委託", "danger")
         return redirect(url_for("sellers"))
+
     seller = doc_to_dict(snap)
+
     if request.method == "POST":
         form_payload = _case_seller_payload_from_form(request.form)
         raw_text = form_payload.get("raw_group_text") or ""
-        parsed_payload = _case_parse_raw_listing_text(raw_text) if raw_text else {}
+        deed_text = form_payload.get("deed_raw_text") or ""
+
+        parsed_payload = {}
+        if raw_text:
+            parsed_payload.update(_case_parse_raw_listing_text(raw_text))
+        if deed_text:
+            deed_payload = _case_parse_deed_text(deed_text)
+            for k, v in deed_payload.items():
+                if str(v or "").strip():
+                    parsed_payload[k] = v
+
         merged_payload = dict(parsed_payload)
         for k, v in form_payload.items():
             if str(v or "").strip():
                 merged_payload[k] = v
+
         case_data = _case_merge_seller_and_case_data(seller, merged_payload)
         action = request.form.get("action", "save_only")
+
         if action == "generate_ai":
             ai_payload = _case_ai_generate_sales_copy(seller, case_data)
             _case_apply_ai_to_seller(seller_id, case_data, ai_payload)
             flash("已整理案件資料，並生成 AI 強銷文案", "success")
+        elif action == "parse_deed":
+            _case_apply_ai_to_seller(seller_id, case_data, {})
+            flash("已解析謄本文字並儲存到案件資料，請人工核對後可下載案件表 PDF", "success")
         else:
             _case_apply_ai_to_seller(seller_id, case_data, {})
             flash("已儲存案件資料", "success")
+
         return redirect(url_for("seller_case_tools", seller_id=seller_id))
+
     case_data = _case_merge_seller_and_case_data(seller)
     missing_fields = _case_missing_fields(case_data)
-    return render_template_string(CASE_TOOLS_HTML, seller=seller, case_data=case_data, field_labels=CASE_BASIC_LABELS, missing_fields=missing_fields)
+    return render_template_string(
+        CASE_TOOLS_HTML,
+        seller=seller,
+        case_data=case_data,
+        field_labels=CASE_BASIC_LABELS,
+        missing_fields=missing_fields,
+    )
 
 
 def _case_pdf_value(case_data, key, default=""):
@@ -22987,7 +23308,17 @@ def _case_generate_pdf_bytes(seller: dict, case_data: dict):
     t = Table(basic_rows, colWidths=[28*mm, 67*mm, 28*mm, 67*mm]); t.setStyle(table_style); story.append(Paragraph("1. 基本資料", styles["CJK"])); story.append(t); story.append(Spacer(1,4*mm))
     points = case_data.get("ai_selling_points") or []
     points_text = "<br/>".join([f"{i}. {p}" for i, p in enumerate(points[:5], 1)]) if points else (_case_pdf_value(case_data, "ai_feature_note") or _case_pdf_value(case_data, "case_note"))
-    desc_rows = [[P("特色備註"), P(points_text or "")], [P("生活機能補充"), P(_case_pdf_value(case_data, "life_note"))], [P("物件亮點補充"), P(_case_pdf_value(case_data, "property_highlight_note"))], [P("適合客群"), P(_case_pdf_value(case_data, "target_customer_note"))], [P("產權特別注意事項"), P("")], [P("合約日 / 租約日"), P("合約日：______年____月____日  至  ______年____月____日")]]
+    deed_notice = _case_pdf_value(case_data, "deed_mortgage_note") or _case_pdf_value(case_data, "case_note")
+    deed_summary = _case_pdf_value(case_data, "deed_parsed_note")
+    desc_rows = [
+        [P("特色備註"), P(points_text or "")],
+        [P("生活機能補充"), P(_case_pdf_value(case_data, "life_note"))],
+        [P("物件亮點補充"), P(_case_pdf_value(case_data, "property_highlight_note"))],
+        [P("適合客群"), P(_case_pdf_value(case_data, "target_customer_note"))],
+        [P("謄本解析摘要"), P(deed_summary or "")],
+        [P("產權特別注意事項"), P(deed_notice or "")],
+        [P("合約日 / 租約日"), P("合約日：______年____月____日  至  ______年____月____日")],
+    ]
     t = Table(desc_rows, colWidths=[38*mm, 152*mm]); t.setStyle(TableStyle([("FONTNAME", (0,0), (-1,-1), "STSong-Light"), ("FONTSIZE", (0,0), (-1,-1), 9), ("GRID", (0,0), (-1,-1), 0.4, colors.black), ("VALIGN", (0,0), (-1,-1), "TOP"), ("BACKGROUND", (0,0), (0,-1), colors.whitesmoke)])); story.append(Paragraph("2. 學區 / 環境 / 特色備註", styles["CJK"])); story.append(t); story.append(Spacer(1,3*mm)); story.append(Paragraph("PS. 未提供或待確認資料請列印後手寫補上。AI 生成內容仍建議人工確認。", styles["CJKSmall"]))
     doc.build(story)
     buffer.seek(0)
@@ -33304,269 +33635,108 @@ except Exception as e:
 # =============================================================================
 
 
-
 # =============================================================================
-# Team M.E v29：房產查詢 / 新上架物件後台頁面
-# - 新增 /assistant/new-properties：只看網址解析 / 新上架物件查詢
-# - 新增 /assistant/property-results：看全部房產查詢結果，含地址、實價、歷史、網址
-# - 不改動原本 /result/<token> 單筆結果頁
+# Team M.E 新上架物件後台｜只顯示網址＋標題 Patch v20260718_NEW_PROPERTY_LINKS_ONLY
+# 說明：
+# - 這個頁面不解析物件細節，只讀 Firebase 裡已紀錄的新物件連結。
+# - 後台顯示方式比照 LINE 摘要：標題 + 網址。
+# - 本機 Playwright watcher 抓到新的物件連結後，寫入 property_alert_items。
 # =============================================================================
 
-TEAMME_DASHBOARD_RESULT_LIMIT = int(os.environ.get("TEAMME_DASHBOARD_RESULT_LIMIT", "200") or "200")
+PROPERTY_ALERT_ITEM_COLLECTION = os.environ.get(
+    "PROPERTY_ALERT_ITEM_COLLECTION",
+    "property_alert_items",
+).strip() or "property_alert_items"
 
-def _v29_safe_text(value, default=""):
-    if value is None:
-        return default
+
+def _property_link_only_safe_text(value, default=""):
     try:
-        text = str(value)
+        text = str(value or "").strip()
+        return text if text else default
     except Exception:
         return default
-    return text.strip() if text.strip() else default
 
 
-def _v29_get_nested(data, *keys, default=""):
-    cur = data
-    for key in keys:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(key)
-    return default if cur is None else cur
-
-
-def _v29_result_link(token):
-    token = _v29_safe_text(token)
-    if not token:
-        return ""
-    try:
-        return url_for("teamme_property_result", token=token)
-    except Exception:
-        return f"/result/{token}"
-
-
-def _v29_result_kind_label(kind, command=""):
-    kind = _v29_safe_text(kind)
-    command = _v29_safe_text(command)
-    mapping = {
-        "url": "網址解析",
-        "address": "地址行情",
-        "nearby": "附近行情",
-        "history": "本戶成交",
-        "status": "資料庫狀態",
-        "settings": "查詢設定",
-        "recent": "最近查詢",
-    }
-    if kind in mapping:
-        return mapping[kind]
-    command_mapping = {
-        "url_lookup": "網址解析",
-        "address_lookup": "地址行情",
-        "nearby": "附近行情",
-        "history": "本戶成交",
-        "db_status": "資料庫狀態",
-    }
-    return command_mapping.get(command, kind or command or "房產查詢")
-
-
-def _v29_result_area_text(row):
-    parts = []
-    for key in ("district", "public_address", "address", "query"):
-        val = _v29_safe_text(row.get(key))
-        if val and val not in parts:
-            parts.append(val)
-    return "｜".join(parts[:2]) or "-"
-
-
-def _v29_extract_property_result_row(doc):
+def _property_link_only_doc_to_item(doc):
     data = doc.to_dict() or {}
-    result = data.get("result") or {}
-    parsed = result.get("parsed") or {}
-    summary = result.get("summary") or {}
-    payload = data.get("payload") or {}
-    source = data.get("source") or {}
-
-    command = (
-        _v29_safe_text(data.get("command"))
-        or _v29_safe_text(_v29_get_nested(data, "task", "command"))
-        or _v29_safe_text(result.get("command"))
+    data["id"] = doc.id
+    # 支援不同版本欄位命名，只顯示標題與網址。
+    data["title"] = (
+        _property_link_only_safe_text(data.get("title"))
+        or _property_link_only_safe_text(data.get("listing_title"))
+        or _property_link_only_safe_text(data.get("name"))
+        or "新上架物件"
     )
-    kind = (
-        _v29_safe_text(result.get("kind"))
-        or ("url" if command == "url_lookup" else "")
-        or ("address" if command == "address_lookup" else "")
-        or command
+    data["url"] = (
+        _property_link_only_safe_text(data.get("listing_url"))
+        or _property_link_only_safe_text(data.get("url"))
+        or _property_link_only_safe_text(data.get("source_url"))
     )
-
-    token = (
-        _v29_safe_text(data.get("result_token"))
-        or _v29_safe_text(data.get("token"))
-        or _v29_safe_text(result.get("result_token"))
-    )
-
-    title = (
-        _v29_safe_text(parsed.get("title"))
-        or _v29_safe_text(result.get("title"))
-        or _v29_safe_text(result.get("query"))
-        or _v29_safe_text(payload.get("address"))
-        or _v29_safe_text(payload.get("url"))
-        or _v29_safe_text(data.get("task_id"))
-        or doc.id
-    )
-
-    row = {
-        "id": doc.id,
-        "task_id": _v29_safe_text(data.get("task_id")) or doc.id,
-        "created_at": _v29_safe_text(data.get("created_at")) or _v29_safe_text(result.get("created_at")),
-        "updated_at": _v29_safe_text(data.get("updated_at")),
-        "kind": kind,
-        "kind_label": _v29_result_kind_label(kind, command),
-        "command": command,
-        "title": title,
-        "url": _v29_safe_text(payload.get("url")) or _v29_safe_text(parsed.get("url")) or _v29_safe_text(parsed.get("source_url")),
-        "query": _v29_safe_text(result.get("query")) or _v29_safe_text(payload.get("address")),
-        "district": _v29_safe_text(parsed.get("district")) or _v29_safe_text(result.get("district")),
-        "public_address": _v29_safe_text(parsed.get("public_address")) or _v29_safe_text(parsed.get("address")),
-        "building_area_ping": _v29_safe_text(parsed.get("building_area_ping")),
-        "main_area_ping": _v29_safe_text(parsed.get("main_area_ping")),
-        "land_area_ping": _v29_safe_text(parsed.get("land_area_ping")),
-        "floor_text": _v29_safe_text(parsed.get("floor_text")) or _v29_safe_text(parsed.get("total_floors")),
-        "building_age": _v29_safe_text(parsed.get("building_age")),
-        "summary_count": _v29_safe_text(summary.get("count")),
-        "median_unit": _v29_safe_text(summary.get("median_unit")),
-        "average_unit": _v29_safe_text(summary.get("average_unit")),
-        "median_total": _v29_safe_text(summary.get("median_total")),
-        "candidate_count": len(result.get("candidates") or []) if isinstance(result.get("candidates"), list) else 0,
-        "result_link": _v29_result_link(token),
-        "target_id": _v29_safe_text(source.get("target_id")),
-        "source_type": _v29_safe_text(source.get("type")),
-    }
-    row["area_text"] = _v29_result_area_text(row)
-    return row
+    data["created_at"] = _property_link_only_safe_text(data.get("created_at") or data.get("first_seen_at") or data.get("updated_at"))
+    data["source_platform"] = _property_link_only_safe_text(data.get("source_platform") or data.get("platform") or data.get("source_domain"))
+    data["status"] = _property_link_only_safe_text(data.get("status") or "new")
+    return data
 
 
-def _v29_fetch_property_results(kind_filter="", limit=None):
-    collection_name = globals().get("TEAMME_PROPERTY_RESULT_COLLECTION", "team_me_line_results")
-    limit = limit or TEAMME_DASHBOARD_RESULT_LIMIT
-    rows = []
-    try:
-        docs = list(db.collection(collection_name).stream())
-    except Exception as e:
-        print("⚠️ v29 讀取房產查詢結果失敗：", e)
-        docs = []
-
-    for doc in docs:
-        try:
-            row = _v29_extract_property_result_row(doc)
-            kind = row.get("kind") or ""
-            command = row.get("command") or ""
-            if kind_filter:
-                if kind_filter == "url":
-                    if not (kind == "url" or command == "url_lookup"):
-                        continue
-                elif kind_filter == "address":
-                    if not (kind == "address" or command == "address_lookup"):
-                        continue
-                elif kind_filter not in {kind, command}:
-                    continue
-            rows.append(row)
-        except Exception as e:
-            print("⚠️ v29 解析房產結果列失敗：", e)
-
-    rows.sort(key=lambda r: r.get("created_at") or r.get("updated_at") or "", reverse=True)
-    return rows[:limit]
-
-
-_TEAMME_V29_PROPERTY_DASHBOARD_TEMPLATE = """
+_NEW_PROPERTY_LINKS_ONLY_TEMPLATE = """
 <!doctype html>
 <html lang="zh-Hant">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{{ page_title }}</title>
+  <title>新上架物件</title>
   <style>
-    body{font-family:Arial,"Microsoft JhengHei",sans-serif;background:#f7f3ee;color:#382d25;margin:0;padding:18px}
-    .wrap{max-width:1180px;margin:0 auto}
-    .top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
-    h1{font-size:24px;margin:0}.muted{color:#7c6b5c;font-size:13px}
-    .tabs{display:flex;gap:8px;flex-wrap:wrap}
-    .btn{display:inline-block;padding:8px 12px;border-radius:10px;border:1px solid #e2c5a2;background:#fff;color:#704719;text-decoration:none;font-size:14px}
-    .btn.active{background:#ffb300;border-color:#ffb300;color:#fff;font-weight:bold}
-    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:12px 0}
-    .stat{background:#fff;border:1px solid #eadbc9;border-radius:16px;padding:14px;box-shadow:0 6px 18px rgba(85,55,25,.05)}
-    .stat b{display:block;font-size:24px;margin-bottom:3px}
-    .card{background:#fff;border:1px solid #eadbc9;border-radius:18px;padding:16px;margin-bottom:12px;box-shadow:0 8px 24px rgba(85,55,25,.06)}
-    .row{display:grid;grid-template-columns:1.2fr .8fr .8fr .8fr auto;gap:10px;align-items:start}
-    .title{font-size:16px;font-weight:bold;line-height:1.45}.tag{display:inline-block;background:#fff2df;border:1px solid #f0d2b1;color:#704719;padding:3px 8px;border-radius:999px;font-size:12px;margin-bottom:6px}
-    .small{font-size:13px;color:#5f5044;line-height:1.6;word-break:break-word}
-    .empty{background:#fff;border:1px dashed #d9c3a9;border-radius:18px;padding:28px;text-align:center;color:#806e5f}
-    @media(max-width:850px){.row{grid-template-columns:1fr}.top{display:block}.tabs{margin-top:10px}}
+    body{font-family:Arial,"Microsoft JhengHei",sans-serif;background:#f7f3ee;color:#3b3028;margin:0;padding:20px}
+    .wrap{max-width:980px;margin:auto}.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+    h1{font-size:26px;margin:0}.muted{color:#8a7767;font-size:13px}.card{background:#fff;border:1px solid #eadbc9;border-radius:18px;padding:16px 18px;margin-bottom:12px;box-shadow:0 8px 25px rgba(85,55,25,.06)}
+    .title{font-weight:700;font-size:17px;margin-bottom:8px}.url{word-break:break-all;line-height:1.5}.url a{color:#0d6efd;text-decoration:none}.url a:hover{text-decoration:underline}
+    .meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.badge{display:inline-block;background:#fff2df;border:1px solid #f0d2b1;color:#7a5630;border-radius:999px;padding:3px 9px;font-size:12px}
+    .toolbar{display:flex;gap:8px;flex-wrap:wrap}.toolbar input{border:1px solid #d9c6b5;border-radius:10px;padding:8px 10px;min-width:240px}.toolbar button,.btn{border:1px solid #c9a37f;background:#fff8f0;color:#5f3d20;border-radius:10px;padding:8px 12px;text-decoration:none;cursor:pointer}
+    .empty{text-align:center;padding:40px;color:#8a7767}.copy{border:1px solid #ddd;background:#fafafa;border-radius:8px;padding:4px 8px;font-size:12px;cursor:pointer;margin-left:6px}
   </style>
 </head>
 <body>
 <div class="wrap">
   <div class="top">
     <div>
-      <h1>{{ page_title }}</h1>
-      <div class="muted">{{ page_desc }}</div>
+      <h1>新上架物件</h1>
+      <div class="muted">只顯示新物件標題與網址，共 {{ items|length }} 筆</div>
     </div>
-    <div class="tabs">
-      <a class="btn {% if active=='new' %}active{% endif %}" href="{{ url_for('assistant_new_properties') }}">新上架物件</a>
-      <a class="btn {% if active=='all' %}active{% endif %}" href="{{ url_for('assistant_property_results') }}">全部房產查詢</a>
-      <a class="btn" href="{{ url_for('buyers') }}">回後台</a>
-    </div>
+    <form class="toolbar" method="get">
+      <input type="text" name="q" value="{{ q }}" placeholder="搜尋標題或網址">
+      <button type="submit">搜尋</button>
+      <a class="btn" href="{{ url_for('assistant_new_properties_links_only') }}">全部</a>
+    </form>
   </div>
 
-  <div class="stats">
-    <div class="stat"><b>{{ rows|length }}</b><span>目前顯示</span></div>
-    <div class="stat"><b>{{ url_count }}</b><span>網址 / 物件查詢</span></div>
-    <div class="stat"><b>{{ address_count }}</b><span>地址 / 實價查詢</span></div>
-  </div>
-
-  {% if not rows %}
-    <div class="empty">
-      目前沒有可顯示的資料。<br>
-      你可以先從 LINE 貼樂屋 / 591 網址，或查詢台中市地址；本機 Agent 完成後，資料會出現在這裡。
-    </div>
+  {% if not items %}
+    <div class="card empty">目前還沒有新上架物件。<br>啟動本機 Playwright 監控後，抓到新連結會顯示在這裡。</div>
   {% endif %}
 
-  {% for r in rows %}
+  {% for item in items %}
     <div class="card">
-      <div class="row">
-        <div>
-          <span class="tag">{{ r.kind_label }}</span>
-          <div class="title">{{ r.title }}</div>
-          <div class="small">
-            {{ r.area_text }}<br>
-            {% if r.url %}<a href="{{ r.url }}" target="_blank">原始物件網址</a>{% endif %}
-          </div>
-        </div>
-        <div class="small">
-          <b>物件資訊</b><br>
-          總建坪：{{ r.building_area_ping or "-" }}<br>
-          主建物：{{ r.main_area_ping or "-" }}<br>
-          地坪：{{ r.land_area_ping or "-" }}
-        </div>
-        <div class="small">
-          <b>實價摘要</b><br>
-          成交筆數：{{ r.summary_count or r.candidate_count or "-" }}<br>
-          單價中位：{{ r.median_unit or "-" }}<br>
-          總價中位：{{ r.median_total or "-" }}
-        </div>
-        <div class="small">
-          <b>時間</b><br>
-          {{ r.created_at or "-" }}<br>
-          <span class="muted">任務：{{ r.task_id[:12] }}</span>
-        </div>
-        <div>
-          {% if r.result_link %}
-            <a class="btn active" href="{{ r.result_link }}" target="_blank">查看結果</a>
-          {% else %}
-            <span class="muted">無連結</span>
-          {% endif %}
-        </div>
+      <div class="title">{{ item.title }}</div>
+      <div class="url">
+        <a href="{{ item.url }}" target="_blank" rel="noopener noreferrer">{{ item.url }}</a>
+        <button class="copy" type="button" data-copy="{{ item.url }}">複製</button>
+      </div>
+      <div class="meta">
+        {% if item.created_at %}<span class="badge">{{ item.created_at[:16].replace('T',' ') }}</span>{% endif %}
+        {% if item.source_platform %}<span class="badge">{{ item.source_platform }}</span>{% endif %}
+        {% if item.status %}<span class="badge">{{ '未讀' if item.status == 'new' else item.status }}</span>{% endif %}
       </div>
     </div>
   {% endfor %}
 </div>
+<script>
+document.addEventListener('click', async function(e){
+  const btn = e.target.closest('[data-copy]');
+  if(!btn) return;
+  const text = btn.getAttribute('data-copy') || '';
+  try { await navigator.clipboard.writeText(text); btn.textContent='已複製'; setTimeout(()=>btn.textContent='複製',1200); }
+  catch(err){ alert(text); }
+});
+</script>
 </body>
 </html>
 """
@@ -33574,42 +33744,43 @@ _TEAMME_V29_PROPERTY_DASHBOARD_TEMPLATE = """
 
 @app.route("/assistant/new-properties")
 @login_required
-def assistant_new_properties():
-    rows = _v29_fetch_property_results(kind_filter="url")
-    all_rows = _v29_fetch_property_results(kind_filter="")
-    url_count = len([r for r in all_rows if r.get("kind") == "url" or r.get("command") == "url_lookup"])
-    address_count = len([r for r in all_rows if r.get("kind") == "address" or r.get("command") == "address_lookup"])
-    return render_template_string(
-        _TEAMME_V29_PROPERTY_DASHBOARD_TEMPLATE,
-        page_title="新上架物件查詢後台",
-        page_desc="這裡會集中顯示 LINE 貼上的樂屋 / 591 物件網址解析結果。",
-        rows=rows,
-        url_count=url_count,
-        address_count=address_count,
-        active="new",
-    )
+def assistant_new_properties_links_only():
+    q = (request.args.get("q") or "").strip()
+    items = []
+    try:
+        # Firestore 可能需要索引；失敗就 fallback 全讀後排序。
+        docs = list(
+            db.collection(PROPERTY_ALERT_ITEM_COLLECTION)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(200)
+            .stream()
+        )
+    except Exception:
+        try:
+            docs = list(db.collection(PROPERTY_ALERT_ITEM_COLLECTION).stream())
+        except Exception as exc:
+            return f"讀取新物件清單失敗：{exc}", 500
+
+    for d in docs:
+        item = _property_link_only_doc_to_item(d)
+        if not item.get("url"):
+            continue
+        if q and q not in item.get("title", "") and q not in item.get("url", ""):
+            continue
+        items.append(item)
+
+    items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    items = items[:200]
+    return render_template_string(_NEW_PROPERTY_LINKS_ONLY_TEMPLATE, items=items, q=q)
 
 
-@app.route("/assistant/property-results")
+# 相同頁面別名：方便之後統一後台網址。
+@app.route("/assistant/property-links")
 @login_required
-def assistant_property_results():
-    kind = (request.args.get("kind") or "").strip()
-    rows = _v29_fetch_property_results(kind_filter=kind)
-    all_rows = _v29_fetch_property_results(kind_filter="")
-    url_count = len([r for r in all_rows if r.get("kind") == "url" or r.get("command") == "url_lookup"])
-    address_count = len([r for r in all_rows if r.get("kind") == "address" or r.get("command") == "address_lookup"])
-    return render_template_string(
-        _TEAMME_V29_PROPERTY_DASHBOARD_TEMPLATE,
-        page_title="房產查詢結果後台",
-        page_desc="集中顯示網址解析、地址行情、本戶成交、附近行情等查詢結果。",
-        rows=rows,
-        url_count=url_count,
-        address_count=address_count,
-        active="all",
-    )
+def assistant_property_links_alias():
+    return assistant_new_properties_links_only()
 
-
-print("✅ v29 房產查詢後台已啟用：/assistant/new-properties、/assistant/property-results")
+print("✅ 新上架物件後台已啟用：/assistant/new-properties（只顯示標題＋網址）")
 # =============================================================================
-# v29 End
+# Team M.E 新上架物件後台 Patch End
 # =============================================================================
