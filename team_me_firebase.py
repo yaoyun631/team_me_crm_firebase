@@ -1,3 +1,4 @@
+from io import BytesIO
 # -*- coding: utf-8 -*-
 # ✅ FULL_READY_20260621：包含 /line-card-preview、/line_card_preview、/debug/routes
 """
@@ -22843,8 +22844,8 @@ CASE_TOOLS_HTML = r'''
   </div>
   <div>
     <a class="btn btn-outline-success" href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}">上傳謄本填表</a>
+    <a class="btn btn-outline-success" target="_blank" href="{{ url_for('seller_case_form_filled_docx', seller_id=seller.id) }}">下載Word案件表</a>
     <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
-    <a class="btn btn-outline-success" target="_blank" href="{{ url_for('seller_case_form_filled_docx', seller_id=seller.id) }}">下載 Word 案件表</a>
     <a class="btn btn-outline-secondary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載原本案件表 PDF</a>
     <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
   </div>
@@ -23046,7 +23047,6 @@ DEED_CASE_FORM_HTML = r"""
   </div>
   <div class="d-flex gap-2 flex-wrap">
     <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
-    <a class="btn btn-outline-success" target="_blank" href="{{ url_for('seller_case_form_filled_docx', seller_id=seller.id) }}">下載 Word 案件表</a>
     <a class="btn btn-outline-secondary" href="{{ url_for('seller_case_tools', seller_id=seller.id) }}">案件表 / AI文案</a>
     <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
   </div>
@@ -23198,6 +23198,26 @@ def seller_deed_case_form(seller_id):
 
 
 
+# =============================================================================
+# CASE_FORM_DOCX_DIRECT_V5：Word 直接 key 入案件輸入表（標楷體）
+# =============================================================================
+
+def _seller_case_form_template_docx_path():
+    candidates = []
+    env_path = os.environ.get("CASE_FORM_TEMPLATE_DOCX", "").strip()
+    if env_path:
+        candidates.append(env_path)
+    candidates.extend([
+        os.path.join(BASE_DIR, "assets", "案件輸入表-使用中.docx"),
+        os.path.join(BASE_DIR, "案件輸入表-使用中.docx"),
+        os.path.join(BASE_DIR, "case_form_template.docx"),
+    ])
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    raise FileNotFoundError("找不到 Word 案件輸入表範本，請放在 assets/案件輸入表-使用中.docx 或設定 CASE_FORM_TEMPLATE_DOCX")
+
+
 @app.route("/sellers/<seller_id>/case-form-filled.docx")
 @login_required
 def seller_case_form_filled_docx(seller_id):
@@ -23210,19 +23230,28 @@ def seller_case_form_filled_docx(seller_id):
     case_data = _case_merge_seller_and_case_data(seller)
 
     try:
-        from case_form_docx_tool import build_case_form_docx_bytes
-        docx_bytes = build_case_form_docx_bytes(case_data, seller=seller)
+        from case_form_docx_tool import fill_case_form_docx_bytes
+        template_path = _seller_case_form_template_docx_path()
+        docx_bytes = fill_case_form_docx_bytes(template_path, case_data, seller=seller)
     except Exception as e:
         flash(f"產生 Word 案件輸入表失敗：{e}", "danger")
-        return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+        try:
+            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+        except Exception:
+            return redirect(url_for("seller_detail", seller_id=seller_id))
 
-    filename = f"Word案件輸入表_{seller.get('name') or seller_id}.docx"
+    filename = f"案件輸入表_{seller.get('name') or seller_id}.docx"
     return send_file(
         BytesIO(docx_bytes),
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         as_attachment=True,
         download_name=filename,
     )
+
+# =============================================================================
+# CASE_FORM_DOCX_DIRECT_V5 End
+# =============================================================================
+
 
 @app.route("/sellers/<seller_id>/case-form-filled.pdf")
 @login_required

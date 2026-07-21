@@ -1,406 +1,380 @@
 # -*- coding: utf-8 -*-
 """
-Team M.E｜案件輸入表 Word 版（PDF 完全同版型）
+Team M.E｜謄本 PDF → Word 案件輸入表（直接 key 進 Word 版）
 
-這版不是重新畫 Word 表格，而是：
-1. 把原本「案件輸入表-使用中.pdf」轉成同版型背景圖
-2. 在 Word 裡把背景圖鋪滿 A4
-3. 用可編輯的文字框把謄本解析資料填到對應位置
-
-好處：Word 打開後版面會跟 PDF 幾乎一模一樣，不會再因 Word 表格重排跑版。
-注意：底圖本身不可編輯，但填入的文字框可在 Word 中點選修改。
-
-安裝：
-    pip install python-docx
+這版改用「案件輸入表-使用中.docx」作為 Word 範本：
+- 不使用 PDF 座標蓋字
+- 不使用圖片背景版型
+- 直接把資料寫進 Word 文字內容裡
+- 全文件字體改為標楷體 / DFKai-SB
 """
+
 from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
-from typing import Any
-import html
-import json
+import math
 import re
+import zipfile
+from typing import Any
 
-try:
-    from docx import Document
-    from docx.shared import Cm, Pt
-    from docx.oxml import parse_xml
-    from docx.oxml.ns import qn
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("缺少 python-docx，請先安裝：pip install python-docx") from e
+from lxml import etree
 
-A4_W_PT = 595.0
-A4_H_PT = 842.0
-FONT_NAME = "Microsoft JhengHei"
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+NS = {"w": W_NS}
+
+DFKAI_ASCII = "DFKai-SB"
+DFKAI_EAST_ASIA = "標楷體"
 
 
-def clean(v: Any) -> str:
-    if v is None:
+def clean(value: Any) -> str:
+    if value is None:
         return ""
-    return str(v).strip()
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
 
 
-def _module_dir() -> Path:
-    return Path(__file__).resolve().parent
+def _fmt(value: Any, digits: int = 2) -> str:
+    value = clean(value)
+    if not value:
+        return ""
+    try:
+        f = round(float(value.replace(",", "")), digits)
+        return f"{f:.{digits}f}".rstrip("0").rstrip(".")
+    except Exception:
+        return value
 
 
-def find_template_png(path: str | Path | None = None) -> Path:
-    candidates = []
-    if path:
-        candidates.append(Path(path))
-    root = _module_dir()
-    candidates.extend([
-        root / "assets" / "案件輸入表-使用中.png",
-        root / "案件輸入表-使用中.png",
-        Path.cwd() / "assets" / "案件輸入表-使用中.png",
-    ])
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError("找不到 Word 背景圖：assets/案件輸入表-使用中.png")
+def _w(tag: str) -> str:
+    return f"{{{W_NS}}}{tag}"
 
 
-def nsdecls_extra():
-    return ('xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-            'xmlns:v="urn:schemas-microsoft-com:vml" '
-            'xmlns:o="urn:schemas-microsoft-com:office:office"')
-
-
-def _xml_text_run(text: str, size: float = 8, bold: bool = False, color: str = "000000") -> str:
-    b = '<w:b/>' if bold else ''
-    return (
-        f'<w:r><w:rPr>{b}'
-        f'<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:eastAsia="{FONT_NAME}"/>'
-        f'<w:sz w:val="{int(size*2)}"/><w:color w:val="{color}"/>'
-        f'</w:rPr><w:t xml:space="preserve">{html.escape(text)}</w:t></w:r>'
-    )
-
-
-def add_textbox(paragraph, text: str, x: float, y_top: float, w: float, h: float, size: float = 8,
-                name: str = "box", bold: bool = False, color: str = "000000", max_lines: int = 1,
-                line_height_pt: float | None = None):
-    """在 Word 頁面上以 PDF 點數座標加入可編輯文字框。x/y_top 都是 pt。"""
-    text = clean(text)
-    if not text:
+def _set_rpr_font(rpr, size_half_points: int | None = None, bold: bool | None = None):
+    if rpr is None:
         return
-    line_height_pt = line_height_pt or (size + 1.8)
+    rfonts = rpr.find(_w("rFonts"))
+    if rfonts is None:
+        rfonts = etree.SubElement(rpr, _w("rFonts"))
+    rfonts.set(_w("ascii"), DFKAI_ASCII)
+    rfonts.set(_w("hAnsi"), DFKAI_ASCII)
+    rfonts.set(_w("eastAsia"), DFKAI_EAST_ASIA)
+    rfonts.set(_w("cs"), DFKAI_ASCII)
 
-    # 簡易中文換行：依文字框寬度估算每行可容納字數
-    def units(s: str) -> float:
-        return sum(1.0 if ord(ch) > 127 else 0.55 for ch in s)
+    if size_half_points:
+        sz = rpr.find(_w("sz"))
+        if sz is None:
+            sz = etree.SubElement(rpr, _w("sz"))
+        sz.set(_w("val"), str(size_half_points))
+        szcs = rpr.find(_w("szCs"))
+        if szcs is None:
+            szcs = etree.SubElement(rpr, _w("szCs"))
+        szcs.set(_w("val"), str(size_half_points))
 
-    max_units = max(1, int(w / max(size * 0.82, 1)))
-    lines = []
-    for raw in text.splitlines():
-        raw = raw.strip()
-        cur = ""
-        for ch in raw:
-            if units(cur + ch) > max_units:
-                if cur:
-                    lines.append(cur)
-                cur = ch
-            else:
-                cur += ch
-        if cur:
-            lines.append(cur)
-    lines = lines[:max_lines]
-    paras = []
-    for line in lines:
-        paras.append(
-            '<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:lineRule="exact" '
-            f'w:line="{int(line_height_pt*20)}"/></w:pPr>' +
-            _xml_text_run(line, size=size, bold=bold, color=color) +
-            '</w:p>'
-        )
-    xml = (
-        f'<w:pict {nsdecls_extra()}>'
-        f'<v:shape id="{html.escape(name)}" type="#_x0000_t202" '
-        f'style="position:absolute;margin-left:{x:.2f}pt;margin-top:{y_top:.2f}pt;'
-        f'width:{w:.2f}pt;height:{h:.2f}pt;z-index:251659264;'
-        f'mso-position-horizontal-relative:page;mso-position-vertical-relative:page" '
-        f'stroked="f" fillcolor="none">'
-        f'<v:textbox inset="0,0,0,0"><w:txbxContent>{"".join(paras)}</w:txbxContent></v:textbox>'
-        f'</v:shape></w:pict>'
-    )
-    paragraph.add_run()._r.append(parse_xml(xml))
+    if bold is not None:
+        b = rpr.find(_w("b"))
+        if bold:
+            if b is None:
+                etree.SubElement(rpr, _w("b"))
+        elif b is not None:
+            rpr.remove(b)
 
 
-def add_check(paragraph, x: float, y_top: float, name: str = "check"):
-    # 用文字框放大勾，避免 Word/LibreOffice 的符號字型問題。實務開 Word 可再點選移動。
-    add_textbox(paragraph, "✓", x-1, y_top-5, 16, 16, size=12, name=name, bold=True, max_lines=1, line_height_pt=13)
+def set_all_fonts_to_dfkai(root):
+    for rpr in root.xpath(".//w:rPr", namespaces=NS):
+        _set_rpr_font(rpr)
+    for ppr in root.xpath(".//w:pPr", namespaces=NS):
+        rpr = ppr.find(_w("rPr"))
+        if rpr is not None:
+            _set_rpr_font(rpr)
 
 
-TEXT_POS = {
-    # 客戶資料
-    "owner_name": (45, 121, 88, 10, 7.8),
-    "owner_mobile": (418, 147, 88, 10, 7.5),
-    "owner_address": (55, 173, 420, 12, 7.2),
-
-    # 1. 基本資料
-    "property_title": (88, 213, 125, 11, 7.4),
-    "community_name": (500, 213, 72, 11, 7.4),
-    "case_address": (80, 331, 410, 12, 7.3),
-    "floor_total": (92, 349, 32, 10, 7.2),
-    "floor": (92, 365, 42, 10, 7.2),
-    "layout": (238, 365, 188, 10, 7.4),
-    "completed_year": (130, 381, 24, 10, 7.2),
-    "completed_month": (174, 381, 18, 10, 7.2),
-    "completed_day": (211, 381, 18, 10, 7.2),
-    "building_age": (302, 381, 24, 10, 7.2),
-    "facing": (510, 290, 30, 10, 7.2),
-
-    # 3. 面積金額
-    "total_ping": (98, 578, 45, 10, 7.1),
-    "main_ping": (203, 578, 45, 10, 7.1),
-    "attached_ping": (293, 578, 45, 10, 7.1),
-    "public_ping": (383, 578, 45, 10, 7.1),
-    "parking_ping": (486, 578, 45, 10, 7.1),
-    "land_ping": (98, 604, 45, 10, 7.1),
-    "base_land_ping": (209, 604, 45, 10, 7.1),
-    "land_share_ping": (362, 604, 45, 10, 7.1),
-    "case_price": (66, 629, 58, 10, 7.2),
-    "rent_price": (208, 629, 58, 10, 7.2),
-    "deposit": (330, 629, 55, 10, 7.2),
-    "deposit_months": (501, 629, 45, 10, 7.2),
-
-    # 5. 特色備註
-    "feature_note": (135, 746, 420, 13, 6.6),
-    "special_note": (135, 804, 420, 13, 6.4),
-}
-
-CHECK_POS = {
-    "deal_sale": (86, 50),
-    "deal_rent": (125, 50),
-    "mandate_exclusive": (264, 50),
-    "mandate_general": (314, 50),
-    "source_deed": (302, 97),
-    "type_toutian": (189, 231),
-    "type_villa": (236, 231),
-    "type_store": (329, 231),
-    "type_factory": (421, 231),
-    "status_empty": (84, 266),
-    "status_self_use": (134, 266),
-    "status_rented": (184, 266),
-    "structure_rc": (247, 441),
-    "use_residential": (132, 542),
-    "use_store": (190, 542),
-    "use_parking": (302, 542),
-    "use_factory": (377, 542),
-    "use_commercial": (461, 542),
-    "use_office": (530, 542),
-}
+def paragraph_text(p) -> str:
+    return "".join(p.xpath(".//w:t/text()", namespaces=NS))
 
 
-def infer_checks(case_data: dict[str, Any], seller: dict[str, Any] | None = None) -> dict[str, bool]:
+def replace_paragraph_text(p, text: str, size_half_points: int = 18, bold: bool | None = None):
+    # 保留段落格式，只替換文字內容，文字就是 Word 裡可編輯的 run。
+    for child in list(p):
+        if child.tag != _w("pPr"):
+            p.remove(child)
+
+    r = etree.SubElement(p, _w("r"))
+    rpr = etree.SubElement(r, _w("rPr"))
+    _set_rpr_font(rpr, size_half_points=size_half_points, bold=bold)
+
+    parts = str(text or "").split("\n")
+    for i, part in enumerate(parts):
+        if i:
+            etree.SubElement(r, _w("br"))
+        t = etree.SubElement(r, _w("t"))
+        t.set(f"{{{XML_NS}}}space", "preserve")
+        t.text = part
+
+
+def checkbox(enabled: bool) -> str:
+    # 使用黑方塊當勾選，避免某些電腦缺少 ☑ 字形。
+    return "■" if enabled else "□"
+
+
+def infer_property_type(case_data: dict, seller: dict | None = None) -> str:
     seller = seller or {}
-    checks: dict[str, bool] = {}
-    deal = clean(seller.get("deal_type") or case_data.get("deal_type") or "sale").lower()
-    checks["deal_rent"] = deal in {"rent", "出租", "租"}
-    checks["deal_sale"] = not checks["deal_rent"]
-    checks["source_deed"] = bool(case_data.get("deed_parsed_note") or case_data.get("deed_raw_text"))
-
     ptype = clean(seller.get("property_type") or case_data.get("property_type"))
     main_use = clean(case_data.get("deed_main_use"))
     floor_total = clean(case_data.get("floor_total"))
-    material = clean(case_data.get("deed_main_material"))
-
-    if "透天" in ptype or ("住宅" in main_use and floor_total.isdigit() and int(floor_total) <= 5):
-        checks["type_toutian"] = True
-    if "別墅" in ptype:
-        checks["type_villa"] = True
-    if "店" in ptype or "店" in main_use:
-        checks["type_store"] = True
-    if "廠" in ptype or "工業" in main_use:
-        checks["type_factory"] = True
-
-    if "自用" in clean(seller.get("occupancy_status")):
-        checks["status_self_use"] = True
-    elif "出租" in clean(seller.get("occupancy_status")):
-        checks["status_rented"] = True
-    elif "空" in clean(seller.get("occupancy_status")):
-        checks["status_empty"] = True
-
-    if "鋼筋混凝土" in material or "RC" in material.upper():
-        checks["structure_rc"] = True
-
-    if "住宅" in main_use or "住家" in main_use:
-        checks["use_residential"] = True
-    if "車庫" in main_use or "停車" in main_use:
-        checks["use_parking"] = True
+    if ptype:
+        return ptype
+    if floor_total.isdigit() and int(floor_total) <= 5 and ("住宅" in main_use):
+        return "透天"
     if "店" in main_use:
-        checks["use_store"] = True
+        return "店面"
     if "工業" in main_use or "廠" in main_use:
-        checks["use_factory"] = True
-    if "商業" in main_use:
-        checks["use_commercial"] = True
-    if "辦公" in main_use:
-        checks["use_office"] = True
-    return checks
+        return "廠房"
+    return ""
 
 
-def build_fields(case_data: dict[str, Any], seller: dict[str, Any] | None = None) -> dict[str, str]:
+def build_case_form_lines(case_data: dict[str, Any], seller: dict[str, Any] | None = None) -> dict[str, tuple[str, int, bool | None]]:
     seller = seller or {}
-    fields: dict[str, str] = {}
 
-    def put(key: str, *values):
-        for v in values:
-            v = clean(v)
-            if v:
-                fields[key] = v
-                return
+    owner_name = clean(seller.get("name") or case_data.get("owner_name") or case_data.get("deed_owner"))
+    owner_phone = clean(seller.get("phone") or seller.get("mobile") or case_data.get("phone"))
+    owner_address = clean(seller.get("contact_address") or seller.get("address") or case_data.get("case_address"))
 
-    put("owner_name", seller.get("name"))
-    put("owner_mobile", seller.get("phone"))
-    put("owner_address", seller.get("contact_address"), seller.get("address"), case_data.get("case_address"))
-    put("property_title", case_data.get("property_title"), case_data.get("ai_sales_title"))
-    put("community_name", case_data.get("community_name"))
-    put("case_address", case_data.get("case_address"), seller.get("address"))
-    put("floor_total", case_data.get("floor_total"))
-    put("floor", case_data.get("floor"))
-    put("layout", case_data.get("layout"))
-    put("completed_year", case_data.get("completed_minguo_year"))
-    put("completed_month", case_data.get("completed_month"))
-    put("completed_day", case_data.get("completed_day"))
-    put("building_age", case_data.get("building_age"))
-    put("facing", case_data.get("facing"))
-    put("total_ping", case_data.get("total_ping"))
-    put("main_ping", case_data.get("main_ping"))
-    put("attached_ping", case_data.get("attached_ping"))
-    put("public_ping", case_data.get("public_ping"))
-    put("parking_ping", case_data.get("parking_ping"))
-    put("land_ping", case_data.get("land_ping"))
-    put("base_land_ping", case_data.get("land_ping"))
-    put("land_share_ping", case_data.get("land_ping"))
-    put("case_price", case_data.get("case_price"), seller.get("expected_price"))
-    put("rent_price", case_data.get("rent_price"))
-    put("deposit", case_data.get("deposit"))
-    put("deposit_months", case_data.get("deposit_months"))
+    title = clean(case_data.get("property_title") or case_data.get("ai_sales_title"))
+    if not title and case_data.get("case_address"):
+        title = clean(case_data.get("case_address"))[-12:]
+    community = clean(case_data.get("community_name"))
 
-    feature_parts = []
-    for k in ("ai_feature_note", "property_highlight_note", "life_note", "target_customer_note"):
-        if clean(case_data.get(k)):
-            feature_parts.append(clean(case_data.get(k)))
-    feature_text = " ".join(feature_parts) or clean(case_data.get("deed_parsed_note"))
-    put("feature_note", feature_text[:110])
+    ptype = infer_property_type(case_data, seller)
+    main_use = clean(case_data.get("deed_main_use"))
+    material = clean(case_data.get("deed_main_material"))
+    price = clean(case_data.get("case_price") or seller.get("expected_price"))
 
-    raw_special = clean(case_data.get("deed_mortgage_note") or case_data.get("case_note"))
-    special = raw_special
-    # 表格這一欄只有一條線，過長會壓到合約日；這裡自動濃縮成可放入表格的一句話。
-    if raw_special:
-        parts = []
-        if "禁止處分" in raw_special:
-            parts.append("有禁止處分登記，須確認塗銷/移轉")
-        if "抵押權" in raw_special or "最高限額" in raw_special:
-            creditors = []
-            for name in ["玉山", "中租", "台新", "國泰", "中信", "聯邦", "土地銀行", "合作金庫"]:
-                if name in raw_special:
-                    creditors.append(name)
-            if creditors:
-                parts.append("有最高限額抵押權：" + "、".join(dict.fromkeys(creditors)))
-            else:
-                parts.append("有他項權利/抵押權須確認")
-        if parts:
-            special = "；".join(parts)
-    put("special_note", special[:120])
-    return fields
+    deal_type = clean(seller.get("deal_type") or case_data.get("deal_type") or "sale").lower()
+    is_rent = deal_type in {"rent", "出租", "租"}
+    is_sale = not is_rent
+
+    is_apartment = "公寓" in ptype
+    is_huaxia = "華廈" in ptype or "華夏" in ptype
+    is_toutian = "透天" in ptype
+    is_villa = "別墅" in ptype
+    is_farm = "農舍" in ptype
+    is_store = "店" in ptype
+    is_suite = "套" in ptype
+    is_factory = "廠" in ptype or "工業" in main_use
+
+    use_res = ("住宅" in main_use) or ("住家" in main_use)
+    use_store = "店" in main_use
+    use_parking = "停車" in main_use or "車庫" in main_use
+    use_factory = "工業" in main_use or "廠" in main_use
+    use_commercial = "商業" in main_use
+    use_office = "辦公" in main_use or "事務所" in main_use
+
+    structure_rc = "鋼筋混凝土" in material or "RC" in material.upper()
+    structure_src = "鋼骨" in material or "SRC" in material.upper()
+    structure_reinforced_brick = "加強磚" in material
+    structure_brick = ("磚" in material and not structure_reinforced_brick)
+    structure_other = bool(material and not any([structure_rc, structure_src, structure_reinforced_brick, structure_brick]))
+
+    layout = clean(case_data.get("layout"))
+    room = hall = bath = ""
+    m = re.search(r"(\d+)\s*房", layout)
+    if m: room = m.group(1)
+    m = re.search(r"(\d+)\s*[廳厅]", layout)
+    if m: hall = m.group(1)
+    m = re.search(r"(\d+)\s*衛", layout)
+    if m: bath = m.group(1)
+
+    completed_y = clean(case_data.get("completed_minguo_year"))
+    completed_m = clean(case_data.get("completed_month"))
+    completed_d = clean(case_data.get("completed_day"))
+    if not completed_y and case_data.get("deed_completed_date"):
+        m = re.search(r"民國\s*(\d+)\s*年\s*(\d+)\s*月\s*(\d+)\s*日", clean(case_data.get("deed_completed_date")))
+        if m:
+            completed_y, completed_m, completed_d = m.group(1), m.group(2), m.group(3)
+
+    feature = clean(case_data.get("ai_feature_note") or case_data.get("property_highlight_note") or case_data.get("life_note"))
+    if not feature:
+        feature = "、".join([x for x in [
+            clean(case_data.get("case_address")),
+            f"建物約{_fmt(case_data.get('total_ping'))}坪" if clean(case_data.get("total_ping")) else "",
+            f"土地約{_fmt(case_data.get('land_ping'))}坪" if clean(case_data.get("land_ping")) else "",
+            clean(case_data.get("deed_main_use")),
+            clean(case_data.get("deed_main_material")),
+        ] if x])
+
+    special = clean(case_data.get("deed_mortgage_note") or case_data.get("case_note"))
+    feature_short = feature[:105]
+    special_short = special[:130]
+
+    return {
+        "委託類別": (
+            f"委託類別：{checkbox(is_sale)}出售{checkbox(is_rent)}出租    委託類別：□專任□一般    案件編號：□□□□□□□□□",
+            16, None
+        ),
+        "客戶來源": (
+            "客戶來源：□踩線 □來店 □來電 ■謄本開發 □親友 □其他 (說明)",
+            16, None
+        ),
+        "姓名": (
+            f"姓名：{owner_name}    身份字號：            性別：□男□女    出生日期：    年    月    日",
+            16, None
+        ),
+        "住宅電話": (
+            f"住宅電話：            公司電話：            行動電話：{owner_phone}    地址：{owner_address}",
+            15, None
+        ),
+        "物件名稱": (
+            f"物件名稱：【{title}】不超過 12 個中文字    社區名稱：【{community}】"
+            f"案件型態：{checkbox(is_apartment)}公寓{checkbox(is_huaxia)}華廈{checkbox(is_toutian)}透天"
+            f"{checkbox(is_villa)}別墅{checkbox(is_farm)}農舍{checkbox(is_store)}店面{checkbox(is_suite)}套房{checkbox(is_factory)}廠房",
+            15, None
+        ),
+        "土地型態": (
+            "土地型態：□建地□商業用地□工業用地□農業用地□保護地□其他用地    採光：【】面"
+            "現 況：□空屋□自用□出租□結構體□空地□其他    面寬：【】米    深度：【】米",
+            15, None
+        ),
+        "售屋動機": (
+            f"售屋動機：□換屋□工作□就學□移民□資金運用□其他    土地定位路口名稱: "
+            f"物件地址：{clean(case_data.get('case_address') or owner_address)}",
+            15, None
+        ),
+        "地上樓層": (
+            f"地上樓層：【{clean(case_data.get('floor_total'))}】地下層數：【】    建物方位：朝【{clean(case_data.get('facing'))}】"
+            f" 大樓：朝【】陽台：朝【】所在樓別：【{clean(case_data.get('floor'))}】-【】"
+            f" 物件格局：【{room}】房【{hall}】廰【{bath}】衛【】陽台【】廚房",
+            15, None
+        ),
+        "竣工日期": (
+            f"竣工日期：民國【{completed_y}】年【{completed_m}】月【{completed_d}】日"
+            f" 屋齡：【{clean(case_data.get('building_age'))}】年 預計完工：民國【】年【】月【】日",
+            15, None
+        ),
+        "外壁材質": (
+            f"外壁材質：□洗石子 □馬賽克 □方塊磚□二丁掛 □玻璃帷幕□花崗石 □原木□其他"
+            f"建物結構：{checkbox(structure_brick)}磚造 {checkbox(structure_reinforced_brick)}加強磚造 "
+            f"{checkbox(structure_rc)}鋼筋混凝土 RC{checkbox(structure_src)}鋼骨鋼筋混凝土 SRC□石材 {checkbox(structure_other)}其他建材",
+            15, None
+        ),
+        "面臨路寬": (
+            "面臨路寬：【】米    中庭：□有    邊間：□是    出租說明：【】"
+            "管理方式：□無 □保全公司 □管理員(警衛) □守望亭 □固定駐警 □巡守人員 □保全設施",
+            15, None
+        ),
+        "管 理 費": (
+            "管 理 費：【】元 內含清潔費：□有 清潔費：【】元    電梯數：【】 每層戶數：【】"
+            "繳費方式：□月繳 □雙月繳 □季繳 □半年繳 □年繳 □其他",
+            15, None
+        ),
+        "建物主要登記用途": (
+            f"建物主要登記用途：{checkbox(use_res)}住家用 {checkbox(use_store)}店鋪 □國民住宅 "
+            f"{checkbox(use_parking)}停車空間 {checkbox(use_factory)}工業用或廠房 {checkbox(use_commercial)}商業用 {checkbox(use_office)}辦公室",
+            15, None
+        ),
+        "建物總面積": (
+            f"建物總面積：【{_fmt(case_data.get('total_ping'))}】坪＝ 主建【{_fmt(case_data.get('main_ping'))}】坪"
+            f"＋附屬【{_fmt(case_data.get('attached_ping'))}】坪＋公設【{_fmt(case_data.get('public_ping'))}】坪"
+            f"＋車位【{_fmt(case_data.get('parking_ping'))}】坪"
+            f"土地總面積：【{_fmt(case_data.get('land_ping'))}】坪＝ 基地面積：【{_fmt(case_data.get('land_ping'))}】坪"
+            f"＋土地持分：【{_fmt(case_data.get('land_ping'))}】坪",
+            14, None
+        ),
+        "售價": (
+            f"售價：【{price}】萬    月租金：【】萬/月    押金：【】萬    押金月數：【】",
+            15, None
+        ),
+        "小學學區": (
+            "小學學區：【】 國中學區：【】 市場購物：【】公園綠地：【】 醫療機構：【】 鄰近車站：【】建設公司：【】 商圈名稱：【】",
+            15, None
+        ),
+        "案件特色詳細說明": (
+            f"案件特色詳細說明：{feature_short}\nPS.此整份煩請詳細填寫，謝謝。\n產權特別注意事項：{special_short}",
+            14, None
+        ),
+    }
 
 
-def build_case_form_docx(case_data: dict[str, Any], seller: dict[str, Any] | None = None,
-                         template_png: str | Path | None = None) -> Document:
-    seller = seller or {}
-    doc = Document()
-    sec = doc.sections[0]
-    sec.page_width = Cm(21.0)
-    sec.page_height = Cm(29.7)
-    sec.top_margin = Cm(0)
-    sec.bottom_margin = Cm(0)
-    sec.left_margin = Cm(0)
-    sec.right_margin = Cm(0)
+def fill_case_form_docx_bytes(template_docx: str | Path, case_data: dict[str, Any], seller: dict[str, Any] | None = None) -> bytes:
+    template_docx = Path(template_docx)
+    if not template_docx.exists():
+        raise FileNotFoundError(f"找不到 Word 案件輸入表範本：{template_docx}")
 
-    # Normal style
-    try:
-        style = doc.styles["Normal"]
-        style.font.name = FONT_NAME
-        style._element.rPr.rFonts.set(qn("w:eastAsia"), FONT_NAME)
-        style.font.size = Pt(8)
-    except Exception:
-        pass
+    lines = build_case_form_lines(case_data, seller=seller)
 
-    p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(0)
-    p.paragraph_format.space_after = Pt(0)
-    p.paragraph_format.line_spacing = 1
+    with zipfile.ZipFile(template_docx, "r") as zin:
+        root = etree.fromstring(zin.read("word/document.xml"))
 
-    # 背景：原 PDF 表格轉成的 PNG，鋪滿 A4，所以格式和 PDF 幾乎一模一樣。
-    bg = find_template_png(template_png)
-    run = p.add_run()
-    run.add_picture(str(bg), width=Cm(21.0), height=Cm(29.7))
+        set_all_fonts_to_dfkai(root)
 
-    fields = build_fields(case_data, seller)
-    for key, value in fields.items():
-        if key not in TEXT_POS:
-            continue
-        x, y, w, h, size = TEXT_POS[key]
-        max_lines = 1
-        if key == "feature_note":
-            max_lines = 1
-        elif key == "special_note":
-            max_lines = 1
-        add_textbox(p, value, x, y, w, h, size=size, name=f"tm_{key}", max_lines=max_lines)
+        for p in root.xpath(".//w:txbxContent//w:p", namespaces=NS):
+            old = paragraph_text(p).strip()
+            if not old:
+                continue
+            for prefix, (new_text, size_hp, bold) in lines.items():
+                if old.startswith(prefix):
+                    replace_paragraph_text(p, new_text, size_half_points=size_hp, bold=bold)
+                    break
 
-    checks = infer_checks(case_data, seller)
-    for key, enabled in checks.items():
-        if enabled and key in CHECK_POS:
-            x, y = CHECK_POS[key]
-            add_check(p, x, y, name=f"tm_check_{key}")
+        for p in root.xpath(".//w:body/w:p", namespaces=NS):
+            for rpr in p.xpath(".//w:rPr", namespaces=NS):
+                _set_rpr_font(rpr)
 
-    return doc
+        new_xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+        out = BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "word/document.xml":
+                    data = new_xml
+                zout.writestr(item, data)
+        return out.getvalue()
 
 
-def build_case_form_docx_bytes(case_data: dict[str, Any], seller: dict[str, Any] | None = None,
-                               template_png: str | Path | None = None) -> bytes:
-    doc = build_case_form_docx(case_data, seller=seller, template_png=template_png)
-    bio = BytesIO()
-    doc.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
+def fill_case_form_docx_file(template_docx: str | Path, output_docx: str | Path, case_data: dict[str, Any], seller: dict[str, Any] | None = None) -> Path:
+    output_docx = Path(output_docx)
+    output_docx.parent.mkdir(parents=True, exist_ok=True)
+    output_docx.write_bytes(fill_case_form_docx_bytes(template_docx, case_data, seller=seller))
+    return output_docx
 
 
-def save_case_form_docx(case_data: dict[str, Any], output_path: str | Path,
-                        seller: dict[str, Any] | None = None,
-                        template_png: str | Path | None = None) -> Path:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(build_case_form_docx_bytes(case_data, seller=seller, template_png=template_png))
-    return output_path
+def parse_deed_pdf_to_docx(deed_pdf: str | Path, template_docx: str | Path, output_docx: str | Path, seller: dict[str, Any] | None = None, extra_case_data: dict[str, Any] | None = None):
+    from deed_case_form_tool import parse_pdf_to_case_data
+    parsed = parse_pdf_to_case_data(deed_pdf)
+    case_data = dict(parsed.get("case_data") or {})
+    if extra_case_data:
+        case_data.update({k: v for k, v in extra_case_data.items() if clean(v)})
+    fill_case_form_docx_file(template_docx, output_docx, case_data, seller=seller)
+    return output_docx
 
 
-def main(argv=None):
+if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="產生與 PDF 版面一致的 Word 案件輸入表")
-    parser.add_argument("json_file", help="deed_case_form_tool.py 解析出的 JSON")
+    parser = argparse.ArgumentParser(description="謄本 PDF → Word 案件輸入表（標楷體、直接 key 入 Word）")
+    parser.add_argument("deed_pdf")
+    parser.add_argument("template_docx")
     parser.add_argument("output_docx")
-    parser.add_argument("--template-png", default="")
     parser.add_argument("--seller-name", default="")
     parser.add_argument("--seller-phone", default="")
     parser.add_argument("--price", default="")
     parser.add_argument("--property-title", default="")
-    parser.add_argument("--layout", default="")
-    args = parser.parse_args(argv)
+    parser.add_argument("--property-type", default="透天")
+    args = parser.parse_args()
 
-    parsed = json.loads(Path(args.json_file).read_text(encoding="utf-8"))
-    case_data = parsed.get("case_data") or parsed
-    if args.price:
-        case_data["case_price"] = args.price
-    if args.property_title:
-        case_data["property_title"] = args.property_title
-    if args.layout:
-        case_data["layout"] = args.layout
-    seller = {"name": args.seller_name, "phone": args.seller_phone, "deal_type": "sale", "property_type": "透天"}
-    save_case_form_docx(case_data, args.output_docx, seller=seller, template_png=args.template_png or None)
+    extra = {
+        "case_price": args.price,
+        "property_title": args.property_title,
+    }
+    seller = {
+        "name": args.seller_name,
+        "phone": args.seller_phone,
+        "deal_type": "sale",
+        "property_type": args.property_type,
+    }
+    parse_deed_pdf_to_docx(args.deed_pdf, args.template_docx, args.output_docx, seller=seller, extra_case_data=extra)
     print(f"已產生：{args.output_docx}")
-
-
-if __name__ == "__main__":
-    main()
