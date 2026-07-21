@@ -22497,10 +22497,11 @@ CASE_DETAIL_FIELD_KEYS = [
     "total_ping", "main_ping", "attached_ping", "public_ping", "land_ping", "parking_ping",
     "floor", "floor_total", "building_age", "facing", "showing_method", "case_note",
     "life_note", "property_highlight_note", "target_customer_note", "raw_group_text", "source_url",
-    # 謄本 / 權狀解析欄位
+    # 謄本 PDF / 案件輸入表自動填寫欄位
     "deed_raw_text", "deed_parsed_note", "deed_owner", "land_lot_no", "building_no",
-    "deed_completed_date", "deed_main_use", "deed_main_material", "deed_right_scope",
-    "deed_mortgage_note",
+    "deed_completed_date", "completed_minguo_year", "completed_month", "completed_day",
+    "deed_main_use", "deed_main_material", "deed_right_scope", "deed_mortgage_note",
+    "deed_pdf_filename", "deed_parsed_json",
     "ai_sales_title", "ai_selling_points", "ai_group_copy", "ai_listing_description", "ai_feature_note",
 ]
 
@@ -22526,16 +22527,21 @@ CASE_BASIC_LABELS = {
     "property_highlight_note": "物件亮點補充",
     "target_customer_note": "適合客群",
     "source_url": "參考網址",
-    "deed_raw_text": "謄本/權狀文字",
+    "deed_raw_text": "謄本文字",
     "deed_parsed_note": "謄本解析摘要",
     "deed_owner": "所有權人",
     "land_lot_no": "地號",
     "building_no": "建號",
     "deed_completed_date": "建物完成日期",
+    "completed_minguo_year": "竣工民國年",
+    "completed_month": "竣工月",
+    "completed_day": "竣工日",
     "deed_main_use": "主要用途",
     "deed_main_material": "主要建材",
     "deed_right_scope": "權利範圍",
-    "deed_mortgage_note": "他項權利/抵押權備註",
+    "deed_mortgage_note": "產權/抵押權注意事項",
+    "deed_pdf_filename": "謄本PDF檔名",
+    "deed_parsed_json": "謄本解析JSON",
 }
 
 
@@ -22611,156 +22617,6 @@ def _case_parse_raw_listing_text(raw_text: str):
     return {k: v for k, v in data.items() if str(v or "").strip()}
 
 
-
-def _case_number_to_ping_text(value: str):
-    """把謄本常見平方公尺數字換算成坪，回傳字串。"""
-    raw = str(value or "").replace(",", "").strip()
-    if not raw:
-        return ""
-    m = re.search(r"(\d+(?:\.\d+)?)", raw)
-    if not m:
-        return ""
-    try:
-        num = float(m.group(1))
-    except Exception:
-        return ""
-    # 謄本多數是平方公尺；若文字裡已明確寫坪，直接保留。
-    if "坪" in raw:
-        return str(round(num, 2)).rstrip("0").rstrip(".")
-    ping = num / 3.305785
-    return str(round(ping, 2)).rstrip("0").rstrip(".")
-
-
-def _case_first_area_to_ping(text: str, patterns, default=""):
-    text = _case_normalize_fullwidth(text)
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.I | re.M | re.S)
-        if m:
-            return _case_number_to_ping_text(m.group(1))
-    return default
-
-
-def _case_parse_deed_text(deed_text: str):
-    """從謄本 / 權狀 / 地籍建物資料文字解析案件輸入表欄位。
-
-    第一版先支援「貼上文字」：
-    - 可貼電子謄本 PDF 複製出的文字
-    - 可貼 OCR 後文字
-    - 若格式不同，解析不到的欄位會保留空白，讓你人工確認
-    """
-    raw = str(deed_text or "").strip()
-    if not raw:
-        return {}
-
-    text = _case_normalize_fullwidth(raw)
-    compact = re.sub(r"[ \t]+", " ", text)
-
-    data = {
-        "deed_raw_text": raw,
-    }
-
-    data["case_address"] = _case_first_match(compact, [
-        r"(?:建物門牌|門牌|房屋門牌|建物坐落|房屋坐落|建物地址|標示部.*?門牌)\s*[:：]?\s*([^\n]+)",
-        r"(?:地址|坐落)\s*[:：]\s*([^\n]+)",
-    ])
-
-    data["land_lot_no"] = _case_first_match(compact, [
-        r"(?:土地標示|土地坐落|地號)\s*[:：]?\s*([^\n]*?\d+(?:[-之]\d+)?\s*地號)",
-        r"([^\n]{0,20}\d+(?:[-之]\d+)?\s*地號)",
-    ])
-
-    data["building_no"] = _case_first_match(compact, [
-        r"(?:建號|建物建號)\s*[:：]?\s*([^\n]*?\d+(?:[-之]\d+)?\s*建號)",
-        r"([^\n]{0,20}\d+(?:[-之]\d+)?\s*建號)",
-    ])
-
-    data["deed_owner"] = _case_first_match(compact, [
-        r"(?:所有權人|權利人)\s*[:：]?\s*([^\n ]{2,20})",
-    ])
-
-    data["deed_completed_date"] = _case_first_match(compact, [
-        r"(?:建築完成日期|建物完成日期|完成日期)\s*[:：]?\s*([^\n]+)",
-    ])
-
-    data["deed_main_use"] = _case_first_match(compact, [
-        r"(?:主要用途|用途)\s*[:：]?\s*([^\n]+)",
-    ])
-
-    data["deed_main_material"] = _case_first_match(compact, [
-        r"(?:主要建材|建材)\s*[:：]?\s*([^\n]+)",
-    ])
-
-    data["deed_right_scope"] = _case_first_match(compact, [
-        r"(?:權利範圍|持分)\s*[:：]?\s*([^\n]+)",
-    ])
-
-    data["deed_mortgage_note"] = _case_first_match(compact, [
-        r"(?:他項權利|抵押權|最高限額抵押權|擔保債權總金額)\s*[:：]?\s*([^\n]+)",
-    ])
-
-    data["floor"] = _case_first_match(compact, [
-        r"(?:層次|所在樓層|樓層)\s*[:：]?\s*([^\n]+)",
-    ])
-
-    data["floor_total"] = _case_first_match(compact, [
-        r"(?:總樓層|樓層總數|層數|總層數)\s*[:：]?\s*([^\n]+)",
-    ])
-
-    data["main_ping"] = _case_first_area_to_ping(compact, [
-        r"(?:主建物面積|主建物|主建)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:平方公尺|㎡|坪)?",
-    ])
-
-    data["attached_ping"] = _case_first_area_to_ping(compact, [
-        r"(?:附屬建物面積|附屬建物|附屬)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:平方公尺|㎡|坪)?",
-    ])
-
-    data["public_ping"] = _case_first_area_to_ping(compact, [
-        r"(?:共有部分面積|共有部分|公設|公設面積)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:平方公尺|㎡|坪)?",
-    ])
-
-    # 若沒有總建坪，先用主建 + 附屬 + 公設估算，方便案件表使用。
-    if not data.get("total_ping"):
-        try:
-            parts = []
-            for k in ("main_ping", "attached_ping", "public_ping"):
-                if data.get(k):
-                    parts.append(float(str(data[k]).replace(",", "")))
-            if parts:
-                data["total_ping"] = str(round(sum(parts), 2)).rstrip("0").rstrip(".")
-        except Exception:
-            pass
-
-    # 從完成日期粗估屋齡；民國年與西元年都盡量支援。
-    if data.get("deed_completed_date") and not data.get("building_age"):
-        try:
-            m = re.search(r"(\d{2,4})\s*[年/-]", data["deed_completed_date"])
-            if m:
-                year = int(m.group(1))
-                if year < 1911:
-                    year += 1911
-                age = now_taipei().year - year
-                if 0 <= age <= 150:
-                    data["building_age"] = str(age)
-        except Exception:
-            pass
-
-    note_lines = []
-    for key in [
-        "case_address", "land_lot_no", "building_no", "deed_owner", "deed_completed_date",
-        "deed_main_use", "deed_main_material", "deed_right_scope", "floor", "floor_total",
-        "main_ping", "attached_ping", "public_ping", "total_ping", "deed_mortgage_note",
-    ]:
-        value = data.get(key)
-        if value:
-            label = CASE_BASIC_LABELS.get(key, key)
-            note_lines.append(f"{label}：{value}")
-
-    if note_lines:
-        data["deed_parsed_note"] = "\n".join(note_lines)
-
-    return {k: v for k, v in data.items() if str(v or "").strip()}
-
-
 def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     incoming = incoming or {}
     data = {}
@@ -22792,10 +22648,15 @@ def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     data["land_lot_no"] = seller.get("land_lot_no") or ""
     data["building_no"] = seller.get("building_no") or ""
     data["deed_completed_date"] = seller.get("deed_completed_date") or ""
+    data["completed_minguo_year"] = seller.get("completed_minguo_year") or ""
+    data["completed_month"] = seller.get("completed_month") or ""
+    data["completed_day"] = seller.get("completed_day") or ""
     data["deed_main_use"] = seller.get("deed_main_use") or ""
     data["deed_main_material"] = seller.get("deed_main_material") or ""
     data["deed_right_scope"] = seller.get("deed_right_scope") or ""
     data["deed_mortgage_note"] = seller.get("deed_mortgage_note") or ""
+    data["deed_pdf_filename"] = seller.get("deed_pdf_filename") or ""
+    data["deed_parsed_json"] = seller.get("deed_parsed_json") or ""
     data["ai_sales_title"] = seller.get("ai_sales_title") or ""
     data["ai_selling_points"] = seller.get("ai_selling_points") or []
     data["ai_group_copy"] = seller.get("ai_group_copy") or ""
@@ -22975,13 +22836,15 @@ def _case_missing_fields(case_data: dict):
 CASE_TOOLS_HTML = r'''
 {% extends "base.html" %}
 {% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+<div class="d-flex justify-content-between align-items-center mb-3">
   <div>
-    <h3 class="mb-1">案件輸入表 / AI 強銷文案</h3>
+    <h3 class="mb-1">案件輸入表 / AI強銷文案</h3>
     <div class="text-muted small">委託：{{ seller.name or '-' }}｜{{ seller.phone or '-' }}</div>
   </div>
-  <div class="d-flex gap-2 flex-wrap">
-    <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載案件輸入表 PDF</a>
+  <div>
+    <a class="btn btn-outline-success" href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}">上傳謄本填表</a>
+    <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
+    <a class="btn btn-outline-secondary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載原本案件表 PDF</a>
     <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
   </div>
 </div>
@@ -22992,142 +22855,30 @@ CASE_TOOLS_HTML = r'''
 </div>
 {% endif %}
 
-<div class="alert alert-info small">
-  <strong>使用方式：</strong>
-  先貼公司群組文案或謄本 / 權狀文字，按「解析謄本並儲存」或「AI 整理並生成強銷文案」。
-  系統會把可判斷的地址、坪數、樓層、屋齡、建號、地號等資料帶入案件輸入表。
-</div>
-
 <div class="row g-4">
   <div class="col-lg-7">
     <form method="post" class="card">
-      <div class="card-header fw-bold">案件資料 / 謄本資料</div>
+      <div class="card-header fw-bold">案件資料</div>
       <div class="card-body">
-
         <div class="mb-3">
-          <label class="form-label fw-bold">貼上公司群組原始文案 / 補充資料</label>
-          <textarea name="raw_group_text" class="form-control" rows="7" placeholder="可直接貼公司群組整段物件資料，系統會先自動拆欄位，再交給 AI 生成標題與五點強銷。">{{ case_data.raw_group_text or '' }}</textarea>
-          <div class="form-text">可解析：地址、售價、格局、坪數、屋齡、帶看方式、網址與條列特色。</div>
+          <label class="form-label">貼上公司群組原始文案 / 補充資料</label>
+          <textarea name="raw_group_text" class="form-control" rows="8" placeholder="可直接貼公司群組整段物件資料，系統會先自動拆欄位，再交給 AI 生成標題與五點強銷。">{{ case_data.raw_group_text or '' }}</textarea>
+          <div class="form-text">送出時會自動解析：地址、售價、格局、坪數、屋齡、帶看方式、網址與條列特色。</div>
         </div>
 
-        <div class="mb-3">
-          <label class="form-label fw-bold">貼上謄本 / 權狀 / 地籍建物資料文字</label>
-          <textarea name="deed_raw_text" class="form-control" rows="8" placeholder="可貼電子謄本複製出的文字、OCR文字，或權狀上的建物/土地資料。&#10;例：建物門牌、建號、地號、主要用途、主要建材、建物完成日期、主建物面積、附屬建物、共有部分、權利範圍、他項權利等。">{{ case_data.deed_raw_text or '' }}</textarea>
-          <div class="form-text">第一版先支援貼上文字。若是掃描 PDF / 圖片，請先轉 OCR 文字再貼上；解析後仍建議人工核對。</div>
+        <div class="row g-2">
+          {% for key, label in field_labels.items() %}
+            {% if key not in ['life_note','property_highlight_note','target_customer_note','source_url'] %}
+              <div class="col-md-6">
+                <label class="form-label">{{ label }}</label>
+                <input type="text" name="{{ key }}" class="form-control" value="{{ case_data.get(key, '') }}">
+              </div>
+            {% endif %}
+          {% endfor %}
         </div>
 
-        {% if case_data.deed_parsed_note %}
-        <div class="mb-3">
-          <label class="form-label">謄本解析摘要</label>
-          <textarea class="form-control" rows="6" readonly>{{ case_data.deed_parsed_note }}</textarea>
-        </div>
-        {% endif %}
-
-        <div class="row g-3">
-          <div class="col-md-6">
-            <label class="form-label">物件標題</label>
-            <input name="property_title" class="form-control" value="{{ case_data.property_title or '' }}">
-          </div>
-          <div class="col-md-6">
-            <label class="form-label">社區名稱</label>
-            <input name="community_name" class="form-control" value="{{ case_data.community_name or '' }}">
-          </div>
-          <div class="col-md-8">
-            <label class="form-label">完整地址</label>
-            <input name="case_address" class="form-control" value="{{ case_data.case_address or '' }}">
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">開價 / 售價</label>
-            <input name="case_price" class="form-control" value="{{ case_data.case_price or '' }}">
-          </div>
-
-          <div class="col-md-4">
-            <label class="form-label">格局</label>
-            <input name="layout" class="form-control" value="{{ case_data.layout or '' }}">
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">所在樓層</label>
-            <input name="floor" class="form-control" value="{{ case_data.floor or '' }}">
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">樓高 / 總樓層</label>
-            <input name="floor_total" class="form-control" value="{{ case_data.floor_total or '' }}">
-          </div>
-
-          <div class="col-md-3">
-            <label class="form-label">總建坪</label>
-            <input name="total_ping" class="form-control" value="{{ case_data.total_ping or '' }}">
-          </div>
-          <div class="col-md-3">
-            <label class="form-label">主建坪</label>
-            <input name="main_ping" class="form-control" value="{{ case_data.main_ping or '' }}">
-          </div>
-          <div class="col-md-3">
-            <label class="form-label">附屬坪</label>
-            <input name="attached_ping" class="form-control" value="{{ case_data.attached_ping or '' }}">
-          </div>
-          <div class="col-md-3">
-            <label class="form-label">公設坪</label>
-            <input name="public_ping" class="form-control" value="{{ case_data.public_ping or '' }}">
-          </div>
-
-          <div class="col-md-3">
-            <label class="form-label">地坪</label>
-            <input name="land_ping" class="form-control" value="{{ case_data.land_ping or '' }}">
-          </div>
-          <div class="col-md-3">
-            <label class="form-label">車位坪</label>
-            <input name="parking_ping" class="form-control" value="{{ case_data.parking_ping or '' }}">
-          </div>
-          <div class="col-md-3">
-            <label class="form-label">屋齡</label>
-            <input name="building_age" class="form-control" value="{{ case_data.building_age or '' }}">
-          </div>
-          <div class="col-md-3">
-            <label class="form-label">朝向 / 座向</label>
-            <input name="facing" class="form-control" value="{{ case_data.facing or '' }}">
-          </div>
-
-          <div class="col-md-4">
-            <label class="form-label">地號</label>
-            <input name="land_lot_no" class="form-control" value="{{ case_data.land_lot_no or '' }}">
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">建號</label>
-            <input name="building_no" class="form-control" value="{{ case_data.building_no or '' }}">
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">建物完成日期</label>
-            <input name="deed_completed_date" class="form-control" value="{{ case_data.deed_completed_date or '' }}">
-          </div>
-
-          <div class="col-md-4">
-            <label class="form-label">主要用途</label>
-            <input name="deed_main_use" class="form-control" value="{{ case_data.deed_main_use or '' }}">
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">主要建材</label>
-            <input name="deed_main_material" class="form-control" value="{{ case_data.deed_main_material or '' }}">
-          </div>
-          <div class="col-md-4">
-            <label class="form-label">權利範圍</label>
-            <input name="deed_right_scope" class="form-control" value="{{ case_data.deed_right_scope or '' }}">
-          </div>
-
-          <div class="col-md-6">
-            <label class="form-label">帶看方式</label>
-            <input name="showing_method" class="form-control" value="{{ case_data.showing_method or '' }}">
-          </div>
-          <div class="col-md-6">
-            <label class="form-label">參考網址</label>
-            <input name="source_url" class="form-control" value="{{ case_data.source_url or '' }}">
-          </div>
-
-          <div class="col-12">
-            <label class="form-label">他項權利 / 抵押權備註</label>
-            <textarea name="deed_mortgage_note" class="form-control" rows="2">{{ case_data.deed_mortgage_note or '' }}</textarea>
-          </div>
-
+        <hr>
+        <div class="row g-2">
           <div class="col-md-4">
             <label class="form-label">生活機能補充</label>
             <textarea name="life_note" class="form-control" rows="4" placeholder="例：中山路生活圈、近市場、近學校、近主要道路">{{ case_data.life_note or '' }}</textarea>
@@ -23140,16 +22891,14 @@ CASE_TOOLS_HTML = r'''
             <label class="form-label">適合客群</label>
             <textarea name="target_customer_note" class="form-control" rows="4" placeholder="例：在地換屋、大家庭、首購、自住整理型客戶">{{ case_data.target_customer_note or '' }}</textarea>
           </div>
-
           <div class="col-12">
-            <label class="form-label">備註 / 產權注意事項</label>
-            <textarea name="case_note" class="form-control" rows="4">{{ case_data.case_note or '' }}</textarea>
+            <label class="form-label">參考網址</label>
+            <input type="text" name="source_url" class="form-control" value="{{ case_data.source_url or '' }}">
           </div>
         </div>
       </div>
       <div class="card-footer d-flex gap-2 flex-wrap">
-        <button class="btn btn-outline-success" name="action" value="parse_deed" type="submit">解析謄本並儲存</button>
-        <button class="btn btn-primary" name="action" value="generate_ai" type="submit">AI 整理並生成強銷文案</button>
+        <button class="btn btn-primary" name="action" value="generate_ai" type="submit">AI整理並生成強銷文案</button>
         <button class="btn btn-outline-secondary" name="action" value="save_only" type="submit">只儲存資料</button>
         <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載案件輸入表 PDF</a>
       </div>
@@ -23161,7 +22910,7 @@ CASE_TOOLS_HTML = r'''
       <div class="card-header fw-bold">AI 強銷標題與五點特色</div>
       <div class="card-body">
         <label class="form-label">強銷標題</label>
-        <input id="aiSalesTitle" class="form-control mb-3" readonly value="{{ case_data.ai_sales_title or '' }}">
+        <input class="form-control mb-3" readonly value="{{ case_data.ai_sales_title or '' }}">
         <label class="form-label">五點特色</label>
         {% if case_data.ai_selling_points %}
           <ol class="mb-0">
@@ -23170,16 +22919,8 @@ CASE_TOOLS_HTML = r'''
             {% endfor %}
           </ol>
         {% else %}
-          <div class="text-muted">尚未生成。左側填資料後按「AI 整理並生成強銷文案」。</div>
+          <div class="text-muted">尚未生成。左側填資料後按「AI整理並生成強銷文案」。</div>
         {% endif %}
-      </div>
-    </div>
-
-    <div class="card mb-3">
-      <div class="card-header fw-bold">樂屋 / 591 刊登描述</div>
-      <div class="card-body">
-        <textarea id="aiListingDescription" class="form-control" rows="7" readonly>{{ case_data.ai_listing_description or '' }}</textarea>
-        <button class="btn btn-sm btn-outline-secondary mt-2" type="button" onclick="navigator.clipboard.writeText(document.getElementById('aiListingDescription').value); alert('已複製刊登描述');">複製刊登描述</button>
       </div>
     </div>
 
@@ -23187,7 +22928,7 @@ CASE_TOOLS_HTML = r'''
       <div class="card-header fw-bold">公司群組文案</div>
       <div class="card-body">
         <textarea id="aiGroupCopy" class="form-control" rows="16" readonly>{{ case_data.ai_group_copy or '' }}</textarea>
-        <button class="btn btn-sm btn-outline-secondary mt-2" type="button" onclick="navigator.clipboard.writeText(document.getElementById('aiGroupCopy').value); alert('已複製群組文案');">複製群組文案</button>
+        <button class="btn btn-sm btn-outline-secondary mt-2" onclick="navigator.clipboard.writeText(document.getElementById('aiGroupCopy').value); alert('已複製群組文案');">複製群組文案</button>
       </div>
     </div>
 
@@ -23211,53 +22952,28 @@ def seller_case_tools(seller_id):
     if not snap.exists:
         flash("找不到這筆委託", "danger")
         return redirect(url_for("sellers"))
-
     seller = doc_to_dict(snap)
-
     if request.method == "POST":
         form_payload = _case_seller_payload_from_form(request.form)
         raw_text = form_payload.get("raw_group_text") or ""
-        deed_text = form_payload.get("deed_raw_text") or ""
-
-        parsed_payload = {}
-        if raw_text:
-            parsed_payload.update(_case_parse_raw_listing_text(raw_text))
-        if deed_text:
-            deed_payload = _case_parse_deed_text(deed_text)
-            for k, v in deed_payload.items():
-                if str(v or "").strip():
-                    parsed_payload[k] = v
-
+        parsed_payload = _case_parse_raw_listing_text(raw_text) if raw_text else {}
         merged_payload = dict(parsed_payload)
         for k, v in form_payload.items():
             if str(v or "").strip():
                 merged_payload[k] = v
-
         case_data = _case_merge_seller_and_case_data(seller, merged_payload)
         action = request.form.get("action", "save_only")
-
         if action == "generate_ai":
             ai_payload = _case_ai_generate_sales_copy(seller, case_data)
             _case_apply_ai_to_seller(seller_id, case_data, ai_payload)
             flash("已整理案件資料，並生成 AI 強銷文案", "success")
-        elif action == "parse_deed":
-            _case_apply_ai_to_seller(seller_id, case_data, {})
-            flash("已解析謄本文字並儲存到案件資料，請人工核對後可下載案件表 PDF", "success")
         else:
             _case_apply_ai_to_seller(seller_id, case_data, {})
             flash("已儲存案件資料", "success")
-
         return redirect(url_for("seller_case_tools", seller_id=seller_id))
-
     case_data = _case_merge_seller_and_case_data(seller)
     missing_fields = _case_missing_fields(case_data)
-    return render_template_string(
-        CASE_TOOLS_HTML,
-        seller=seller,
-        case_data=case_data,
-        field_labels=CASE_BASIC_LABELS,
-        missing_fields=missing_fields,
-    )
+    return render_template_string(CASE_TOOLS_HTML, seller=seller, case_data=case_data, field_labels=CASE_BASIC_LABELS, missing_fields=missing_fields)
 
 
 def _case_pdf_value(case_data, key, default=""):
@@ -23308,21 +23024,207 @@ def _case_generate_pdf_bytes(seller: dict, case_data: dict):
     t = Table(basic_rows, colWidths=[28*mm, 67*mm, 28*mm, 67*mm]); t.setStyle(table_style); story.append(Paragraph("1. 基本資料", styles["CJK"])); story.append(t); story.append(Spacer(1,4*mm))
     points = case_data.get("ai_selling_points") or []
     points_text = "<br/>".join([f"{i}. {p}" for i, p in enumerate(points[:5], 1)]) if points else (_case_pdf_value(case_data, "ai_feature_note") or _case_pdf_value(case_data, "case_note"))
-    deed_notice = _case_pdf_value(case_data, "deed_mortgage_note") or _case_pdf_value(case_data, "case_note")
-    deed_summary = _case_pdf_value(case_data, "deed_parsed_note")
-    desc_rows = [
-        [P("特色備註"), P(points_text or "")],
-        [P("生活機能補充"), P(_case_pdf_value(case_data, "life_note"))],
-        [P("物件亮點補充"), P(_case_pdf_value(case_data, "property_highlight_note"))],
-        [P("適合客群"), P(_case_pdf_value(case_data, "target_customer_note"))],
-        [P("謄本解析摘要"), P(deed_summary or "")],
-        [P("產權特別注意事項"), P(deed_notice or "")],
-        [P("合約日 / 租約日"), P("合約日：______年____月____日  至  ______年____月____日")],
-    ]
+    desc_rows = [[P("特色備註"), P(points_text or "")], [P("生活機能補充"), P(_case_pdf_value(case_data, "life_note"))], [P("物件亮點補充"), P(_case_pdf_value(case_data, "property_highlight_note"))], [P("適合客群"), P(_case_pdf_value(case_data, "target_customer_note"))], [P("產權特別注意事項"), P("")], [P("合約日 / 租約日"), P("合約日：______年____月____日  至  ______年____月____日")]]
     t = Table(desc_rows, colWidths=[38*mm, 152*mm]); t.setStyle(TableStyle([("FONTNAME", (0,0), (-1,-1), "STSong-Light"), ("FONTSIZE", (0,0), (-1,-1), 9), ("GRID", (0,0), (-1,-1), 0.4, colors.black), ("VALIGN", (0,0), (-1,-1), "TOP"), ("BACKGROUND", (0,0), (0,-1), colors.whitesmoke)])); story.append(Paragraph("2. 學區 / 環境 / 特色備註", styles["CJK"])); story.append(t); story.append(Spacer(1,3*mm)); story.append(Paragraph("PS. 未提供或待確認資料請列印後手寫補上。AI 生成內容仍建議人工確認。", styles["CJKSmall"]))
     doc.build(story)
     buffer.seek(0)
     return buffer
+
+
+# =============================================================================
+# DEED_PDF_CASE_FORM V2：謄本 PDF 上傳解析 + 固定案件輸入表 PDF 自動填寫
+# =============================================================================
+
+DEED_CASE_FORM_HTML = r"""
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-1">上傳謄本 PDF → 自動填案件輸入表</h3>
+    <div class="text-muted small">委託：{{ seller.name or '-' }}｜{{ seller.phone or '-' }}</div>
+  </div>
+  <div class="d-flex gap-2 flex-wrap">
+    <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
+    <a class="btn btn-outline-secondary" href="{{ url_for('seller_case_tools', seller_id=seller.id) }}">案件表 / AI文案</a>
+    <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
+  </div>
+</div>
+
+<div class="alert alert-info small">
+  <strong>流程：</strong>上傳電子謄本 PDF → 系統抽文字 → 解析土地/建物資料 → 回寫委託案件 → 產生填好的案件輸入表 PDF。
+  若是掃描圖 PDF，請先 OCR 成文字，或把 OCR 文字貼到下方。
+</div>
+
+<form method="post" enctype="multipart/form-data" class="card mb-4">
+  <div class="card-header fw-bold">謄本 PDF / OCR 文字</div>
+  <div class="card-body">
+    <div class="mb-3">
+      <label class="form-label">上傳謄本 PDF</label>
+      <input type="file" name="deed_pdf" class="form-control" accept="application/pdf,.pdf">
+      <div class="form-text">電子謄本 PDF 通常可以直接抽文字；掃描圖 PDF 可能需要 OCR。</div>
+    </div>
+    <div class="mb-3">
+      <label class="form-label">或貼上謄本 OCR 文字</label>
+      <textarea name="deed_text" class="form-control" rows="8" placeholder="可貼上 PDF 複製出的文字或 OCR 文字">{{ case_data.deed_raw_text or '' }}</textarea>
+    </div>
+  </div>
+  <div class="card-footer d-flex gap-2 flex-wrap">
+    <button class="btn btn-success" name="action" value="parse" type="submit">解析謄本並儲存</button>
+    <button class="btn btn-primary" name="action" value="parse_and_download" type="submit">解析並下載填好的案件表</button>
+  </div>
+</form>
+
+<div class="row g-4">
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header fw-bold">目前案件欄位預覽</div>
+      <div class="card-body">
+        <table class="table table-sm align-middle">
+          <tbody>
+            <tr><th style="width:140px;">物件地址</th><td>{{ case_data.case_address or seller.address or '-' }}</td></tr>
+            <tr><th>地號</th><td>{{ case_data.land_lot_no or '-' }}</td></tr>
+            <tr><th>建號</th><td>{{ case_data.building_no or '-' }}</td></tr>
+            <tr><th>主要用途</th><td>{{ case_data.deed_main_use or '-' }}</td></tr>
+            <tr><th>主要建材</th><td>{{ case_data.deed_main_material or '-' }}</td></tr>
+            <tr><th>樓層 / 樓高</th><td>{{ case_data.floor or '-' }} / {{ case_data.floor_total or '-' }}</td></tr>
+            <tr><th>竣工日期</th><td>{{ case_data.deed_completed_date or '-' }}</td></tr>
+            <tr><th>屋齡</th><td>{{ case_data.building_age or '-' }}</td></tr>
+            <tr><th>總建坪</th><td>{{ case_data.total_ping or '-' }}</td></tr>
+            <tr><th>主建坪</th><td>{{ case_data.main_ping or '-' }}</td></tr>
+            <tr><th>附屬坪</th><td>{{ case_data.attached_ping or '-' }}</td></tr>
+            <tr><th>公設坪</th><td>{{ case_data.public_ping or '-' }}</td></tr>
+            <tr><th>土地坪</th><td>{{ case_data.land_ping or '-' }}</td></tr>
+            <tr><th>產權注意</th><td style="white-space:pre-line;">{{ case_data.deed_mortgage_note or case_data.case_note or '-' }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header fw-bold">謄本解析摘要</div>
+      <div class="card-body">
+        {% if case_data.deed_parsed_note %}
+          <pre class="small mb-0" style="white-space:pre-wrap;">{{ case_data.deed_parsed_note }}</pre>
+        {% else %}
+          <p class="text-muted mb-0">尚未解析謄本。</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+"""
+
+
+def _seller_case_form_template_pdf_path():
+    candidates = []
+    env_path = os.environ.get("CASE_FORM_TEMPLATE_PDF", "").strip()
+    if env_path:
+        candidates.append(env_path)
+    candidates.extend([
+        os.path.join(BASE_DIR, "assets", "案件輸入表-使用中.pdf"),
+        os.path.join(BASE_DIR, "案件輸入表-使用中.pdf"),
+        os.path.join(BASE_DIR, "case_form_template.pdf"),
+    ])
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    raise FileNotFoundError("找不到案件輸入表範本 PDF，請放在 assets/案件輸入表-使用中.pdf 或設定 CASE_FORM_TEMPLATE_PDF")
+
+
+def _seller_deed_parse_pdf_or_text(upload_file=None, deed_text=""):
+    from deed_case_form_tool import extract_deed_pdf_text_from_bytes, parse_deed_text
+    raw_text = (deed_text or "").strip()
+    filename = ""
+    if upload_file and getattr(upload_file, "filename", ""):
+        filename = secure_filename(upload_file.filename)
+        pdf_bytes = upload_file.read()
+        if pdf_bytes:
+            raw_text = extract_deed_pdf_text_from_bytes(pdf_bytes)
+    if not raw_text or len(raw_text.strip()) < 50:
+        raise RuntimeError("無法從 PDF 取得足夠文字。若這份是掃描 PDF，請先 OCR 後把文字貼上。")
+    parsed = parse_deed_text(raw_text)
+    return parsed, raw_text, filename
+
+
+def _seller_apply_deed_case_data(seller_id, parsed, raw_text="", filename=""):
+    case_data = dict((parsed or {}).get("case_data") or {})
+    if raw_text:
+        case_data["deed_raw_text"] = raw_text[:20000]
+    if filename:
+        case_data["deed_pdf_filename"] = filename
+    try:
+        case_data["deed_parsed_json"] = json.dumps(parsed, ensure_ascii=False)[:30000]
+    except Exception:
+        pass
+    case_data["deed_parsed_at"] = now_taipei().isoformat()
+    _case_apply_ai_to_seller(seller_id, case_data, {})
+    return case_data
+
+
+@app.route("/sellers/<seller_id>/deed-case-form", methods=["GET", "POST"])
+@login_required
+def seller_deed_case_form(seller_id):
+    doc_ref = db.collection("sellers").document(seller_id)
+    snap = doc_ref.get()
+    if not snap.exists:
+        flash("找不到這筆委託", "danger")
+        return redirect(url_for("sellers"))
+
+    seller = doc_to_dict(snap)
+    if request.method == "POST":
+        action = request.form.get("action", "parse")
+        upload = request.files.get("deed_pdf")
+        deed_text = request.form.get("deed_text", "")
+
+        try:
+            parsed, raw_text, filename = _seller_deed_parse_pdf_or_text(upload, deed_text)
+            _seller_apply_deed_case_data(seller_id, parsed, raw_text=raw_text, filename=filename)
+
+            if action == "parse_and_download":
+                return redirect(url_for("seller_case_form_filled_pdf", seller_id=seller_id))
+
+            flash("已解析謄本 PDF，並回寫到委託案件資料。", "success")
+            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+        except Exception as e:
+            flash(f"解析謄本失敗：{e}", "danger")
+            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+
+    case_data = _case_merge_seller_and_case_data(seller)
+    return render_template_string(DEED_CASE_FORM_HTML, seller=seller, case_data=case_data)
+
+
+@app.route("/sellers/<seller_id>/case-form-filled.pdf")
+@login_required
+def seller_case_form_filled_pdf(seller_id):
+    snap = db.collection("sellers").document(seller_id).get()
+    if not snap.exists:
+        flash("找不到這筆委託", "danger")
+        return redirect(url_for("sellers"))
+
+    seller = doc_to_dict(snap)
+    case_data = _case_merge_seller_and_case_data(seller)
+
+    try:
+        from deed_case_form_tool import fill_case_form_pdf_bytes
+        template_path = _seller_case_form_template_pdf_path()
+        pdf_bytes = fill_case_form_pdf_bytes(template_path, case_data, seller=seller)
+    except Exception as e:
+        flash(f"產生填好的案件輸入表失敗：{e}", "danger")
+        return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+
+    filename = f"填好案件輸入表_{seller.get('name') or seller_id}.pdf"
+    return send_file(
+        BytesIO(pdf_bytes),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+# =============================================================================
+# DEED_PDF_CASE_FORM V2 End
+# =============================================================================
 
 
 @app.route("/sellers/<seller_id>/case-form.pdf")
