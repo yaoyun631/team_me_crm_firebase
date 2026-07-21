@@ -29047,16 +29047,16 @@ PROPERTY_CSV_BACKEND_UPLOAD_HTML = r"""
           </div>
 
           <div class="form-check mb-2">
-            <input class="form-check-input" type="checkbox" name="keep_latest_only" value="1" id="keepLatestOnly" checked>
+            <input class="form-check-input" type="checkbox" name="keep_latest_only" value="1" id="keepLatestOnly">
             <label class="form-check-label" for="keepLatestOnly">
               匯入後只保留這份最新 CSV 的物件，刪除同類型舊 CSV 資料
             </label>
           </div>
 
           <div class="form-check mb-2">
-            <input class="form-check-input" type="checkbox" name="refresh_status" value="1" id="refreshStatus" checked>
+            <input class="form-check-input" type="checkbox" name="refresh_status" value="1" id="refreshStatus">
             <label class="form-check-label" for="refreshStatus">
-              匯入後重新整理 Firebase 物件庫統計
+              匯入後完整掃描 Firebase 物件庫統計（資料多時較慢）
             </label>
           </div>
 
@@ -29287,6 +29287,128 @@ def _property_backend_csv_import_bytes(
     }
 
 
+
+def _property_csv_backend_empty_deal_status(deal_type: str) -> dict:
+    deal_type = "rent" if deal_type == "rent" else "sale"
+    return {
+        "deal_type": deal_type,
+        "label": "出租" if deal_type == "rent" else "出售",
+        "total_count": 0,
+        "active_count": 0,
+        "inactive_count": 0,
+        "duplicate_groups": 0,
+        "duplicate_old_active_count": 0,
+        "latest_doc": {},
+        "latest_updated_at": "",
+        "latest_import_log": {},
+        "truncated": False,
+        "error": "",
+        "fast_mode": True,
+        "note": "後台 CSV 上傳頁安全模式：狀態讀取失敗時顯示 0，避免整頁 500。",
+    }
+
+
+def _property_csv_backend_safe_property_status() -> dict:
+    try:
+        status = get_property_library_status()
+        if not isinstance(status, dict):
+            raise RuntimeError("get_property_library_status 回傳不是 dict")
+        status.setdefault("sale", _property_csv_backend_empty_deal_status("sale"))
+        status.setdefault("rent", _property_csv_backend_empty_deal_status("rent"))
+        status.setdefault("generated_at", now_taipei().isoformat())
+        return status
+    except Exception as exc:
+        return {
+            "generated_at": now_taipei().isoformat(),
+            "sale": {
+                **_property_csv_backend_empty_deal_status("sale"),
+                "error": f"狀態讀取失敗：{exc}",
+            },
+            "rent": {
+                **_property_csv_backend_empty_deal_status("rent"),
+                "error": f"狀態讀取失敗：{exc}",
+            },
+            "total_active": 0,
+            "total_duplicates": 0,
+            "from_cache": False,
+            "scan_mode": "safe_fallback",
+        }
+
+
+def _property_csv_backend_status_from_import_result(result: dict) -> dict:
+    deal_type = "rent" if (result or {}).get("deal_type") == "rent" else "sale"
+    imported = int((result or {}).get("imported_count") or 0)
+    total = int((result or {}).get("total_count") or 0)
+    now_iso = now_taipei().isoformat()
+
+    latest_log = {
+        "deal_type": deal_type,
+        "file_name": (result or {}).get("file_name") or "",
+        "imported_count": imported,
+        "total_count": total,
+        "skipped_count": int((result or {}).get("skipped_count") or 0),
+        "created_at": now_iso,
+        "imported_at": now_iso,
+        "source": "backend_upload_fast_cache",
+        "import_batch_id": (result or {}).get("import_batch_id") or "",
+    }
+
+    return {
+        "deal_type": deal_type,
+        "label": "出租" if deal_type == "rent" else "出售",
+        "total_count": imported,
+        "active_count": imported,
+        "inactive_count": 0,
+        "duplicate_groups": 0,
+        "duplicate_old_active_count": 0,
+        "latest_doc": {},
+        "latest_updated_at": now_iso,
+        "latest_import_log": latest_log,
+        "truncated": False,
+        "error": "",
+        "fast_mode": True,
+        "note": "後台 CSV 上傳後快速快取；完整統計可另外按重新整理。",
+    }
+
+
+def _property_csv_backend_save_fast_status_after_import(result: dict) -> dict:
+    """匯入後直接寫快取，避免狀態頁為了掃 Firestore 造成 500。"""
+    status = _property_csv_backend_safe_property_status()
+    deal_type = "rent" if (result or {}).get("deal_type") == "rent" else "sale"
+    status[deal_type] = _property_csv_backend_status_from_import_result(result)
+    status["generated_at"] = now_taipei().isoformat()
+    status["from_cache"] = False
+    status["scan_mode"] = "backend_upload_fast_cache"
+    status["total_active"] = int(status.get("sale", {}).get("active_count") or 0) + int(status.get("rent", {}).get("active_count") or 0)
+    status["total_duplicates"] = int(status.get("sale", {}).get("duplicate_old_active_count") or 0) + int(status.get("rent", {}).get("duplicate_old_active_count") or 0)
+    try:
+        _property_maintenance_save_status_cache(status)
+    except Exception as exc:
+        print("⚠️ 後台 CSV 快速狀態快取寫入失敗：", exc)
+    return status
+
+
+@app.route("/debug/property-csv-upload-check")
+@login_required
+def debug_property_csv_upload_check():
+    checks = {
+        "ok": True,
+        "route": "/tools/property-csv-upload",
+        "has_import_func": "_property_backend_csv_import_bytes" in globals(),
+        "has_csv_reader": "_property_csv_read_rows" in globals(),
+        "has_property_logs_collection": PROPERTY_IMPORT_LOG_COLLECTION,
+        "has_property_collection": PROPERTY_LIBRARY_COLLECTION,
+        "status": {},
+    }
+    try:
+        checks["status"] = _property_csv_backend_safe_property_status()
+    except Exception as exc:
+        checks["ok"] = False
+        checks["error"] = str(exc)
+    return checks
+
+
+
 @app.route("/tools/property-csv-upload", methods=["GET", "POST"])
 @login_required
 def property_csv_backend_upload():
@@ -29325,18 +29447,31 @@ def property_csv_backend_upload():
                     "info",
                 )
             else:
-                if keep_latest_only:
-                    cleanup_result = _property_import_auto_cleanup_keep_latest(
-                        deal_type=result.get("deal_type", ""),
-                        import_result=result,
-                        source_label="backend_csv_upload",
-                    )
+                # 先寫快速狀態快取。這一步很輕，不掃全 Firestore，可避免匯入後狀態頁 latest CSV 又變 0 或整頁 500。
+                _property_csv_backend_save_fast_status_after_import(result)
 
+                if keep_latest_only:
+                    try:
+                        cleanup_result = _property_import_auto_cleanup_keep_latest(
+                            deal_type=result.get("deal_type", ""),
+                            import_result=result,
+                            source_label="backend_csv_upload",
+                        )
+                    except Exception as exc:
+                        cleanup_result = {
+                            "ok": False,
+                            "errors": [str(exc)],
+                            "deleted_docs": 0,
+                            "kept_docs": 0,
+                        }
+                        flash(f"CSV 已匯入，但清理舊 CSV 失敗：{exc}", "warning")
+
+                # 完整掃描改成選配，不再預設執行。
                 if refresh_status:
                     try:
                         refresh_property_library_status_cache()
                     except Exception as exc:
-                        flash(f"已匯入，但重新整理統計失敗：{exc}", "warning")
+                        flash(f"CSV 已匯入，但完整掃描統計失敗：{exc}", "warning")
 
                 label = "出租" if result.get("deal_type") == "rent" else "出售"
                 flash(
@@ -29345,9 +29480,10 @@ def property_csv_backend_upload():
                 )
 
         except Exception as exc:
+            # 不讓錯誤變成 Internal Server Error，直接回到頁面顯示原因。
             flash(f"CSV 後台匯入失敗：{exc}", "danger")
 
-    property_status = get_property_library_status()
+    property_status = _property_csv_backend_safe_property_status()
 
     return render_template_string(
         PROPERTY_CSV_BACKEND_UPLOAD_HTML,
