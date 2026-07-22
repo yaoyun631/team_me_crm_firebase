@@ -33345,7 +33345,12 @@ _TEAMME_PROPERTY_RESULT_TEMPLATE = """
   {% for c in candidates %}<tr><td>{{ loop.index }}</td><td>{{ c.get('address') }}</td><td>{{ c.get('core_exact_match_ratio') }}%</td><td>{{ c.get('building_area_ping') }}</td><td>{{ c.get('main_building_area_ping') }}</td><td>{{ c.get('district') }}</td><td>{{ c.get('transfer_floor') }}/{{ c.get('total_floors') }}</td><td>{{ c.get('candidate_current_age') }}</td></tr>{% endfor %}
   </tbody></table></div>
   {% elif kind == 'address' %}
-  <div class="card"><h2>{{ result.get('query') }}</h2><div class="grid"><div class="metric"><b>{{ summary.get('count') or 0 }}</b><span>附近成交</span></div><div class="metric"><b>{{ summary.get('median_unit') or '—' }}</b><span>單價中位數</span></div><div class="metric"><b>{{ summary.get('average_unit') or '—' }}</b><span>平均單價</span></div><div class="metric"><b>{{ summary.get('median_total') or '—' }}</b><span>總價中位數</span></div></div></div>
+  {% set nearby_rows = result.get('nearby_transactions') or result.get('nearby_records') or result.get('nearby_rows') or result.get('records') or result.get('items') or [] %}
+  {% set settings = result.get('query_settings') or {} %}
+  <div class="card"><h2>{{ (result.get('target') or {}).get('full_address') or result.get('query') }}</h2><div class="grid"><div class="metric"><b>{{ summary.get('count') or nearby_rows|length or 0 }}</b><span>附近成交</span></div><div class="metric"><b>{{ summary.get('median_unit') or '—' }}</b><span>單價中位數（萬／坪）</span></div><div class="metric"><b>{{ summary.get('average_unit') or '—' }}</b><span>平均單價（萬／坪）</span></div><div class="metric"><b>{{ summary.get('median_total') or '—' }}</b><span>總價中位數（萬）</span></div><div class="metric"><b>{{ summary.get('latest') or '—' }}</b><span>最近成交</span></div><div class="metric"><b>{{ settings.get('radius') or 500 }}m</b><span>查詢範圍／{{ settings.get('years') or 5 }}年</span></div></div></div>
+  <div class="card"><h2>附近成交逐筆明細（{{ nearby_rows|length }}筆）</h2><div style="overflow:auto;max-height:70vh"><table><thead><tr><th>#</th><th>距離</th><th>日期</th><th>類型</th><th>交易位置</th><th>樓層</th><th>格局</th><th>地坪</th><th>建坪</th><th>總價(萬)</th><th>單價</th><th>屋齡</th></tr></thead><tbody>
+  {% for row in nearby_rows %}<tr><td>{{ loop.index }}</td><td>{{ row.get('distance_m') or '-' }}</td><td>{{ row.get('transaction_date') or '-' }}</td><td>{{ row.get('property_category') or '-' }}</td><td>{{ row.get('address') or '-' }}</td><td>{{ row.get('floor_text') or row.get('transfer_floor') or '-' }}</td><td>{{ row.get('layout_text') or '-' }}</td><td>{{ row.get('land_area_ping') if row.get('land_area_ping') not in (none, '') else '-' }}</td><td>{{ row.get('building_area_ping') if row.get('building_area_ping') not in (none, '') else '-' }}</td><td>{{ row.get('total_price_wan') if row.get('total_price_wan') not in (none, '') else '-' }}</td><td>{{ row.get('unit_price_wan') if row.get('unit_price_wan') not in (none, '') else '-' }}</td><td>{{ row.get('building_age') if row.get('building_age') not in (none, '') else '-' }}</td></tr>{% else %}<tr><td colspan="12" class="muted">沒有收到逐筆成交資料，請更新 ELLEN-PC local_agent.py 後重新查詢。</td></tr>{% endfor %}
+  </tbody></table></div></div>
   {% endif %}
   <div class="card"><h2>完整資料</h2><pre>{{ raw_json }}</pre></div>
 </div></body></html>
@@ -33408,7 +33413,7 @@ def debug_property_line_check():
         "line_webhook": getattr(app.view_functions.get("line_webhook"), "__name__", ""),
         "message_handler": getattr(process_line_message_event, "__name__", ""),
         "postback_handler": getattr(process_line_postback_event, "__name__", ""),
-        "version": "5.4",
+        "version": "5.4-v26-transaction-details",
     }
 
 
@@ -38301,6 +38306,198 @@ def seller_deed_owner_ai_v25(seller_id):
 app.view_functions["seller_deed_owner_ai_v23"] = seller_deed_owner_ai_v25
 
 
+
+
+# =============================================================================
+# Team M.E v27｜每日新物件網址正規化
+#
+# 修正重點：
+# 1. 樂屋目前的正式物件頁是 /sell_item/info?ehid=...，不是舊的 /sell/info。
+# 2. 591 優先從實際 detail href 取物件 ID，再統一成桌面版正式網址。
+# 3. 已存在 Firestore 的舊錯誤網址，在 Render 顯示時也會即時修正。
+# 4. 已知平台若無法確認物件 ID，寧可不顯示連結，不再導到錯誤搜尋頁。
+# =============================================================================
+
+def _v27_clean_listing_url(value):
+    import html as _html
+    text = _html.unescape(str(value or '')).strip()
+    text = text.replace('\\u0026', '&').replace('&amp;', '&')
+    if text.startswith('//'):
+        text = 'https:' + text
+    return text
+
+
+def _v27_listing_url_candidates(data):
+    data = data or {}
+    raw = data.get('raw') or {}
+    values = [
+        data.get('detail_url'),
+        data.get('detail_href'),
+        data.get('source_url'),
+    ]
+    if isinstance(raw, dict):
+        values.extend([
+            raw.get('detail_url'),
+            raw.get('detail_href'),
+            raw.get('header_href'),
+            raw.get('href'),
+            raw.get('url'),
+        ])
+    values.extend([
+        data.get('url'),
+        data.get('listing_url'),
+        data.get('link'),
+    ])
+    result = []
+    for value in values:
+        value = _v27_clean_listing_url(value)
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _v27_source_name(data, candidates=None):
+    data = data or {}
+    text = ' '.join(str(data.get(key) or '') for key in (
+        'source_platform', 'platform', 'market_scope_source', 'source',
+        'source_domain', 'provider_code', 'provider_label'
+    )).lower()
+    text += ' ' + ' '.join(candidates or []).lower()
+    if '591' in text:
+        return '591'
+    if 'rakuya' in text or '樂屋' in text:
+        return 'rakuya'
+    return ''
+
+
+def _v27_extract_591_id(data, candidates):
+    import re
+    for url in candidates:
+        for pattern in (
+            r'/home/house/detail/(?:[^/?#]+/)*(\d+)\.html',
+            r'/v2/sale/(\d+)',
+        ):
+            matched = re.search(pattern, url, flags=re.I)
+            if matched:
+                return matched.group(1)
+    # 只有完全沒有可辨識網址時才使用欄位備援。
+    for value in (data.get('source_listing_id'), data.get('listing_key')):
+        text = str(value or '').strip()
+        if text.startswith('591:'):
+            text = text.split(':', 1)[1]
+        if re.fullmatch(r'\d{6,12}', text):
+            return text
+    return ''
+
+
+def _v27_extract_rakuya_ehid(data, candidates):
+    import re
+    from urllib.parse import parse_qs, urlsplit
+    for url in candidates:
+        try:
+            query = parse_qs(urlsplit(url).query)
+            ehid = str((query.get('ehid') or [''])[0] or '').strip()
+            if ehid:
+                return ehid
+        except Exception:
+            pass
+        matched = re.search(r'(?:[?&]ehid=)([A-Za-z0-9_-]+)', url, flags=re.I)
+        if matched:
+            return matched.group(1)
+    for value in (data.get('source_listing_id'), data.get('listing_key')):
+        text = str(value or '').strip()
+        if text.startswith('rakuya:'):
+            text = text.split(':', 1)[1]
+        if re.fullmatch(r'[A-Za-z0-9_-]{6,80}', text) and not text.isdigit():
+            return text
+    return ''
+
+
+def _v27_canonical_property_url(data):
+    from urllib.parse import quote
+    data = data or {}
+    candidates = _v27_listing_url_candidates(data)
+    source = _v27_source_name(data, candidates)
+
+    if source == '591':
+        listing_id = _v27_extract_591_id(data, candidates)
+        if not listing_id:
+            return ''
+        return f'https://sale.591.com.tw/home/house/detail/2/{listing_id}.html'
+
+    if source == 'rakuya':
+        ehid = _v27_extract_rakuya_ehid(data, candidates)
+        if not ehid:
+            return ''
+        return 'https://www.rakuya.com.tw/sell_item/info?ehid=' + quote(ehid, safe='_-')
+
+    for url in candidates:
+        if url.lower().startswith(('https://', 'http://')):
+            return url
+    return ''
+
+
+# 讓舊的「只顯示標題＋網址」頁也套用正確網址。
+_v27_original_property_link_only_doc_to_item = _property_link_only_doc_to_item
+
+def _property_link_only_doc_to_item(doc):
+    item = _v27_original_property_link_only_doc_to_item(doc)
+    data = doc.to_dict() or {}
+    item['url_original'] = item.get('url') or ''
+    if data.get('hidden') or data.get('superseded_by'):
+        item['url'] = ''
+    else:
+        item['url'] = _v27_canonical_property_url(data)
+    item['url_repaired_for_display'] = bool(
+        item.get('url') and item.get('url') != item.get('url_original')
+    )
+    return item
+
+
+# 讓 /properties/daily-new 每日頁面套用正確網址。
+_v27_original_property_item_from_doc = _v25_property_item_from_doc
+
+def _v25_property_item_from_doc(doc):
+    item = _v27_original_property_item_from_doc(doc)
+    data = doc.to_dict() or {}
+    item['url_original'] = item.get('url') or ''
+    if data.get('hidden') or data.get('superseded_by'):
+        item['url'] = ''
+    else:
+        item['url'] = _v27_canonical_property_url(data)
+    item['url_repaired_for_display'] = bool(
+        item.get('url') and item.get('url') != item.get('url_original')
+    )
+    return item
+
+
+
+
+_v27_original_load_property_alert_items = _v25_load_property_alert_items
+
+def _v25_load_property_alert_items(limit=1000):
+    items = _v27_original_load_property_alert_items(limit=limit)
+    deduped = []
+    seen = set()
+    for item in items:
+        url = str(item.get('url') or '').strip()
+        if not url:
+            continue
+        key = (
+            str(item.get('source_platform') or '').lower(),
+            url.lower().split('#', 1)[0],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+print('✅ Team M.E v27 新物件網址正規化已啟用：591 detail URL／樂屋 sell_item URL')
+# =============================================================================
+# Team M.E v27 End
+# =============================================================================
+
 print("✅ Team M.E v25 已啟用：首頁 / 戶籍地址開發路線 / 實價查詢 / 每日新物件 / 所有權部影像補抓")
 
 
@@ -38308,3 +38505,11 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
     print("Routes:", app.url_map)
     app.run(host="0.0.0.0", port=port, debug=True)
+
+
+# =============================================================================
+# Team M.E v26 實價登錄逐筆成交明細
+# - property-search 顯示附近每一筆成交
+# - 本戶成交與附近成交分開呈現
+# - ELLEN-PC local_agent 需回傳 nearby_transactions
+# =============================================================================

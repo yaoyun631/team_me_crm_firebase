@@ -63,7 +63,9 @@
           {% if item.price %}<span class="badge bg-light text-dark border">{{ item.price }}</span>{% endif %}
           {% if item.building_area_ping %}<span class="badge bg-light text-dark border">{{ item.building_area_ping }} 坪</span>{% endif %}
           {% if item.created_display %}<span class="badge bg-light text-dark border">{{ item.created_display }}</span>{% endif %}
+          {% if item.url_repaired_for_display %}<span class="badge text-bg-warning">網址已自動修正</span>{% endif %}
         </div>
+        <div class="small text-muted text-break mb-2">{{ item.url }}</div>
         <div class="d-flex gap-2 flex-wrap">
           <a href="{{ item.url }}" target="_blank" rel="noopener" class="btn btn-primary btn-sm">開啟物件</a>
           <button type="button" class="btn btn-outline-secondary btn-sm" data-copy="{{ item.url }}">複製網址</button>
