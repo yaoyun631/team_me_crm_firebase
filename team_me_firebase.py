@@ -36387,3 +36387,928 @@ print("✅ CASE_FORM_V19：單一上傳謄本/地籍圖 + AI分析已啟用")
 # CASE_FORM_V19 Patch End
 # =============================================================================
 
+
+# =============================================================================
+# CASE_FORM_V23：原本解析 / Gemini補抓 / 人工確認套用 三段式 Patch
+# - 第一步解析與儲存完全不呼叫 Gemini，避免長請求拖垮案件表頁面。
+# - 第二步只把已保存的「所有權部」局部文字送 Gemini，單一 REST、短 timeout。
+# - 第三步先顯示 AI 暫存結果，由使用者確認後才套用正式欄位。
+# =============================================================================
+
+CASE_FORM_V23_UPLOAD_HTML = r"""
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-1">上傳謄本/地籍圖 → 原本解析 → AI補抓 → 確認套用</h3>
+    <div class="text-muted small">委託：{{ seller.name or '-' }}｜{{ seller.phone or '-' }}</div>
+  </div>
+  <div class="d-flex gap-2 flex-wrap">
+    <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
+    <a class="btn btn-outline-secondary" href="{{ url_for('seller_case_tools', seller_id=seller.id) }}">案件表 / AI文案</a>
+    <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
+  </div>
+</div>
+
+<div class="alert alert-info small">
+  <strong>v23 三段式穩定版：</strong>
+  第一步只使用原本 PDF 文字、OCR 與規則解析，完全不呼叫 Gemini；
+  第二步只有四項所有權人資料缺漏時，才獨立分析所有權部局部文字；
+  第三步會先顯示 AI 結果，確認後才寫入案件欄位。Gemini 失敗不會影響土地面積、案件表或原本解析結果。
+</div>
+
+<div class="card mb-4 border-primary">
+  <div class="card-header fw-bold">① 原本解析並儲存（不呼叫 Gemini）</div>
+  <form method="post" enctype="multipart/form-data">
+    <div class="card-body">
+      <label class="form-label">選擇檔案，可一次多選</label>
+      <input type="file" name="case_files" class="form-control" accept="application/pdf,.pdf,image/*" multiple>
+      <div class="form-text mb-3">
+        可同時選擇土地謄本、建物謄本及地籍圖。這一步只做原本解析，不等待 Gemini。
+      </div>
+
+      <label class="form-label">謄本 OCR / 複製文字補充</label>
+      <textarea name="deed_text" class="form-control" rows="6" placeholder="若 PDF 抽不到文字，可把 OCR 文字貼在這裡。">{{ case_data.deed_raw_text or '' }}</textarea>
+    </div>
+    <div class="card-footer d-flex gap-2 flex-wrap">
+      <button class="btn btn-success" name="action" value="parse" type="submit">原本解析並儲存</button>
+      <button class="btn btn-primary" name="action" value="parse_and_download" type="submit">解析後下載案件表</button>
+    </div>
+  </form>
+</div>
+
+<div class="row g-4">
+  <div class="col-lg-7">
+    <div class="card mb-4 border-warning">
+      <div class="card-header fw-bold">② AI 補抓所有權人資料（獨立呼叫）</div>
+      <div class="card-body">
+        <p class="small text-muted mb-2">
+          只會傳送已保存的「土地／建物所有權部」局部文字，且只要求缺少的欄位；不重新分析土地面積，也不傳送完整 PDF。
+        </p>
+
+        {% if owner_missing_labels %}
+          <div class="alert alert-warning py-2 small">
+            原本解析仍缺少：<strong>{{ owner_missing_labels|join('、') }}</strong>
+          </div>
+        {% else %}
+          <div class="alert alert-success py-2 small">四項所有權人資料已完整，不需要呼叫 Gemini。</div>
+        {% endif %}
+
+        {% if not ai_enabled %}
+          <div class="alert alert-secondary py-2 small">尚未設定 GEMINI_API_KEY，AI 補抓按鈕目前不可使用。</div>
+        {% endif %}
+
+        <button
+          type="button"
+          id="ownerAiButton"
+          class="btn btn-warning"
+          {% if not owner_missing_labels or not ai_enabled or not case_data.deed_raw_text %}disabled{% endif %}
+        >AI 補抓缺少欄位</button>
+        <span class="small text-muted ms-2">最長等待約 20 秒；失敗只顯示訊息，不會跳到 Internal Server Error。</span>
+        <div id="ownerAiMessage" class="mt-3"></div>
+
+        {% if not case_data.deed_raw_text %}
+          <div class="text-danger small mt-2">尚未保存謄本文字，請先執行步驟①。</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card mb-4 border-success">
+      <div class="card-header fw-bold">③ 確認並套用 AI 結果</div>
+      <form method="post" action="{{ url_for('seller_deed_owner_ai_apply_v23', seller_id=seller.id) }}">
+        <div class="card-body">
+          {% if pending_available %}
+            <div class="alert alert-success py-2 small">AI 結果已暫存。可先修正內容，再按下「確認並套用」。</div>
+          {% else %}
+            <div class="alert alert-light border py-2 small">目前沒有待確認的 AI 結果。</div>
+          {% endif %}
+
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">所有權人</label>
+              <input type="text" name="pending_owner_name" class="form-control" value="{{ case_data.deed_ai_pending_owner_name or '' }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">統一編號／身分證字號</label>
+              <input type="text" name="pending_owner_id" class="form-control" value="{{ case_data.deed_ai_pending_owner_id or '' }}">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">出生日期</label>
+              <input type="text" name="pending_birth_date" class="form-control" value="{{ case_data.deed_ai_pending_birth_date or '' }}" placeholder="例如：民國066年01月02日">
+            </div>
+            <div class="col-md-2">
+              <label class="form-label">民國年</label>
+              <input type="text" name="pending_birth_year" class="form-control" value="{{ case_data.deed_ai_pending_birth_year or '' }}">
+            </div>
+            <div class="col-md-2">
+              <label class="form-label">月</label>
+              <input type="text" name="pending_birth_month" class="form-control" value="{{ case_data.deed_ai_pending_birth_month or '' }}">
+            </div>
+            <div class="col-md-2">
+              <label class="form-label">日</label>
+              <input type="text" name="pending_birth_day" class="form-control" value="{{ case_data.deed_ai_pending_birth_day or '' }}">
+            </div>
+            <div class="col-12">
+              <label class="form-label">住址</label>
+              <input type="text" name="pending_address" class="form-control" value="{{ case_data.deed_ai_pending_address or '' }}">
+            </div>
+          </div>
+
+          {% if case_data.deed_ai_pending_note %}
+            <div class="small text-muted mt-3" style="white-space:pre-wrap;">AI 說明：{{ case_data.deed_ai_pending_note }}</div>
+          {% endif %}
+
+          <div class="form-check mt-3">
+            <input class="form-check-input" type="checkbox" value="1" name="overwrite_existing" id="overwriteExisting">
+            <label class="form-check-label small" for="overwriteExisting">
+              覆蓋原本已有欄位（預設不勾選，只補空白欄位）
+            </label>
+          </div>
+        </div>
+        <div class="card-footer">
+          <button class="btn btn-success" type="submit" {% if not pending_available %}disabled{% endif %}>確認並套用 AI 結果</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="col-lg-5">
+    <div class="card mb-3">
+      <div class="card-header fw-bold">目前案件表資料</div>
+      <div class="card-body">
+        <table class="table table-sm align-middle">
+          <tbody>
+            <tr><th style="width:170px;">謄本檔名</th><td>{{ case_data.deed_pdf_filename or '-' }}</td></tr>
+            <tr><th>分析方式</th><td>{{ case_data.deed_analysis_source or '-' }}</td></tr>
+            <tr><th>所有權人</th><td>{{ case_data.deed_owner or case_data.owner_name or '-' }}</td></tr>
+            <tr><th>統一編號</th><td>{{ case_data.owner_identity_no or case_data.owner_id or '-' }}</td></tr>
+            <tr><th>出生日期</th><td>{{ case_data.owner_birth_date or '-' }}</td></tr>
+            <tr><th>住址</th><td>{{ case_data.owner_household_address or case_data.registered_address or case_data.household_address or '-' }}</td></tr>
+            <tr><th>基地面積（肉地/1分之1）</th><td>{{ case_data.base_land_ping or '-' }} 坪</td></tr>
+            <tr><th>持分面積（非1分之1）</th><td>{{ case_data.land_share_ping or '-' }} 坪</td></tr>
+            <tr><th>實際持有土地合計</th><td>{{ case_data.land_ping or '-' }} 坪</td></tr>
+            <tr><th>AI 狀態</th><td>{{ case_data.deed_ai_status or '-' }}</td></tr>
+          </tbody>
+        </table>
+        {% if case_data.deed_parsed_note %}
+          <pre class="small mb-0 bg-light p-2 rounded" style="white-space:pre-wrap;max-height:260px;overflow:auto;">{{ case_data.deed_parsed_note }}</pre>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header fw-bold">地籍圖解析</div>
+      <div class="card-body small">
+        <div><strong>檔名：</strong>{{ case_data.cadastral_pdf_filename or '-' }}</div>
+        <div><strong>方式：</strong>{{ case_data.cadastral_analysis_source or '原本解析，未呼叫 Gemini' }}</div>
+        <div><strong>地號：</strong>{{ case_data.cadastral_lot or '-' }}</div>
+        <div><strong>比例尺：</strong>{{ case_data.cadastral_scale or '-' }}</div>
+        <div class="text-muted mt-2">v23 的步驟①不執行地籍圖 Gemini vision，避免長時間請求影響案件表。</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const button = document.getElementById('ownerAiButton');
+  const box = document.getElementById('ownerAiMessage');
+  if (!button || !box) return;
+
+  function showMessage(kind, text) {
+    box.className = 'alert alert-' + kind + ' mt-3 py-2';
+    box.textContent = text;
+  }
+
+  button.addEventListener('click', async function () {
+    button.disabled = true;
+    const originalText = button.textContent;
+    button.textContent = 'AI 分析中…';
+    showMessage('info', '正在單獨分析所有權部，請稍候。');
+
+    const controller = new AbortController();
+    const timer = setTimeout(function () { controller.abort(); }, 25000);
+    try {
+      const response = await fetch({{ url_for('seller_deed_owner_ai_v23', seller_id=seller.id)|tojson }}, {
+        method: 'POST',
+        headers: {'X-Requested-With': 'XMLHttpRequest'},
+        signal: controller.signal
+      });
+      const raw = await response.text();
+      let result = null;
+      try {
+        result = JSON.parse(raw);
+      } catch (jsonError) {
+        throw new Error(raw || ('伺服器回傳 HTTP ' + response.status));
+      }
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || ('AI 補抓失敗，HTTP ' + response.status));
+      }
+      showMessage('success', result.message || 'AI 補抓完成，正在更新頁面。');
+      setTimeout(function () { window.location.reload(); }, 700);
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        showMessage('danger', 'AI 等待超過 25 秒，已停止等待。原本解析資料不受影響。');
+      } else {
+        showMessage('danger', 'AI 補抓失敗：' + (error && error.message ? error.message : String(error)));
+      }
+      button.disabled = false;
+      button.textContent = originalText;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+})();
+</script>
+{% endblock %}
+"""
+
+
+_CASE_V23_OWNER_LABELS = {
+    "owner_name": "所有權人",
+    "owner_id": "統一編號／身分證字號",
+    "owner_birth_date": "出生日期",
+    "owner_household_address": "住址",
+}
+
+_CASE_V23_PENDING_FIELDS = [
+    "deed_ai_pending_owner_name",
+    "deed_ai_pending_owner_id",
+    "deed_ai_pending_birth_date",
+    "deed_ai_pending_birth_year",
+    "deed_ai_pending_birth_month",
+    "deed_ai_pending_birth_day",
+    "deed_ai_pending_address",
+    "deed_ai_pending_note",
+    "deed_ai_pending_missing_fields",
+    "deed_ai_pending_at",
+]
+
+
+def _case_v23_json(payload, status=200):
+    return Response(
+        json.dumps(payload or {}, ensure_ascii=False),
+        status=status,
+        content_type="application/json; charset=utf-8",
+    )
+
+
+def _case_v23_strict_owner_data(seller: dict):
+    """只使用謄本/所有權人專用欄位，不把一般聯絡地址誤當成謄本住址。"""
+    source = seller or {}
+    return {
+        "owner_name": source.get("owner_name") or source.get("deed_owner") or "",
+        "deed_owner": source.get("deed_owner") or source.get("owner_name") or "",
+        "owner_id": source.get("owner_id") or source.get("owner_identity_no") or source.get("identity_no") or "",
+        "owner_identity_no": source.get("owner_identity_no") or source.get("owner_id") or source.get("identity_no") or "",
+        "owner_birth_date": source.get("owner_birth_date") or source.get("birth_date") or "",
+        "owner_birth_year": source.get("owner_birth_year") or "",
+        "owner_birth_month": source.get("owner_birth_month") or "",
+        "owner_birth_day": source.get("owner_birth_day") or "",
+        "owner_household_address": source.get("owner_household_address") or "",
+        "registered_address": source.get("registered_address") or "",
+        "household_address": source.get("household_address") or "",
+    }
+
+
+def _case_v23_rules_only_deed_item(item: dict):
+    """只執行原本謄本規則，不允許任何 Gemini 呼叫。"""
+    from deed_case_form_tool import parse_deed_text, parse_owner_personal_info
+
+    raw_text = str((item or {}).get("text") or "")
+    try:
+        parsed = parse_deed_text(raw_text) if raw_text else {"case_data": {}}
+    except Exception as exc:
+        parsed = {"case_data": {}, "parse_error": str(exc)}
+
+    case_data = dict((parsed.get("case_data") or {}))
+    try:
+        owner_info = parse_owner_personal_info(raw_text)
+        for key, value in (owner_info or {}).items():
+            if str(value or "").strip() and not str(case_data.get(key) or "").strip():
+                case_data[key] = value
+    except Exception as exc:
+        case_data["deed_rule_status"] = f"規則解析所有權人失敗：{exc}"
+
+    normalized = _case_v19_normalize_owner_ai_data(case_data)
+    for key, value in normalized.items():
+        if str(value or "").strip():
+            case_data[key] = value
+
+    missing = _case_v22_owner_missing_fields(case_data)
+    if missing:
+        labels = [_CASE_V23_OWNER_LABELS.get(key, key) for key in missing]
+        case_data["deed_ai_status"] = "原本規則解析完成，尚缺：" + "、".join(labels)
+    else:
+        case_data["deed_ai_status"] = "原本規則解析已完整，未呼叫 Gemini"
+    case_data["deed_analysis_source"] = "原本PDF文字／OCR／規則解析（未呼叫Gemini）"
+
+    parsed["case_data"] = case_data
+    parsed["owner_missing_after_rule"] = missing
+    return parsed
+
+
+def _case_v23_rules_only_cadastral_item(item: dict):
+    """地籍圖在第一步也只做原本文字解析，避免任何 AI 長請求。"""
+    from deed_case_form_tool import parse_deed_text
+
+    raw_text = str((item or {}).get("text") or "")
+    try:
+        parsed = parse_deed_text(raw_text) if raw_text else {"case_data": {}}
+    except Exception as exc:
+        parsed = {"case_data": {}, "parse_error": str(exc)}
+    case_data = dict((parsed.get("case_data") or {}))
+    case_data["cadastral_ai_status"] = "v23 原本解析階段未呼叫 Gemini"
+    case_data["cadastral_analysis_source"] = "原本PDF文字解析（未呼叫Gemini）"
+    parsed["case_data"] = case_data
+    return parsed
+
+
+def _case_v23_merge_deed_rules_only(items: list):
+    merged = {"case_data": {}, "parts": []}
+    raw_texts = []
+    filenames = []
+    sum_keys = {
+        "base_land_ping", "land_share_ping", "land_ping", "total_land_raw_ping",
+        "base_land_m2", "land_share_m2",
+    }
+    sums = {key: 0.0 for key in sum_keys}
+    has_sum = {key: False for key in sum_keys}
+    lot_values = []
+    notes = []
+    statuses = []
+
+    def add_number(key, value):
+        try:
+            number = float(str(value).replace(",", "").strip())
+        except Exception:
+            return
+        sums[key] += number
+        has_sum[key] = True
+
+    for item in items or []:
+        parsed = _case_v23_rules_only_deed_item(item)
+        merged["parts"].append(parsed)
+        case_part = parsed.get("case_data") or {}
+        for key, value in _case_v19_nonempty(case_part).items():
+            if key in sum_keys:
+                add_number(key, value)
+                continue
+            if key == "land_lot_no":
+                lot_values.extend([
+                    x.strip() for x in re.split(r"[、,，]+", str(value)) if x.strip()
+                ])
+                continue
+            if key == "deed_parsed_note":
+                notes.append(str(value).strip())
+                continue
+            if key == "deed_ai_status":
+                statuses.append(str(value).strip())
+                continue
+            if not str(merged["case_data"].get(key) or "").strip():
+                merged["case_data"][key] = value
+        if item.get("text"):
+            raw_texts.append(str(item.get("text")))
+        if item.get("filename"):
+            filenames.append(str(item.get("filename")))
+
+    for key in sum_keys:
+        if has_sum[key]:
+            merged["case_data"][key] = (f"{sums[key]:.4f}").rstrip("0").rstrip(".")
+    if lot_values:
+        merged["case_data"]["land_lot_no"] = "、".join(dict.fromkeys(lot_values))
+    if notes:
+        merged["case_data"]["deed_parsed_note"] = "\n\n".join(dict.fromkeys(notes))
+    if statuses:
+        merged["case_data"]["deed_ai_status"] = "；".join(dict.fromkeys(statuses))
+    merged["case_data"]["deed_analysis_source"] = "原本PDF文字／OCR／規則解析（未呼叫Gemini）"
+    return (
+        merged,
+        "\n\n---謄本分隔---\n\n".join(raw_texts),
+        "+".join(filenames),
+    )
+
+
+def _case_v23_merge_cadastral_rules_only(items: list):
+    merged = {"case_data": {}, "parts": []}
+    raw_texts = []
+    filenames = []
+    allowed = {
+        "cadastral_lot", "cadastral_scale", "cadastral_road_access", "cadastral_note",
+        "facing", "building_facing", "road_width", "estimated_road_width",
+        "cadastral_road_width", "cadastral_ai_status", "cadastral_analysis_source",
+    }
+    for item in items or []:
+        parsed = _case_v23_rules_only_cadastral_item(item)
+        merged["parts"].append(parsed)
+        for key, value in _case_v19_nonempty(parsed.get("case_data") or {}).items():
+            if key in allowed and str(value or "").strip():
+                merged["case_data"][key] = value
+        if item.get("text"):
+            raw_texts.append(str(item.get("text")))
+        if item.get("filename"):
+            filenames.append(str(item.get("filename")))
+    merged["case_data"]["cadastral_ai_status"] = "v23 原本解析階段未呼叫 Gemini"
+    merged["case_data"]["cadastral_analysis_source"] = "原本PDF文字解析（未呼叫Gemini）"
+    return (
+        merged,
+        "\n\n---地籍圖分隔---\n\n".join(raw_texts),
+        "+".join(filenames),
+    )
+
+
+def _case_v23_apply_rules_result(seller_id: str, deed_result=None, cadastral_result=None):
+    updates = {}
+
+    if deed_result:
+        deed_parsed, deed_raw_text, deed_filename = deed_result
+        deed_case = _case_v19_nonempty((deed_parsed or {}).get("case_data") or {})
+        updates.update(deed_case)
+        if deed_raw_text:
+            updates["deed_raw_text"] = deed_raw_text[:30000]
+        if deed_filename:
+            updates["deed_pdf_filename"] = deed_filename
+        try:
+            updates["deed_parsed_json"] = json.dumps(deed_parsed, ensure_ascii=False)[:60000]
+        except Exception:
+            pass
+        updates["deed_parsed_at"] = now_taipei().isoformat()
+        updates["deed_analysis_source"] = "原本PDF文字／OCR／規則解析（未呼叫Gemini）"
+
+    if cadastral_result:
+        cadastral_parsed, cadastral_raw_text, cadastral_filename = cadastral_result
+        cadastral_case = _case_v19_nonempty((cadastral_parsed or {}).get("case_data") or {})
+        allowed = {
+            "cadastral_lot", "cadastral_scale", "cadastral_road_access", "cadastral_note",
+            "facing", "building_facing", "road_width", "estimated_road_width",
+            "cadastral_road_width", "cadastral_ai_status", "cadastral_analysis_source",
+        }
+        for key, value in cadastral_case.items():
+            if key in allowed and str(value or "").strip():
+                updates[key] = value
+        if cadastral_raw_text:
+            updates["cadastral_raw_text"] = cadastral_raw_text[:30000]
+        if cadastral_filename:
+            updates["cadastral_pdf_filename"] = cadastral_filename
+        try:
+            updates["cadastral_parsed_json"] = json.dumps(cadastral_parsed, ensure_ascii=False)[:60000]
+        except Exception:
+            pass
+        updates["cadastral_parsed_at"] = now_taipei().isoformat()
+        updates["cadastral_analysis_source"] = "原本PDF文字解析（未呼叫Gemini）"
+
+    safe_updates = _case_v21_safe_upload_updates(updates)
+    if not safe_updates:
+        raise RuntimeError("沒有可儲存的解析資料。")
+
+    # 新謄本重新解析後，舊的 AI 暫存結果必須清空，避免誤套用到另一份謄本。
+    if deed_result:
+        for key in _CASE_V23_PENDING_FIELDS:
+            safe_updates[key] = ""
+
+    return _case_apply_ai_to_seller(seller_id, safe_updates, {})
+
+
+def _case_v23_owner_prompt(owner_section: str, missing_fields: list):
+    labels = [_CASE_V23_OWNER_LABELS.get(key, key) for key in missing_fields]
+    return f"""
+你是台灣不動產登記謄本的欄位補抓助手。
+系統已先執行原本規則解析，現在只缺少：{'、'.join(labels)}。
+
+只能分析下方提供的「土地／建物所有權部」局部文字：
+- 只填缺少欄位，文件沒有或看不清楚就留空，禁止猜測。
+- 不可把土地坐落、建物門牌或物件地址當成所有權人住址。
+- 不可把抵押權人、債權人、銀行或代理人當成所有權人。
+- 統一編號只接受台灣自然人身分證格式：英文字母加 9 位數字。
+- 出生日期使用民國年月日，並拆成年、月、日。
+- 只輸出 JSON，不要 markdown，不要其他說明。
+
+輸出 JSON：
+{{
+  "owner_name": "",
+  "owner_id": "",
+  "owner_identity_no": "",
+  "owner_birth_date": "",
+  "owner_birth_year": "",
+  "owner_birth_month": "",
+  "owner_birth_day": "",
+  "owner_household_address": "",
+  "deed_ai_note": ""
+}}
+
+【所有權部局部文字】
+{str(owner_section or '')[:6000]}
+""".strip()
+
+
+def _case_v23_gemini_owner_once(owner_section: str, missing_fields: list):
+    """只使用一次 REST 請求；不呼叫共用 helper、不做第二次 fallback。"""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("尚未設定 GEMINI_API_KEY")
+
+    model = os.environ.get(
+        "GEMINI_CASE_OWNER_MODEL",
+        os.environ.get("GEMINI_MODEL", globals().get("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash")),
+    ).strip() or "gemini-2.5-flash"
+    try:
+        timeout_seconds = float(os.environ.get("CASE_OWNER_AI_TIMEOUT", "18"))
+    except Exception:
+        timeout_seconds = 18.0
+    timeout_seconds = max(5.0, min(timeout_seconds, 22.0))
+
+    prompt = _case_v23_owner_prompt(owner_section, missing_fields)
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": prompt}],
+        }],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 600,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    import urllib.request
+    import urllib.error
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:1200]
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"Gemini HTTP {exc.code}：{detail or exc.reason}")
+    except Exception as exc:
+        raise RuntimeError(f"Gemini 單次分析失敗：{exc}")
+
+    parts = (((body.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+    text = "\n".join(str(part.get("text") or "") for part in parts)
+    data = _case_v19_ai_json_loads(text)
+    if not isinstance(data, dict) or not data:
+        raise RuntimeError("Gemini 回傳內容無法解析成 JSON")
+    return data
+
+
+def _case_v23_pending_from_ai(ai_data: dict, missing_fields: list):
+    normalized = _case_v19_normalize_owner_ai_data(ai_data)
+    missing = set(missing_fields or [])
+    pending = {}
+
+    if "owner_name" in missing and normalized.get("owner_name"):
+        pending["deed_ai_pending_owner_name"] = normalized.get("owner_name")
+    if "owner_id" in missing and (normalized.get("owner_id") or normalized.get("owner_identity_no")):
+        pending["deed_ai_pending_owner_id"] = normalized.get("owner_id") or normalized.get("owner_identity_no")
+    if "owner_birth_date" in missing:
+        for source_key, target_key in (
+            ("owner_birth_date", "deed_ai_pending_birth_date"),
+            ("owner_birth_year", "deed_ai_pending_birth_year"),
+            ("owner_birth_month", "deed_ai_pending_birth_month"),
+            ("owner_birth_day", "deed_ai_pending_birth_day"),
+        ):
+            if normalized.get(source_key):
+                pending[target_key] = normalized.get(source_key)
+    if "owner_household_address" in missing:
+        address = (
+            normalized.get("owner_household_address")
+            or normalized.get("registered_address")
+            or normalized.get("household_address")
+        )
+        if address:
+            pending["deed_ai_pending_address"] = address
+    note = _case_v19_scalar_text((ai_data or {}).get("deed_ai_note"), 2000)
+    if note:
+        pending["deed_ai_pending_note"] = note
+    return pending
+
+
+@login_required
+def seller_deed_owner_ai_v23(seller_id):
+    """獨立 AJAX：只做所有權部 Gemini 補抓，任何錯誤都回 JSON，不影響案件表頁面。"""
+    error_id = uuid4().hex[:8]
+    try:
+        snap = db.collection("sellers").document(seller_id).get()
+        if not snap.exists:
+            return _case_v23_json({"success": False, "message": "找不到這筆委託。"}, 404)
+        seller = doc_to_dict(snap) or {"id": seller_id}
+        case_data = _case_v23_strict_owner_data(seller)
+        missing_fields = _case_v22_owner_missing_fields(case_data)
+        if not missing_fields:
+            return _case_v23_json({"success": True, "message": "四項資料已完整，不需要 AI 補抓。"})
+
+        raw_text = _case_v19_scalar_text(seller.get("deed_raw_text"), 30000)
+        if not raw_text:
+            return _case_v23_json({"success": False, "message": "尚未保存謄本文字，請先執行原本解析。"})
+        owner_section = _case_v22_extract_owner_section_text(raw_text, max_chars=6000)
+        if not owner_section:
+            return _case_v23_json({
+                "success": False,
+                "message": "無法在謄本文字中定位所有權部。可將所有權部 OCR 文字貼入後重新執行原本解析。",
+            })
+
+        ai_data = _case_v23_gemini_owner_once(owner_section, missing_fields)
+        pending = _case_v23_pending_from_ai(ai_data, missing_fields)
+        actual_fields = [key for key in pending if key not in {"deed_ai_pending_note"}]
+        if not actual_fields:
+            message = "Gemini 已完成分析，但缺少欄位仍無法辨識，未寫入正式案件資料。"
+            db.collection("sellers").document(seller_id).set({
+                "deed_ai_status": message,
+                "deed_ai_pending_note": _case_v19_scalar_text((ai_data or {}).get("deed_ai_note"), 2000),
+                "deed_ai_last_error_id": error_id,
+                "updated_at": now_taipei().isoformat(),
+            }, merge=True)
+            return _case_v23_json({"success": False, "message": message})
+
+        for key in _CASE_V23_PENDING_FIELDS:
+            if key not in pending:
+                pending[key] = ""
+        pending["deed_ai_pending_missing_fields"] = ",".join(missing_fields)
+        pending["deed_ai_pending_at"] = now_taipei().isoformat()
+        found_labels = []
+        if pending.get("deed_ai_pending_owner_name"):
+            found_labels.append("所有權人")
+        if pending.get("deed_ai_pending_owner_id"):
+            found_labels.append("統一編號")
+        if pending.get("deed_ai_pending_birth_date") or pending.get("deed_ai_pending_birth_year"):
+            found_labels.append("出生日期")
+        if pending.get("deed_ai_pending_address"):
+            found_labels.append("住址")
+        pending["deed_ai_status"] = "AI 補抓完成，等待人工確認：" + "、".join(found_labels)
+        pending["updated_at"] = now_taipei().isoformat()
+        pending["updated_by_id"] = session.get("user_id") or "web"
+        pending["updated_by_name"] = session.get("user_name") or "Web"
+        db.collection("sellers").document(seller_id).set(pending, merge=True)
+
+        print(f"✅ CASE_FORM_V23 owner AI pending seller={seller_id} fields={found_labels}")
+        return _case_v23_json({
+            "success": True,
+            "message": "AI 補抓完成：" + "、".join(found_labels) + "。請確認後再套用。",
+        })
+    except Exception as exc:
+        import traceback
+        print(f"❌ CASE_FORM_V23 owner AI failure [{error_id}] seller_id={seller_id}: {exc}")
+        traceback.print_exc()
+        try:
+            db.collection("sellers").document(seller_id).set({
+                "deed_ai_status": f"AI 補抓失敗（錯誤編號 {error_id}）：{exc}",
+                "deed_ai_last_error_id": error_id,
+                "updated_at": now_taipei().isoformat(),
+            }, merge=True)
+        except Exception:
+            pass
+        return _case_v23_json({
+            "success": False,
+            "message": f"AI 補抓失敗（錯誤編號 {error_id}）：{exc}",
+        })
+
+
+@login_required
+def seller_deed_owner_ai_apply_v23(seller_id):
+    """快速請求：把使用者確認過的 AI 暫存值套用到正式案件欄位。"""
+    try:
+        snap = db.collection("sellers").document(seller_id).get()
+        if not snap.exists:
+            flash("找不到這筆委託", "danger")
+            return redirect(url_for("sellers"))
+        seller = doc_to_dict(snap) or {"id": seller_id}
+        current = _case_v23_strict_owner_data(seller)
+        overwrite = str(request.form.get("overwrite_existing") or "") == "1"
+
+        source = {
+            "owner_name": request.form.get("pending_owner_name") or seller.get("deed_ai_pending_owner_name") or "",
+            "owner_id": request.form.get("pending_owner_id") or seller.get("deed_ai_pending_owner_id") or "",
+            "owner_birth_date": request.form.get("pending_birth_date") or seller.get("deed_ai_pending_birth_date") or "",
+            "owner_birth_year": request.form.get("pending_birth_year") or seller.get("deed_ai_pending_birth_year") or "",
+            "owner_birth_month": request.form.get("pending_birth_month") or seller.get("deed_ai_pending_birth_month") or "",
+            "owner_birth_day": request.form.get("pending_birth_day") or seller.get("deed_ai_pending_birth_day") or "",
+            "owner_household_address": request.form.get("pending_address") or seller.get("deed_ai_pending_address") or "",
+        }
+        normalized = _case_v19_normalize_owner_ai_data(source)
+        pending_missing = {
+            item for item in str(seller.get("deed_ai_pending_missing_fields") or "").split(",") if item
+        }
+        if not pending_missing:
+            pending_missing = set(_case_v22_owner_missing_fields(current))
+
+        updates = {}
+
+        def can_apply(group_key, existing_value):
+            return group_key in pending_missing and (overwrite or not str(existing_value or "").strip())
+
+        if normalized.get("owner_name") and can_apply(
+            "owner_name", current.get("owner_name") or current.get("deed_owner")
+        ):
+            updates["owner_name"] = normalized.get("owner_name")
+            updates["deed_owner"] = normalized.get("owner_name")
+
+        identity = normalized.get("owner_id") or normalized.get("owner_identity_no")
+        if identity and can_apply(
+            "owner_id", current.get("owner_id") or current.get("owner_identity_no")
+        ):
+            updates["owner_id"] = identity
+            updates["owner_identity_no"] = identity
+            if normalized.get("owner_gender"):
+                updates["owner_gender"] = normalized.get("owner_gender")
+
+        has_existing_birth = (
+            current.get("owner_birth_date")
+            or (
+                current.get("owner_birth_year")
+                and current.get("owner_birth_month")
+                and current.get("owner_birth_day")
+            )
+        )
+        if can_apply("owner_birth_date", has_existing_birth):
+            for key in (
+                "owner_birth_date", "owner_birth_year", "owner_birth_month", "owner_birth_day",
+            ):
+                if normalized.get(key):
+                    updates[key] = normalized.get(key)
+
+        address = (
+            normalized.get("owner_household_address")
+            or normalized.get("registered_address")
+            or normalized.get("household_address")
+        )
+        existing_address = (
+            current.get("owner_household_address")
+            or current.get("registered_address")
+            or current.get("household_address")
+        )
+        if address and can_apply("owner_household_address", existing_address):
+            updates["owner_household_address"] = address
+            updates["registered_address"] = address
+            updates["household_address"] = address
+
+        if not updates:
+            flash("沒有可套用的 AI 欄位。預設只補空白；需要覆蓋時請勾選覆蓋選項。", "warning")
+            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+
+        updates["deed_ai_status"] = "AI 補抓結果已由人工確認並套用"
+        updates["deed_analysis_source"] = "原本PDF文字／OCR／規則解析 + Gemini所有權部補抓（人工確認）"
+        updates["deed_ai_applied_at"] = now_taipei().isoformat()
+        updates["case_form_updated_at"] = now_taipei().isoformat()
+        updates["updated_at"] = now_taipei().isoformat()
+        updates["updated_by_id"] = session.get("user_id") or "web"
+        updates["updated_by_name"] = session.get("user_name") or "Web"
+        db.collection("sellers").document(seller_id).set(updates, merge=True)
+        flash("AI 所有權人資料已確認並套用。", "success")
+        print(f"✅ CASE_FORM_V23 owner AI applied seller={seller_id} fields={sorted(updates.keys())}")
+    except Exception as exc:
+        import traceback
+        error_id = uuid4().hex[:8]
+        print(f"❌ CASE_FORM_V23 apply failure [{error_id}] seller_id={seller_id}: {exc}")
+        traceback.print_exc()
+        flash(f"套用 AI 結果失敗（錯誤編號 {error_id}）：{exc}", "danger")
+    return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+
+
+@login_required
+def seller_deed_case_form_v23(seller_id):
+    """v23 主頁：上傳解析永遠不呼叫 Gemini。"""
+    try:
+        snap = db.collection("sellers").document(seller_id).get()
+        if not snap.exists:
+            flash("找不到這筆委託", "danger")
+            return redirect(url_for("sellers"))
+        seller = doc_to_dict(snap) or {"id": seller_id}
+    except Exception as exc:
+        error_id = uuid4().hex[:8]
+        print(f"❌ CASE_FORM_V23 read failure [{error_id}] seller_id={seller_id}: {exc}")
+        return (
+            "<meta charset='utf-8'><div style='font-family:sans-serif;padding:28px'>"
+            f"<h3>案件資料讀取失敗</h3><p>錯誤編號：{error_id}</p></div>",
+            500,
+        )
+
+    if request.method == "POST":
+        action = request.form.get("action", "parse")
+        try:
+            items = _case_v19_collect_upload_items()
+            if not items:
+                raise RuntimeError("請選擇謄本或地籍圖檔案，或貼上謄本 OCR 文字。")
+
+            deed_items = []
+            cadastral_items = []
+            for item in items:
+                file_type = item.get("forced_type") or _case_v19_classify_file(
+                    item.get("filename"), item.get("text")
+                )
+                if file_type == "cadastral":
+                    cadastral_items.append(item)
+                else:
+                    deed_items.append(item)
+
+            deed_result = _case_v23_merge_deed_rules_only(deed_items) if deed_items else None
+            cadastral_result = (
+                _case_v23_merge_cadastral_rules_only(cadastral_items) if cadastral_items else None
+            )
+            saved = _case_v23_apply_rules_result(
+                seller_id,
+                deed_result=deed_result,
+                cadastral_result=cadastral_result,
+            )
+            parts = []
+            if deed_result:
+                parts.append("謄本原本規則解析")
+            if cadastral_result:
+                parts.append("地籍圖原本文字解析")
+            flash("已完成並儲存：" + " + ".join(parts) + "（未呼叫 Gemini）", "success")
+            print(f"✅ CASE_FORM_V23 rules saved seller={seller_id} fields={sorted(saved.keys())}")
+
+            if action == "parse_and_download":
+                return redirect(url_for("seller_case_form_filled_pdf", seller_id=seller_id))
+            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+        except Exception as exc:
+            import traceback
+            error_id = uuid4().hex[:8]
+            print(f"❌ CASE_FORM_V23 parse failure [{error_id}] seller_id={seller_id}: {exc}")
+            traceback.print_exc()
+            flash(f"原本解析失敗（錯誤編號 {error_id}）：{exc}", "danger")
+            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+
+    try:
+        case_data = _case_merge_seller_and_case_data(seller)
+        for key in _CASE_V23_PENDING_FIELDS:
+            case_data[key] = _case_v19_scalar_text(seller.get(key), 8000)
+        for key, value in list(case_data.items()):
+            if isinstance(value, (dict, list, tuple, set, bytes, bytearray)) and key != "ai_selling_points":
+                case_data[key] = ""
+
+        missing_fields = _case_v22_owner_missing_fields(_case_v23_strict_owner_data(seller))
+        missing_labels = [_CASE_V23_OWNER_LABELS.get(key, key) for key in missing_fields]
+        pending_available = any(
+            str(case_data.get(key) or "").strip()
+            for key in (
+                "deed_ai_pending_owner_name", "deed_ai_pending_owner_id",
+                "deed_ai_pending_birth_date", "deed_ai_pending_birth_year",
+                "deed_ai_pending_address",
+            )
+        )
+        return render_template_string(
+            CASE_FORM_V23_UPLOAD_HTML,
+            seller=seller,
+            case_data=case_data,
+            ai_enabled=_case_v19_ai_available(),
+            owner_missing_labels=missing_labels,
+            pending_available=pending_available,
+        )
+    except Exception as exc:
+        import html
+        import traceback
+        error_id = uuid4().hex[:8]
+        print(f"❌ CASE_FORM_V23 render failure [{error_id}] seller_id={seller_id}: {exc}")
+        traceback.print_exc()
+        return (
+            "<meta charset='utf-8'><div style='font-family:Arial,sans-serif;padding:28px;max-width:760px;margin:auto'>"
+            "<h2>案件表頁面顯示失敗</h2>"
+            f"<p>錯誤編號：<b>{error_id}</b></p>"
+            f"<p style='white-space:pre-wrap'>{html.escape(str(exc))}</p>"
+            f"<p><a href='/sellers/{seller_id}'>回委託詳細</a></p>"
+            "</div>",
+            200,
+        )
+
+
+try:
+    # 主入口與舊入口全部切換到 v23。
+    app.view_functions["seller_deed_case_form"] = seller_deed_case_form_v23
+    legacy_rule = "/sellers/<seller_id>/case-form/edit"
+    for rule in list(app.url_map.iter_rules()):
+        if rule.rule == legacy_rule:
+            app.view_functions[rule.endpoint] = seller_deed_case_form_v23
+
+    if "seller_deed_owner_ai_v23" not in app.view_functions:
+        app.add_url_rule(
+            "/sellers/<seller_id>/deed-owner-ai",
+            endpoint="seller_deed_owner_ai_v23",
+            view_func=seller_deed_owner_ai_v23,
+            methods=["POST"],
+        )
+    if "seller_deed_owner_ai_apply_v23" not in app.view_functions:
+        app.add_url_rule(
+            "/sellers/<seller_id>/deed-owner-ai/apply",
+            endpoint="seller_deed_owner_ai_apply_v23",
+            view_func=seller_deed_owner_ai_apply_v23,
+            methods=["POST"],
+        )
+    print("✅ CASE_FORM_V23：原本解析 / AI補抓 / 人工確認套用三段式已啟用")
+except Exception as exc:
+    print("⚠️ CASE_FORM_V23 路由註冊失敗：", exc)
+
+# =============================================================================
+# CASE_FORM_V23 Patch End
+# =============================================================================
