@@ -1,4 +1,4 @@
-from io import BytesIO
+﻿from io import BytesIO
 # -*- coding: utf-8 -*-
 # ✅ FULL_READY_20260621：包含 /line-card-preview、/line_card_preview、/debug/routes
 """
@@ -39958,6 +39958,251 @@ print('✅ Team M.E v31 已啟用：物件頁瀏覽器解析錯誤顯示／每�
 # Team M.E v31 End
 # =============================================================================
 
+
+
+# =============================================================================
+# Team M.E v33｜每日新上架快速查詢 + 市場資料即時備援
+#
+# 原 v31 每次開頁會讀 3000 property_alert_items、5000 listings、1000 scopes、
+# 300 runs，造成頁面很慢。v33 改為日期範圍查詢，且公開集合尚未同步時，
+# 直接從同日期的 property_radar_listings 顯示具有實際網址的新物件。
+# =============================================================================
+
+def _v33_clean_url_value(value):
+    import html as _html
+    from urllib.parse import urljoin
+    text = _html.unescape(str(value or '')).replace('\\u0026', '&').replace('&amp;', '&').strip()
+    if text.startswith('//'): text = 'https:' + text
+    elif text.startswith('/'):
+        text = urljoin('https://sale.591.com.tw', text)
+    return text
+
+
+def _v33_walk_values(value, path='', depth=0):
+    if depth > 5: return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f'{path}.{key}' if path else str(key)
+            yield from _v33_walk_values(child, child_path, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value[:100]):
+            yield from _v33_walk_values(child, f'{path}[{index}]', depth + 1)
+    elif isinstance(value, str):
+        yield path, value
+
+
+def _v33_actual_listing_url(data):
+    import re
+    source = str(data.get('market_scope_source') or data.get('source_platform') or data.get('platform') or data.get('source') or '').lower()
+    expected = ''
+    match = re.search(r'(\d{5,})', str(data.get('source_listing_id') or data.get('listing_key') or ''))
+    if match: expected = match.group(1)
+    candidates = []
+    for path, raw in _v33_walk_values(data or {}):
+        lower_path = path.lower(); value = _v33_clean_url_value(raw); lower = value.lower()
+        if not value.startswith(('http://','https://')): continue
+        if '591' in source or '591.com.tw' in lower:
+            matched = re.search(r'/home/house/detail/(?:[^/?#]+/)*(\d+)\.html(?:[?#]|$)', value, flags=re.I)
+            if not matched: continue
+            listing_id = matched.group(1)
+            if expected and listing_id != expected: continue
+            score = 100 + (20 if 'itm_source=sale' in lower else 0) + (20 if 'filter_results' in lower else 0)
+            if any(token in lower_path for token in ('anchor','href','captured_detail_url')): score += 20
+            candidates.append((score, value))
+        elif 'rakuya' in source or 'rakuya.com.tw' in lower:
+            matched = re.search(r'(?:[?&]ehid=)([A-Za-z0-9_-]+)', value, flags=re.I)
+            if not matched: continue
+            score = 110 if '/sell_item/info' in lower else 100 if '/sell/info' in lower else 80
+            candidates.append((score, value))
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+    # 樂屋允許官方 ehid detail path；591 不用 ID 重組網址。
+    if 'rakuya' in source:
+        ehid = str(data.get('source_listing_id') or '').strip()
+        if re.fullmatch(r'[A-Za-z0-9_-]{4,80}', ehid):
+            return f'https://www.rakuya.com.tw/sell_item/info?ehid={ehid}'
+    return ''
+
+
+def _v33_doc_item(doc, origin):
+    data = doc.to_dict() or {}
+    url = _v33_actual_listing_url(data)
+    if not url:
+        return None
+    first_seen_raw = data.get('first_seen_at') or data.get('created_at') or data.get('updated_at')
+    dt = _v25_iso_datetime(first_seen_raw)
+    title = data.get('title') or data.get('listing_title') or data.get('name') or '新上架物件'
+    address = data.get('address') or data.get('public_address') or data.get('property_address') or ''
+    area = data.get('district') or data.get('area') or ''
+    if not area:
+        matched = re.search(r'(沙鹿|清水|梧棲|龍井|大甲|大肚|外埔|大安|西屯|南屯|北屯|豐原|潭子|大雅|烏日|太平|大里)區?', f'{title} {address}')
+        if matched: area = matched.group(1)
+    source = data.get('source_platform') or data.get('platform') or data.get('market_scope_source') or data.get('source') or ''
+    source = '591' if str(source).startswith('591') else 'rakuya' if str(source).startswith('rakuya') else str(source)
+    price = data.get('price') or data.get('total_price') or data.get('sale_price') or ''
+    building_area = data.get('building_area_ping') or data.get('building_area') or data.get('area_ping') or ''
+    return {
+        **data,
+        'id': doc.id,
+        'title': str(title).strip(),
+        'url': url,
+        'address': str(address).strip(),
+        'area': str(area).strip(),
+        'source_platform': source,
+        'price': price,
+        'building_area_ping': building_area,
+        'created_dt': dt,
+        'created_date': dt.strftime('%Y-%m-%d') if dt else str(first_seen_raw or '')[:10],
+        'created_display': dt.strftime('%m/%d %H:%M') if dt else str(first_seen_raw or '')[:16].replace('T',' '),
+        'display_origin': origin,
+        'url_verified_source': data.get('url_verified_source') or ('actual_dom_anchor' if source == '591' else 'actual_or_ehid_detail'),
+    }
+
+
+def _v33_day_bounds(date_text):
+    from datetime import datetime, timedelta
+    try:
+        start_dt = datetime.strptime(date_text, '%Y-%m-%d').replace(tzinfo=TAIPEI_TZ)
+    except Exception:
+        start_dt = now_taipei().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = start_dt + timedelta(days=1)
+    return start_dt.isoformat(), end_dt.isoformat()
+
+
+def _v33_query_date_docs(collection_name, date_text, *, field='first_seen_at', limit=600):
+    from google.cloud.firestore_v1.base_query import FieldFilter
+    start, end = _v33_day_bounds(date_text)
+    try:
+        query = (
+            db.collection(collection_name)
+            .where(filter=FieldFilter(field, '>=', start))
+            .where(filter=FieldFilter(field, '<', end))
+            .order_by(field, direction=firestore.Query.DESCENDING)
+            .limit(int(limit))
+        )
+        return list(query.stream())
+    except Exception as exc:
+        print(f'⚠️ v33 {collection_name}.{field} 日期範圍查詢失敗：', exc)
+        # 單欄位索引未完成時，僅讀最近有限筆，不再全 collection 掃描。
+        try:
+            docs = list(
+                db.collection(collection_name)
+                .order_by(field, direction=firestore.Query.DESCENDING)
+                .limit(min(int(limit), 800))
+                .stream()
+            )
+        except Exception:
+            return []
+        result = []
+        for doc in docs:
+            data = doc.to_dict() or {}
+            dt = _v25_iso_datetime(data.get(field))
+            if dt and dt.strftime('%Y-%m-%d') == date_text:
+                result.append(doc)
+        return result
+
+
+def _v33_items_for_date(date_text):
+    public_docs = _v33_query_date_docs(PROPERTY_ALERT_ITEM_COLLECTION, date_text, field='first_seen_at', limit=600)
+    market_docs = _v33_query_date_docs('property_radar_listings', date_text, field='first_seen_at', limit=800)
+    items = []
+    seen = set()
+    public_count = fallback_count = 0
+    for origin, docs in (('property_alert_items', public_docs), ('property_radar_listings 即時備援', market_docs)):
+        for doc in docs:
+            data = doc.to_dict() or {}
+            if origin.startswith('property_radar') and bool(data.get('baseline_only')):
+                continue
+            item = _v33_doc_item(doc, origin)
+            if not item or item.get('created_date') != date_text:
+                continue
+            key = str(item.get('listing_key') or item.get('source_listing_id') or item.get('url') or doc.id)
+            if key in seen: continue
+            seen.add(key); items.append(item)
+            if origin == 'property_alert_items': public_count += 1
+            else: fallback_count += 1
+    items.sort(key=lambda item: item.get('created_dt') or datetime.min.replace(tzinfo=TAIPEI_TZ), reverse=True)
+    return items, public_count, fallback_count
+
+
+def _v33_fast_status(selected_count, public_count, fallback_count):
+    summary = {}
+    try:
+        snap = db.collection('property_radar_system').document('public_page_summary').get()
+        summary = snap.to_dict() or {} if snap.exists else {}
+    except Exception:
+        summary = {}
+    latest = {}
+    if not summary:
+        try:
+            docs = list(db.collection('property_radar_runs').order_by('started_at', direction=firestore.Query.DESCENDING).limit(1).stream())
+            latest = docs[0].to_dict() or {} if docs else {}
+        except Exception:
+            latest = {}
+    status = summary.get('latest_run_status') or latest.get('status') or ''
+    started = summary.get('latest_run_started_at') or latest.get('started_at') or ''
+    saved = summary.get('latest_public_items_saved') if summary else latest.get('public_items_saved')
+    failed = summary.get('latest_public_items_failed') if summary else latest.get('public_items_failed')
+    scanned = summary.get('latest_scanned_count') if summary else latest.get('scanned_count')
+    if selected_count:
+        diagnosis = f'已載入 {selected_count} 筆新物件；公開集合 {public_count} 筆，市場即時備援 {fallback_count} 筆。'
+        level = 'success'
+    elif status == 'failed':
+        diagnosis = '最近一次 Property Radar 掃描失敗，請查看 ELLEN-PC 的 Property_Radar logs。'
+        level = 'danger'
+    elif not started:
+        diagnosis = '尚未找到最近掃描紀錄；請確認 ELLEN-PC 排程有執行。'
+        level = 'warning'
+    else:
+        diagnosis = '所選日期目前沒有具有有效物件網址的新上架資料。頁面已完成快速查詢，沒有掃描整個市場 collection。'
+        level = 'info'
+    return {
+        'diagnosis': diagnosis, 'level': level, 'latest_run': {
+            'status': status, 'started_at': started, 'scanned_count': scanned or 0,
+            'public_items_saved': saved or 0, 'public_items_failed': failed or 0,
+        },
+        'public_total': public_count, 'fallback_total': fallback_count,
+        'selected_total': selected_count, 'version': 'v33',
+    }
+
+
+@login_required
+def daily_new_properties_v33():
+    filters = {
+        'date': (request.args.get('date') or now_taipei().strftime('%Y-%m-%d')).strip(),
+        'source': (request.args.get('source') or '').strip(),
+        'area': (request.args.get('area') or '').strip(),
+        'q': (request.args.get('q') or '').strip(),
+    }
+    all_items, public_count, fallback_count = _v33_items_for_date(filters['date'])
+    items = list(all_items)
+    if filters['source']:
+        items = [item for item in items if item.get('source_platform') == filters['source']]
+    if filters['area']:
+        area = filters['area']
+        items = [item for item in items if area in (item.get('area') or '') or area in (item.get('address') or '') or area in (item.get('title') or '')]
+    if filters['q']:
+        q = filters['q'].lower()
+        items = [item for item in items if q in f"{item.get('title','')} {item.get('address','')} {item.get('url','')}".lower()]
+    source_counts = {}
+    for item in items:
+        key = item.get('source_platform') or '其他'
+        source_counts[key] = source_counts.get(key, 0) + 1
+    diagnostics = _v33_fast_status(len(all_items), public_count, fallback_count)
+    source_options = ['591', 'rakuya']
+    return render_template(
+        'new_properties_daily.html', filters=filters, items=items,
+        source_options=source_options, source_counts=source_counts,
+        diagnostics=diagnostics, available_dates=[],
+    )
+
+
+app.view_functions['daily_new_properties'] = daily_new_properties_v33
+print('✅ Team M.E v33 已啟用：每日新物件日期範圍快速查詢＋市場即時備援。')
+# =============================================================================
+# Team M.E v33 End
+# =============================================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
