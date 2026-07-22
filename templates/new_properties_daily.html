@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}每日新上架物件｜厝米 Team M.E{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-3">
+  <div>
+    <h2 class="mb-1">每日新上架物件</h2>
+    <div class="text-muted">依本機監控寫入 Firebase 的時間，查看每天新增的樂屋／591物件。</div>
+  </div>
+  <a class="btn btn-outline-secondary" href="{{ url_for('index') }}">回首頁</a>
+</div>
+
+<form method="get" class="card dashboard-card mb-4">
+  <div class="card-body">
+    <div class="row g-2 align-items-end">
+      <div class="col-6 col-md-2">
+        <label class="form-label">日期</label>
+        <input type="date" name="date" class="form-control" value="{{ filters.date }}">
+      </div>
+      <div class="col-6 col-md-2">
+        <label class="form-label">平台</label>
+        <select name="source" class="form-select">
+          <option value="">全部平台</option>
+          {% for source in source_options %}<option value="{{ source }}" {% if filters.source == source %}selected{% endif %}>{{ source }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="col-6 col-md-2">
+        <label class="form-label">區域</label>
+        <input type="text" name="area" class="form-control" value="{{ filters.area }}" placeholder="梧棲／清水">
+      </div>
+      <div class="col-6 col-md-4">
+        <label class="form-label">關鍵字</label>
+        <input type="text" name="q" class="form-control" value="{{ filters.q }}" placeholder="標題／地址／網址">
+      </div>
+      <div class="col-md-2 d-grid">
+        <button class="btn btn-primary" type="submit">查詢</button>
+      </div>
+    </div>
+  </div>
+</form>
+
+<div class="row g-3 mb-4">
+  <div class="col-6 col-md-3"><div class="card dashboard-card"><div class="card-body"><div class="small text-muted">所選日期</div><div class="fs-5 fw-bold">{{ filters.date }}</div></div></div></div>
+  <div class="col-6 col-md-3"><div class="card dashboard-card"><div class="card-body"><div class="small text-muted">新上架筆數</div><div class="fs-3 fw-bold">{{ items|length }}</div></div></div></div>
+  {% for source, count in source_counts.items() %}
+  <div class="col-6 col-md-3"><div class="card dashboard-card"><div class="card-body"><div class="small text-muted">{{ source }}</div><div class="fs-3 fw-bold">{{ count }}</div></div></div></div>
+  {% endfor %}
+</div>
+
+{% if items %}
+<div class="row g-3">
+  {% for item in items %}
+  <div class="col-12 col-lg-6">
+    <div class="card dashboard-card h-100">
+      <div class="card-body">
+        <div class="d-flex justify-content-between gap-2 mb-2">
+          <div class="fw-bold fs-5">{{ item.title }}</div>
+          <span class="badge text-bg-success align-self-start">新上架</span>
+        </div>
+        {% if item.address %}<div class="small mb-2">📍 {{ item.address }}</div>{% endif %}
+        <div class="d-flex flex-wrap gap-2 small mb-3">
+          {% if item.source_platform %}<span class="badge bg-light text-dark border">{{ item.source_platform }}</span>{% endif %}
+          {% if item.area %}<span class="badge bg-light text-dark border">{{ item.area }}</span>{% endif %}
+          {% if item.price %}<span class="badge bg-light text-dark border">{{ item.price }}</span>{% endif %}
+          {% if item.building_area_ping %}<span class="badge bg-light text-dark border">{{ item.building_area_ping }} 坪</span>{% endif %}
+          {% if item.created_display %}<span class="badge bg-light text-dark border">{{ item.created_display }}</span>{% endif %}
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+          <a href="{{ item.url }}" target="_blank" rel="noopener" class="btn btn-primary btn-sm">開啟物件</a>
+          <button type="button" class="btn btn-outline-secondary btn-sm" data-copy="{{ item.url }}">複製網址</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card dashboard-card"><div class="card-body text-center text-muted py-5">
+  所選日期目前沒有新物件。<br>
+  請確認 ELLEN-PC 的新物件監控程式有執行，並已寫入 <code>property_alert_items</code>。
+</div></div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('click', async function(e){
+  const btn=e.target.closest('[data-copy]'); if(!btn) return;
+  const text=btn.getAttribute('data-copy')||'';
+  try{await navigator.clipboard.writeText(text); const old=btn.textContent; btn.textContent='已複製'; setTimeout(()=>btn.textContent=old,1000);}catch(err){alert(text);}
+});
+</script>
+{% endblock %}

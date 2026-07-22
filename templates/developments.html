@@ -11,6 +11,7 @@
     </div>
   </div>
   <div class="d-flex gap-2 flex-wrap">
+    <a href="{{ url_for('development_route_planner') }}" class="btn btn-warning">🗺️ 安排開發路線</a>
     {% if next_action == "寄開發信" %}
       <a href="{{ url_for('development_labels_docx', q=q, current_stage=current_stage, next_action=next_action, source=source, sort_by=sort_by, show_done=show_done) }}"
          class="btn btn-primary">

@@ -29968,8 +29968,8 @@ def _development_route_safe(value):
 
 def _development_route_address(item: dict) -> str:
     for key in (
-        "address",
         "registered_address",
+        "address",
         "route_address",
         "property_address",
         "object_address",
@@ -34151,12 +34151,6 @@ except Exception as exc:
 # =============================================================================
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000") or 5000)
-    print("Routes:", app.url_map)
-    app.run(host="0.0.0.0", port=port, debug=True)
-
-
 # =============================================================================
 # v25：AI屋主回報簡潔介面 + 生成穩定化
 # - 新增 /assistant/owner-report-ai
@@ -35641,6 +35635,18 @@ def _case_v22_extract_owner_section_text(raw_text: str, max_chars: int = 14000):
     text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         return ""
+    # 電子謄本的文字層有時會把標題拆成「所 有 權 部」，先合併固定標籤。
+    for pattern, replacement in (
+        (r"土\s*地\s*所\s*有\s*權\s*部", "土地所有權部"),
+        (r"建\s*物\s*所\s*有\s*權\s*部", "建物所有權部"),
+        (r"土\s*地\s*他\s*項\s*權\s*利\s*部", "土地他項權利部"),
+        (r"建\s*物\s*他\s*項\s*權\s*利\s*部", "建物他項權利部"),
+        (r"所\s*有\s*權\s*人", "所有權人"),
+        (r"統\s*一\s*編\s*號", "統一編號"),
+        (r"出\s*生\s*(?:日\s*期|年\s*月\s*日)", "出生日期"),
+        (r"住\s*址", "住址"),
+    ):
+        text = re.sub(pattern, replacement, text)
 
     sections = []
     pattern = re.compile(
@@ -36411,9 +36417,9 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
 </div>
 
 <div class="alert alert-info small">
-  <strong>v24 三段式穩定版：</strong>
+  <strong>v25 文字＋所有權部影像補抓：</strong>
   第一步只使用原本 PDF 文字、OCR 與規則解析，完全不呼叫 Gemini；
-  第二步只有四項所有權人資料缺漏時，才獨立分析所有權部局部文字；遇到 Gemini 503/429/5xx 會自動退避重試，最後切換備援模型；
+  第二步只有四項所有權人資料缺漏時才啟動。未選檔案時分析已保存的所有權部文字；重新選擇原謄本 PDF／圖片時，會只擷取「所有權部」所在頁面區域交給 Gemini 視覺辨識；遇到 Gemini 503/429/5xx 會自動退避重試並切換備援模型；
   第三步會先顯示 AI 結果，確認後才寫入案件欄位。Gemini 失敗不會影響土地面積、案件表或原本解析結果。
 </div>
 
@@ -36443,8 +36449,14 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
       <div class="card-header fw-bold">② AI 補抓所有權人資料（獨立呼叫）</div>
       <div class="card-body">
         <p class="small text-muted mb-2">
-          只會傳送已保存的「土地／建物所有權部」局部文字，且只要求缺少的欄位；不重新分析土地面積，也不傳送完整 PDF。
+          未選檔案時只傳送已保存的「土地／建物所有權部」局部文字；若文字只抓到姓名，請在下方重新選擇同一份謄本，系統會擷取所有權部所在頁面的影像區塊，不會重新分析土地面積。
         </p>
+
+        <div class="mb-3">
+          <label class="form-label fw-bold">謄本 PDF／圖片（建議選擇，可提高出生日期、統一編號、住址辨識率）</label>
+          <input type="file" id="ownerAiFile" class="form-control" accept="application/pdf,.pdf,image/png,image/jpeg,image/webp">
+          <div class="form-text">電子謄本文字層常只抽到姓名；選擇原檔後，Gemini 會看所有權部影像。若原謄本本身以＊遮蔽個資，AI 也無法還原。</div>
+        </div>
 
         {% if owner_missing_labels %}
           <div class="alert alert-warning py-2 small">
@@ -36462,13 +36474,13 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
           type="button"
           id="ownerAiButton"
           class="btn btn-warning"
-          {% if not owner_missing_labels or not ai_enabled or not case_data.deed_raw_text %}disabled{% endif %}
+          {% if not owner_missing_labels or not ai_enabled %}disabled{% endif %}
         >AI 補抓缺少欄位</button>
         <span class="small text-muted ms-2">遇到 503 忙碌會自動重試並切換備援模型；失敗只顯示訊息，不影響原本解析。</span>
         <div id="ownerAiMessage" class="mt-3"></div>
 
         {% if not case_data.deed_raw_text %}
-          <div class="text-danger small mt-2">尚未保存謄本文字，請先執行步驟①。</div>
+          <div class="text-warning small mt-2">目前沒有可用的謄本文字；請在上方選擇原謄本 PDF／圖片，改用所有權部影像辨識。</div>
         {% endif %}
       </div>
     </div>
@@ -36563,7 +36575,7 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
         <div><strong>方式：</strong>{{ case_data.cadastral_analysis_source or '原本解析，未呼叫 Gemini' }}</div>
         <div><strong>地號：</strong>{{ case_data.cadastral_lot or '-' }}</div>
         <div><strong>比例尺：</strong>{{ case_data.cadastral_scale or '-' }}</div>
-        <div class="text-muted mt-2">v24 的步驟①不執行地籍圖 Gemini vision，避免長時間請求影響案件表。</div>
+        <div class="text-muted mt-2">v25 的步驟①不執行地籍圖 Gemini vision，避免長時間請求影響案件表。</div>
       </div>
     </div>
   </div>
@@ -36584,14 +36596,20 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
     button.disabled = true;
     const originalText = button.textContent;
     button.textContent = 'AI 分析中…';
-    showMessage('info', '正在單獨分析所有權部，請稍候。');
+    showMessage('info', '正在分析所有權部文字／影像區塊，請稍候。');
 
     const controller = new AbortController();
     const timer = setTimeout(function () { controller.abort(); }, 50000);
     try {
+      const formData = new FormData();
+      const fileInput = document.getElementById('ownerAiFile');
+      if (fileInput && fileInput.files && fileInput.files[0]) {
+        formData.append('owner_ai_file', fileInput.files[0]);
+      }
       const response = await fetch({{ url_for('seller_deed_owner_ai_v23', seller_id=seller.id)|tojson }}, {
         method: 'POST',
         headers: {'X-Requested-With': 'XMLHttpRequest'},
+        body: formData,
         signal: controller.signal
       });
       const raw = await response.text();
@@ -37398,3 +37416,895 @@ except Exception as exc:
 # =============================================================================
 # CASE_FORM_V23 Patch End
 # =============================================================================
+
+# =============================================================================
+# Team M.E v25｜首頁、開發路線、實價查詢、每日新物件、所有權部影像補抓
+# =============================================================================
+
+
+def _v25_iso_datetime(value):
+    """將 Firestore datetime / ISO 字串轉成台北時區 datetime；失敗回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            dt = datetime.fromisoformat(text)
+        except Exception:
+            # 常見簡化格式
+            dt = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+                try:
+                    dt = datetime.strptime(text[:19], fmt)
+                    break
+                except Exception:
+                    continue
+            if dt is None:
+                return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TAIPEI_TZ)
+        else:
+            dt = dt.astimezone(TAIPEI_TZ)
+    except Exception:
+        pass
+    return dt
+
+
+def _v25_property_item_from_doc(doc):
+    data = doc.to_dict() or {}
+    data["id"] = doc.id
+    title = (
+        data.get("title") or data.get("listing_title") or data.get("name")
+        or data.get("property_title") or "新上架物件"
+    )
+    url = (
+        data.get("listing_url") or data.get("url") or data.get("source_url")
+        or data.get("link") or ""
+    )
+    created_raw = data.get("created_at") or data.get("first_seen_at") or data.get("updated_at")
+    dt = _v25_iso_datetime(created_raw)
+    source_platform = (
+        data.get("source_platform") or data.get("platform") or data.get("source_domain")
+        or data.get("source") or ""
+    )
+    address = (
+        data.get("address") or data.get("public_address") or data.get("property_address")
+        or data.get("location") or ""
+    )
+    area = data.get("district") or data.get("area") or data.get("region") or ""
+    if not area:
+        hay = f"{title} {address}"
+        m = re.search(r"(沙鹿|清水|梧棲|龍井|大甲|大肚|外埔|大安|西屯|南屯|北屯|豐原|潭子|大雅|烏日|太平|大里)區?", hay)
+        if m:
+            area = m.group(1)
+    return {
+        **data,
+        "title": str(title or "新上架物件").strip(),
+        "url": str(url or "").strip(),
+        "source_platform": str(source_platform or "").strip(),
+        "address": str(address or "").strip(),
+        "area": str(area or "").strip(),
+        "price": data.get("price") or data.get("total_price") or data.get("sale_price") or "",
+        "building_area_ping": data.get("building_area_ping") or data.get("area_ping") or data.get("building_ping") or "",
+        "created_dt": dt,
+        "created_date": dt.strftime("%Y-%m-%d") if dt else str(created_raw or "")[:10],
+        "created_display": dt.strftime("%m/%d %H:%M") if dt else str(created_raw or "")[:16].replace("T", " "),
+    }
+
+
+def _v25_load_property_alert_items(limit=1000):
+    docs = []
+    try:
+        docs = list(
+            db.collection(PROPERTY_ALERT_ITEM_COLLECTION)
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(int(limit))
+            .stream()
+        )
+    except Exception:
+        try:
+            docs = list(db.collection(PROPERTY_ALERT_ITEM_COLLECTION).limit(int(limit)).stream())
+        except Exception as exc:
+            print("⚠️ v25 讀取新物件失敗：", exc)
+            return []
+    items = [_v25_property_item_from_doc(doc) for doc in docs]
+    items = [item for item in items if item.get("url")]
+    items.sort(key=lambda item: item.get("created_dt") or datetime.min.replace(tzinfo=TAIPEI_TZ), reverse=True)
+    return items
+
+
+def _v25_collection_count(collection_name):
+    try:
+        # 新版 Firestore 支援 aggregation count。
+        agg = db.collection(collection_name).count().get()
+        if agg:
+            first = agg[0]
+            if isinstance(first, (list, tuple)) and first:
+                first = first[0]
+            value = getattr(first, "value", None)
+            if value is not None:
+                return int(value)
+    except Exception:
+        pass
+    try:
+        return sum(1 for _ in db.collection(collection_name).stream())
+    except Exception:
+        return 0
+
+
+@login_required
+def v25_dashboard_index():
+    today = now_taipei().strftime("%Y-%m-%d")
+    recent_items = _v25_load_property_alert_items(limit=200)
+    new_today = [item for item in recent_items if item.get("created_date") == today]
+    stats = {
+        "buyers": _v25_collection_count("buyers"),
+        "sellers": _v25_collection_count("sellers"),
+        "developments": _v25_collection_count("developments"),
+        "new_today": len(new_today),
+    }
+    return render_template(
+        "index.html",
+        stats=stats,
+        recent_new_properties=recent_items[:5],
+        generated_at=now_taipei().strftime("%Y-%m-%d %H:%M"),
+    )
+
+
+# 覆寫原本只跳買方列表的首頁。
+app.view_functions["index"] = v25_dashboard_index
+
+
+# -----------------------------------------------------------------------------
+# v25 開發路線：戶籍地址優先 + 最近鄰 + 2-opt 改善
+# -----------------------------------------------------------------------------
+
+def _development_route_address(item: dict) -> str:
+    """跑開發以客戶戶籍地址為第一順位。"""
+    for key in (
+        "registered_address",
+        "address",
+        "route_address",
+        "property_address",
+        "object_address",
+        "contact_address",
+    ):
+        value = _development_route_safe((item or {}).get(key))
+        if value:
+            return value
+
+    content = _development_route_safe((item or {}).get("content") or (item or {}).get("note") or (item or {}).get("internal_note"))
+    if content:
+        m = re.search(
+            r"((?:台中市|臺中市|嘉義市|彰化縣|苗栗縣|南投縣|雲林縣|台北市|新北市|桃園市|高雄市|台南市)[^\n，,。]{3,80})",
+            content,
+        )
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _v25_route_total_distance(items, start_point=None, return_to_start=False):
+    points = [item.get("_route_point") for item in items]
+    if not points or any(point is None for point in points):
+        return float("inf")
+    total = 0.0
+    current = start_point or points[0]
+    start_index = 0 if start_point else 1
+    for point in points[start_index:]:
+        total += _development_route_distance_km(current, point)
+        current = point
+    if return_to_start and start_point:
+        total += _development_route_distance_km(current, start_point)
+    return total
+
+
+def _v25_route_nearest_neighbor(items, start_point=None):
+    remaining = list(items)
+    if not remaining:
+        return []
+    ordered = []
+    if start_point is None:
+        # 未指定出發地時，逐一嘗試起點，挑總路徑較短者；點數太多時只試前 12 個。
+        candidates = remaining if len(remaining) <= 12 else sorted(remaining, key=lambda x: -int(x.get("route_score") or 0))[:12]
+        best = None
+        best_distance = float("inf")
+        for first in candidates:
+            pool = [x for x in remaining if x is not first]
+            trial = [first]
+            current = first.get("_route_point")
+            while pool:
+                nxt = min(
+                    pool,
+                    key=lambda x: (
+                        _development_route_distance_km(current, x.get("_route_point")),
+                        -int(x.get("route_score") or 0),
+                    ),
+                )
+                pool.remove(nxt)
+                trial.append(nxt)
+                current = nxt.get("_route_point")
+            distance = _v25_route_total_distance(trial)
+            if distance < best_distance:
+                best_distance = distance
+                best = trial
+        return best or remaining
+
+    current = start_point
+    while remaining:
+        nxt = min(
+            remaining,
+            key=lambda x: (
+                _development_route_distance_km(current, x.get("_route_point")),
+                -int(x.get("route_score") or 0),
+            ),
+        )
+        remaining.remove(nxt)
+        ordered.append(nxt)
+        current = nxt.get("_route_point")
+    return ordered
+
+
+def _v25_route_two_opt(items, start_point=None, return_to_start=False, max_rounds=5):
+    route = list(items)
+    if len(route) < 4:
+        return route
+    best_distance = _v25_route_total_distance(route, start_point=start_point, return_to_start=return_to_start)
+    for _ in range(max_rounds):
+        improved = False
+        for i in range(0, len(route) - 2):
+            for j in range(i + 2, len(route)):
+                candidate = route[:i] + list(reversed(route[i:j])) + route[j:]
+                distance = _v25_route_total_distance(candidate, start_point=start_point, return_to_start=return_to_start)
+                if distance + 0.01 < best_distance:
+                    route = candidate
+                    best_distance = distance
+                    improved = True
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+    return route
+
+
+def _development_route_order_items(items: list, start_address: str = "", return_to_start: bool = False) -> tuple[list, str]:
+    enriched = []
+    for item in items or []:
+        data = dict(item)
+        data["route_address"] = _development_route_address(data)
+        data["route_area"] = _development_route_area(data)
+        data["route_score"] = _development_route_score(data)
+        data["route_nav_url"] = _development_route_nav_url(data["route_address"])
+        data["route_reason"] = _development_route_reason(data)
+        enriched.append(data)
+
+    usable = [x for x in enriched if x.get("route_address")]
+    no_address = [x for x in enriched if not x.get("route_address")]
+    start_point = _development_route_geocode(start_address)
+
+    for item in usable:
+        point = _development_route_latlng(item)
+        if not point:
+            point = _development_route_geocode(item.get("route_address"))
+        item["_route_point"] = point
+
+    with_points = [x for x in usable if x.get("_route_point")]
+    without_points = [x for x in usable if not x.get("_route_point")]
+
+    # 至少大多數地點有座標時才做距離最佳化。
+    if len(with_points) >= max(2, int(len(usable) * 0.65)):
+        ordered_points = _v25_route_nearest_neighbor(with_points, start_point=start_point)
+        ordered_points = _v25_route_two_opt(
+            ordered_points,
+            start_point=start_point,
+            return_to_start=return_to_start,
+        )
+        # 少數無座標地點接在同區域附近；簡化為區域順序後附加。
+        without_points.sort(
+            key=lambda x: (
+                _development_route_area_rank(x),
+                -int(x.get("route_score") or 0),
+            )
+        )
+        method = "戶籍地址座標最近鄰＋2-opt順路排序"
+        return ordered_points + without_points + no_address, method
+
+    usable.sort(
+        key=lambda x: (
+            _development_route_area_rank(x),
+            _development_route_safe(x.get("next_action_date")) or "9999-99-99",
+            -int(x.get("route_score") or 0),
+            _development_route_safe(x.get("created_at")),
+        )
+    )
+    return usable + no_address, "戶籍地址區域順序＋開發分數排序"
+
+
+@login_required
+def development_route_planner_v25():
+    filters = {
+        "q": (request.values.get("q") or "").strip(),
+        "current_stage": (request.values.get("current_stage") or "").strip(),
+        "next_action": (request.values.get("next_action") or "").strip(),
+        "source": (request.values.get("source") or "").strip(),
+        "area": (request.values.get("area") or "").strip(),
+    }
+    items, source_options = _development_route_filter_items(request.values)
+    route_result = None
+    start_address = (request.values.get("start_address") or "").strip()
+
+    if request.method == "POST":
+        selected_ids = request.form.getlist("development_ids")
+        return_mode = (request.form.get("return_mode") or "last").strip()
+        return_to_start = return_mode == "round_trip"
+        selected_items = []
+        if selected_ids:
+            id_set = set(selected_ids)
+            selected_items = [item for item in items if item.get("id") in id_set]
+            found_ids = {x.get("id") for x in selected_items}
+            for dev_id in [x for x in selected_ids if x not in found_ids]:
+                try:
+                    snap = db.collection("developments").document(dev_id).get()
+                    if snap.exists:
+                        selected_items.append(doc_to_dict(snap))
+                except Exception:
+                    pass
+
+        if not selected_items:
+            flash("請先勾選至少一筆開發資料。", "warning")
+        else:
+            ordered, method = _development_route_order_items(
+                selected_items,
+                start_address=start_address,
+                return_to_start=return_to_start,
+            )
+            google_url = _development_route_google_url(start_address, ordered, return_to_start=return_to_start)
+            stop_count = len([x for x in ordered if x.get("route_address")])
+            warning = ""
+            if stop_count > DEVELOPMENT_ROUTE_GOOGLE_MAX_STOPS:
+                warning = (
+                    f"你選了 {stop_count} 個有地址的點，Google Maps 單一路線中途點可能有限。"
+                    f"建議分成每 {DEVELOPMENT_ROUTE_GOOGLE_MAX_STOPS} 個點一趟。"
+                )
+            share_text = _development_route_share_text(start_address, ordered, method, google_url)
+            route_result = {
+                "ordered_items": ordered,
+                "method": method,
+                "google_url": google_url,
+                "share_text": share_text,
+                "warning": warning,
+            }
+            try:
+                db.collection("development_routes").add({
+                    "start_address": start_address,
+                    "return_to_start": return_to_start,
+                    "method": method,
+                    "target_ids": selected_ids,
+                    "ordered_target_ids": [x.get("id") for x in ordered],
+                    "google_url": google_url,
+                    "share_text": share_text,
+                    "created_at": now_taipei().isoformat(),
+                    "created_by_id": session.get("user_id") or "",
+                    "created_by_name": session.get("user_name") or "",
+                })
+            except Exception as exc:
+                print("⚠️ v25 儲存開發路線失敗：", exc)
+
+    return render_template(
+        "development_route_planner.html",
+        items=items,
+        filters=filters,
+        source_options=source_options,
+        stage_options=globals().get("DEVELOPMENT_STATUS_OPTIONS", []),
+        action_options=globals().get("DEVELOPMENT_NEXT_ACTION_OPTIONS", []),
+        route_result=route_result,
+        start_address=start_address,
+    )
+
+
+app.view_functions["development_route_planner"] = development_route_planner_v25
+
+
+# -----------------------------------------------------------------------------
+# v25 實價登錄查詢 HTML：沿用 ELLEN-PC / team_me_line_tasks 任務佇列
+# -----------------------------------------------------------------------------
+
+def _v25_property_web_task_create(query_text):
+    query_text = str(query_text or "").strip()
+    if not query_text:
+        raise ValueError("請輸入地址或物件網址。")
+    url_match = re.search(r"https?://[^\s<>]+", query_text, re.I)
+    if url_match and any(domain in url_match.group(0).lower() for domain in ("rakuya.com.tw", "591.com.tw")):
+        command = "url_lookup"
+        payload = {"url": url_match.group(0).rstrip(".,，。")}
+    else:
+        command = "address_lookup"
+        payload = {"address": query_text}
+
+    task_id = "property_web_" + uuid4().hex
+    now_iso = now_taipei().isoformat()
+    data = {
+        "task_id": task_id,
+        "command": command,
+        "payload": payload,
+        "source": {
+            "type": "web",
+            "target_id": "",
+            "user_id": session.get("user_id") or "",
+            "group_id": "",
+            "room_id": "",
+        },
+        "web_only": True,
+        "web_query": query_text,
+        "target_worker": globals().get("TEAMME_PROPERTY_DEFAULT_WORKER", "ELLEN-PC"),
+        "status": "queued",
+        "event": {"type": "web", "timestamp": int(time.time() * 1000), "webhookEventId": ""},
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "created_by_id": session.get("user_id") or "",
+        "created_by_name": session.get("user_name") or "",
+    }
+    collection = globals().get("TEAMME_PROPERTY_TASK_COLLECTION", "team_me_line_tasks")
+    db.collection(collection).document(task_id).set(data)
+    return task_id
+
+
+def _v25_property_task_result(task_id):
+    task_collection = globals().get("TEAMME_PROPERTY_TASK_COLLECTION", "team_me_line_tasks")
+    result_collection = globals().get("TEAMME_PROPERTY_RESULT_COLLECTION", "team_me_line_results")
+    task = {}
+    try:
+        snap = db.collection(task_collection).document(task_id).get()
+        if snap.exists:
+            task = snap.to_dict() or {}
+    except Exception as exc:
+        print("⚠️ v25 讀取房產任務失敗：", exc)
+
+    result_doc = None
+    # 依序嘗試：相同 doc id、task_id 欄位、result_token 欄位。
+    try:
+        snap = db.collection(result_collection).document(task_id).get()
+        if snap.exists:
+            result_doc = snap
+    except Exception:
+        pass
+    if result_doc is None:
+        try:
+            docs = list(db.collection(result_collection).where("task_id", "==", task_id).limit(1).stream())
+            if docs:
+                result_doc = docs[0]
+        except Exception:
+            pass
+    result_token = str(task.get("result_token") or "").strip()
+    if result_doc is None and result_token:
+        try:
+            docs = list(db.collection(result_collection).where("result_token", "==", result_token).limit(1).stream())
+            if docs:
+                result_doc = docs[0]
+        except Exception:
+            pass
+
+    result_data = result_doc.to_dict() if result_doc is not None else {}
+    result = (result_data or {}).get("result") or (result_data or {}).get("data") or result_data or None
+    # 有些 worker 直接把 result 寫回 task。
+    if not result:
+        result = task.get("result") or task.get("output") or None
+    if result is not None and not isinstance(result, dict):
+        result = {"kind": "raw", "raw": str(result)}
+    return task, result
+
+
+@app.route("/property-search", methods=["GET", "POST"])
+@login_required
+def property_search_page():
+    if request.method == "POST":
+        query_text = (request.form.get("query") or "").strip()
+        try:
+            task_id = _v25_property_web_task_create(query_text)
+            flash("已建立實價查詢任務，等待 ELLEN-PC 回傳。", "success")
+            return redirect(url_for("property_search_page", task_id=task_id))
+        except Exception as exc:
+            flash(f"建立查詢任務失敗：{exc}", "danger")
+            return render_template("property_search.html", query=query_text, task_id="", result=None)
+
+    task_id = (request.args.get("task_id") or "").strip()
+    task = {}
+    result = None
+    query_text = (request.args.get("query") or "").strip()
+    if task_id:
+        task, result = _v25_property_task_result(task_id)
+        query_text = query_text or task.get("web_query") or (task.get("payload") or {}).get("address") or (task.get("payload") or {}).get("url") or ""
+    return render_template(
+        "property_search.html",
+        query=query_text,
+        task_id=task_id,
+        task_status=task.get("status") or ("done" if result else "queued"),
+        result=result,
+        raw_json=json.dumps(result, ensure_ascii=False, indent=2, default=str) if result else "",
+    )
+
+
+@app.route("/property-search/status/<task_id>")
+@login_required
+def property_search_status(task_id):
+    task, result = _v25_property_task_result(task_id)
+    status = str(task.get("status") or ("done" if result else "queued"))
+    message = str(task.get("message") or task.get("error") or task.get("result_message") or "")
+    return _case_v23_json({
+        "success": True,
+        "task_id": task_id,
+        "status": status,
+        "ready": bool(result),
+        "message": message,
+    })
+
+
+# -----------------------------------------------------------------------------
+# v25 每日新上架物件
+# -----------------------------------------------------------------------------
+
+@app.route("/properties/daily-new")
+@login_required
+def daily_new_properties():
+    filters = {
+        "date": (request.args.get("date") or now_taipei().strftime("%Y-%m-%d")).strip(),
+        "source": (request.args.get("source") or "").strip(),
+        "area": (request.args.get("area") or "").strip(),
+        "q": (request.args.get("q") or "").strip(),
+    }
+    all_items = _v25_load_property_alert_items(limit=1000)
+    source_options = sorted({item.get("source_platform") for item in all_items if item.get("source_platform")})
+    items = [item for item in all_items if item.get("created_date") == filters["date"]]
+    if filters["source"]:
+        items = [item for item in items if item.get("source_platform") == filters["source"]]
+    if filters["area"]:
+        area = filters["area"]
+        items = [item for item in items if area in (item.get("area") or "") or area in (item.get("address") or "") or area in (item.get("title") or "")]
+    if filters["q"]:
+        q = filters["q"].lower()
+        items = [item for item in items if q in f"{item.get('title','')} {item.get('address','')} {item.get('url','')}".lower()]
+    source_counts = {}
+    for item in items:
+        key = item.get("source_platform") or "其他"
+        source_counts[key] = source_counts.get(key, 0) + 1
+    return render_template(
+        "new_properties_daily.html",
+        filters=filters,
+        items=items,
+        source_options=source_options,
+        source_counts=source_counts,
+    )
+
+
+# -----------------------------------------------------------------------------
+# v25 所有權部影像補抓：可重新選擇同一份 PDF，只送所有權部頁面區塊
+# -----------------------------------------------------------------------------
+
+def _v25_prepare_image_bytes(file_bytes, mime_type):
+    """縮小圖片，避免 inline_data 過大。"""
+    try:
+        image = Image.open(BytesIO(file_bytes))
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        image.thumbnail((2200, 2600))
+        buf = BytesIO()
+        image.save(buf, format="JPEG", quality=90, optimize=True)
+        return "image/jpeg", buf.getvalue()
+    except Exception:
+        return mime_type or "image/jpeg", file_bytes
+
+
+def _v25_owner_region_images(file_bytes: bytes, mime_type: str, max_images=3):
+    if not file_bytes:
+        return []
+    mime_type = str(mime_type or "").lower()
+    if mime_type.startswith("image/"):
+        return [_v25_prepare_image_bytes(file_bytes, mime_type)]
+
+    try:
+        import fitz  # PyMuPDF
+    except Exception as exc:
+        raise RuntimeError("缺少 PyMuPDF，無法擷取所有權部影像；請安裝 PyMuPDF。") from exc
+
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+    except Exception as exc:
+        raise RuntimeError(f"PDF 無法開啟：{exc}") from exc
+
+    page_candidates = []
+    owner_terms = ["土地所有權部", "建物所有權部", "所有權部", "所有權人", "權利人", "統一編號", "出生日期", "住址"]
+    end_terms = ["土地他項權利部", "建物他項權利部", "他項權利部", "共同擔保"]
+
+    for index in range(len(doc)):
+        page = doc[index]
+        try:
+            page_text = page.get_text("text") or ""
+        except Exception:
+            page_text = ""
+        score = sum(3 if term in page_text else 0 for term in owner_terms)
+        if "所有權人" in page_text or "權利人" in page_text:
+            score += 6
+        if score:
+            page_candidates.append((score, index))
+
+    if not page_candidates:
+        page_candidates = [(1, index) for index in range(min(len(doc), 2))]
+    page_candidates.sort(key=lambda x: (-x[0], x[1]))
+    selected_indices = sorted(index for _, index in page_candidates[:max_images])
+
+    results = []
+    for index in selected_indices:
+        page = doc[index]
+        rects = []
+        for term in owner_terms:
+            try:
+                rects.extend(page.search_for(term))
+            except Exception:
+                pass
+        if rects:
+            y0 = max(0, min(rect.y0 for rect in rects) - 90)
+            y1 = min(page.rect.height, max(rect.y1 for rect in rects) + 520)
+            # 遇到他項權利部時在其上方停止。
+            end_y = None
+            for term in end_terms:
+                try:
+                    for rect in page.search_for(term):
+                        if rect.y0 > y0 and (end_y is None or rect.y0 < end_y):
+                            end_y = rect.y0
+                except Exception:
+                    pass
+            if end_y is not None:
+                y1 = min(y1, max(y0 + 260, end_y + 10))
+            if y1 - y0 < 260:
+                y1 = min(page.rect.height, y0 + 520)
+            clip = fitz.Rect(0, y0, page.rect.width, y1)
+        else:
+            clip = page.rect
+        try:
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), clip=clip, alpha=False)
+            png_bytes = pix.tobytes("png")
+            results.append(_v25_prepare_image_bytes(png_bytes, "image/png"))
+        except Exception as exc:
+            print("⚠️ v25 所有權部頁面轉圖失敗：", index, exc)
+    doc.close()
+    return results
+
+
+def _v25_gemini_owner_from_region(owner_section: str, missing_fields: list, image_parts: list):
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("尚未設定 GEMINI_API_KEY")
+    primary_model = os.environ.get(
+        "GEMINI_CASE_OWNER_MODEL",
+        os.environ.get("GEMINI_MODEL", globals().get("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash")),
+    ).strip() or "gemini-2.5-flash"
+    fallback_model = os.environ.get("GEMINI_CASE_OWNER_FALLBACK_MODEL", "gemini-2.5-flash-lite").strip()
+    models = [primary_model] + ([fallback_model] if fallback_model and fallback_model != primary_model else [])
+    try:
+        timeout_seconds = max(8.0, min(float(os.environ.get("CASE_OWNER_AI_TIMEOUT", "18")), 25.0))
+    except Exception:
+        timeout_seconds = 18.0
+    try:
+        max_attempts = max(1, min(int(os.environ.get("CASE_OWNER_AI_MAX_ATTEMPTS", "3")), 4))
+    except Exception:
+        max_attempts = 3
+
+    labels = [_CASE_V23_OWNER_LABELS.get(key, key) for key in missing_fields]
+    prompt = f"""
+你是台灣不動產登記謄本的視覺欄位擷取助手。
+系統只提供「土地／建物所有權部」所在頁面的影像區塊，現在缺少：{'、'.join(labels)}。
+
+請直接閱讀圖片上的印刷文字，規則如下：
+1. 只擷取自然人所有權人的姓名、出生日期、統一編號／身分證字號、住址。
+2. 不可把土地坐落、建物門牌、物件地址當成所有權人住址。
+3. 不可把抵押權人、銀行、債權人或代理人當成所有權人。
+4. 原文件若以＊、圓點或遮罩隱藏個資，必須留空，不得猜測或還原。
+5. 統一編號只有完整的英文字母加九位數字才可填入。
+6. 出生日期使用民國年月日，並拆成年、月、日。
+7. 只輸出 JSON，不要 markdown。
+
+輸出 JSON：
+{{
+  "owner_name": "",
+  "owner_id": "",
+  "owner_identity_no": "",
+  "owner_birth_date": "",
+  "owner_birth_year": "",
+  "owner_birth_month": "",
+  "owner_birth_day": "",
+  "owner_household_address": "",
+  "deed_ai_note": "請說明哪些欄位在影像中可見、哪些被遮蔽或未出現"
+}}
+
+PDF 抽出的所有權部文字僅供輔助，圖片優先：
+{str(owner_section or '')[:3500]}
+""".strip()
+
+    import urllib.request
+    import urllib.error
+    import random
+    last_error = None
+    last_status = None
+    attempts = []
+    retryable = {408, 429, 500, 502, 503, 504}
+
+    for attempt_index in range(max_attempts):
+        model = models[-1] if len(models) > 1 and attempt_index == max_attempts - 1 else models[0]
+        parts = [{"text": prompt}]
+        for image_mime, image_bytes in image_parts[:3]:
+            parts.append({
+                "inline_data": {
+                    "mime_type": image_mime,
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                }
+            })
+        payload = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 800,
+                "responseMimeType": "application/json",
+            },
+        }
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            method="POST",
+        )
+        attempt_no = attempt_index + 1
+        try:
+            print(f"ℹ️ CASE_FORM_V25 owner region attempt={attempt_no}/{max_attempts} model={model}")
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            parts_out = (((body.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+            text = "\n".join(str(part.get("text") or "") for part in parts_out)
+            data = _case_v19_ai_json_loads(text)
+            if not isinstance(data, dict) or not data:
+                raise RuntimeError("Gemini 回傳內容無法解析成 JSON")
+            data["_case_owner_ai_model"] = model
+            data["_case_owner_ai_attempts"] = attempt_no
+            return data
+        except urllib.error.HTTPError as exc:
+            last_status = int(getattr(exc, "code", 0) or 0)
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            except Exception:
+                detail = ""
+            last_error = f"Gemini HTTP {last_status}：{detail or exc.reason}"
+            attempts.append(f"第{attempt_no}次/{model}/HTTP {last_status}")
+            if last_status not in retryable or attempt_no >= max_attempts:
+                break
+        except Exception as exc:
+            last_error = f"Gemini 影像分析失敗：{exc}"
+            attempts.append(f"第{attempt_no}次/{model}/錯誤")
+            if attempt_no >= max_attempts:
+                break
+        delay = min(1.2 * (2 ** attempt_index), 5.0) + random.uniform(0.15, 0.55)
+        time.sleep(delay)
+
+    attempt_text = "、".join(attempts)
+    if last_status in {429, 503}:
+        raise RuntimeError(f"Gemini目前忙碌或額度受限，已自動重試（{attempt_text}）。請稍後再試。")
+    raise RuntimeError(f"{last_error or 'Gemini影像分析失敗'}（{attempt_text}）")
+
+
+@login_required
+def seller_deed_owner_ai_v25(seller_id):
+    error_id = uuid4().hex[:8]
+    try:
+        snap = db.collection("sellers").document(seller_id).get()
+        if not snap.exists:
+            return _case_v23_json({"success": False, "message": "找不到這筆委託。"}, 404)
+        seller = doc_to_dict(snap) or {"id": seller_id}
+        case_data = _case_v23_strict_owner_data(seller)
+        missing_fields = _case_v22_owner_missing_fields(case_data)
+        if not missing_fields:
+            return _case_v23_json({"success": True, "message": "四項資料已完整，不需要 AI 補抓。"})
+
+        raw_text = _case_v19_scalar_text(seller.get("deed_raw_text"), 30000)
+        owner_section = _case_v22_extract_owner_section_text(raw_text, max_chars=6000) if raw_text else ""
+        upload = request.files.get("owner_ai_file")
+        image_parts = []
+        source_label = "已保存的所有權部文字"
+        if upload and getattr(upload, "filename", ""):
+            file_bytes = upload.read()
+            if not file_bytes:
+                return _case_v23_json({"success": False, "message": "選擇的謄本檔案是空白檔案。"})
+            if len(file_bytes) > 5 * 1024 * 1024:
+                return _case_v23_json({"success": False, "message": "謄本檔案超過 5MB，請先壓縮 PDF。"})
+            mime_type = getattr(upload, "mimetype", "") or "application/pdf"
+            if str(upload.filename).lower().endswith(".pdf"):
+                mime_type = "application/pdf"
+            image_parts = _v25_owner_region_images(file_bytes, mime_type, max_images=3)
+            if not image_parts:
+                return _case_v23_json({"success": False, "message": "無法從檔案擷取所有權部影像，請確認 PDF 可以正常開啟。"})
+            source_label = f"所有權部影像區塊（{len(image_parts)}張）"
+            ai_data = _v25_gemini_owner_from_region(owner_section, missing_fields, image_parts)
+        else:
+            if not owner_section:
+                return _case_v23_json({
+                    "success": False,
+                    "message": "無法定位所有權部文字。請在 AI 補抓區重新選擇同一份謄本 PDF，改用影像區塊辨識。",
+                })
+            ai_data = _case_v23_gemini_owner_once(owner_section, missing_fields)
+
+        pending = _case_v23_pending_from_ai(ai_data, missing_fields)
+        actual_fields = [key for key in pending if key != "deed_ai_pending_note"]
+        normalized = _case_v19_normalize_owner_ai_data(ai_data)
+        found_labels = []
+        if normalized.get("owner_name"):
+            found_labels.append("所有權人")
+        if normalized.get("owner_id") or normalized.get("owner_identity_no"):
+            found_labels.append("統一編號")
+        if normalized.get("owner_birth_date") or normalized.get("owner_birth_year"):
+            found_labels.append("出生日期")
+        if normalized.get("owner_household_address"):
+            found_labels.append("住址")
+
+        for key in _CASE_V23_PENDING_FIELDS:
+            if key not in pending:
+                pending[key] = ""
+        pending["deed_ai_pending_missing_fields"] = ",".join(missing_fields)
+        pending["deed_ai_pending_at"] = now_taipei().isoformat()
+        pending["deed_ai_status"] = (
+            f"AI 使用{source_label}完成；辨識到：" + "、".join(found_labels)
+            if found_labels else
+            f"AI 已分析{source_label}，但其他個資在文件中未顯示、被遮蔽或無法辨識。"
+        )
+        pending["updated_at"] = now_taipei().isoformat()
+        pending["updated_by_id"] = session.get("user_id") or "web"
+        pending["updated_by_name"] = session.get("user_name") or "Web"
+        db.collection("sellers").document(seller_id).set(pending, merge=True)
+
+        if not actual_fields:
+            note = _case_v19_scalar_text((ai_data or {}).get("deed_ai_note"), 1200)
+            message = "Gemini 已完成分析，但缺少欄位仍無法辨識。"
+            if note:
+                message += " " + note
+            return _case_v23_json({"success": False, "message": message})
+
+        return _case_v23_json({
+            "success": True,
+            "message": f"AI 使用{source_label}補抓完成：" + "、".join(found_labels) + "。請確認後再套用。",
+        })
+    except Exception as exc:
+        import traceback
+        print(f"❌ CASE_FORM_V25 owner AI failure [{error_id}] seller_id={seller_id}: {exc}")
+        traceback.print_exc()
+        error_text = str(exc)
+        temporary = any(token in error_text for token in ("忙碌", "HTTP 503", "HTTP 429", "額度受限"))
+        try:
+            db.collection("sellers").document(seller_id).set({
+                "deed_ai_status": f"AI 補抓失敗（錯誤編號 {error_id}）：{error_text}",
+                "deed_ai_last_error_id": error_id,
+                "updated_at": now_taipei().isoformat(),
+            }, merge=True)
+        except Exception:
+            pass
+        return _case_v23_json({
+            "success": False,
+            "temporary": temporary,
+            "message": f"AI 補抓失敗（錯誤編號 {error_id}）：{error_text}",
+        }, 503 if temporary else 500)
+
+
+# 保留既有 URL 與 endpoint，替換成 v25 影像區塊版本。
+app.view_functions["seller_deed_owner_ai_v23"] = seller_deed_owner_ai_v25
+
+
+print("✅ Team M.E v25 已啟用：首頁 / 戶籍地址開發路線 / 實價查詢 / 每日新物件 / 所有權部影像補抓")
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000") or 5000)
+    print("Routes:", app.url_map)
+    app.run(host="0.0.0.0", port=port, debug=True)

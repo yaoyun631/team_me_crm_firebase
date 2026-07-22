@@ -411,6 +411,22 @@ def parse_owner_personal_info(text: str) -> dict[str, str]:
     「住址」會視為客戶資料區的戶籍地址 / 登記住址。
     """
     text = normalize_text(text)
+    # PDF 文字層常把欄位名稱與身分證字號拆成多個空白字元，先只正規化固定標籤。
+    label_patterns = {
+        r"土\s*地\s*所\s*有\s*權\s*部": "土地所有權部",
+        r"建\s*物\s*所\s*有\s*權\s*部": "建物所有權部",
+        r"土\s*地\s*他\s*項\s*權\s*利\s*部": "土地他項權利部",
+        r"建\s*物\s*他\s*項\s*權\s*利\s*部": "建物他項權利部",
+        r"所\s*有\s*權\s*人": "所有權人",
+        r"權\s*利\s*人": "權利人",
+        r"統\s*一\s*編\s*號": "統一編號",
+        r"身\s*分\s*證\s*(?:統\s*一\s*)?編\s*號": "身分證統一編號",
+        r"出\s*生\s*(?:年\s*月\s*日|日\s*期)": "出生日期",
+        r"戶\s*籍\s*(?:地\s*址|住\s*址)": "戶籍地址",
+        r"住\s*址": "住址",
+    }
+    for pattern, replacement in label_patterns.items():
+        text = re.sub(pattern, replacement, text)
     info = {
         "owner_name": "",
         "owner_id": "",
@@ -435,10 +451,10 @@ def parse_owner_personal_info(text: str) -> dict[str, str]:
     ])
 
     raw_id = first_match(owner_block, [
-        r"(?:國民身分證統一編號|身分證統一編號|身分證明文件字號|身分證字號|身份字號|統一編號)\s*[:：]?\s*([A-Z][12][0-9]{8})",
-        r"\b([A-Z][12][0-9]{8})\b",
+        r"(?:國民身分證統一編號|身分證統一編號|身分證明文件字號|身分證字號|身份字號|統一編號)\s*[:：]?\s*([A-Z]\s*[12](?:\s*[0-9]){8})",
+        r"\b([A-Z]\s*[12](?:\s*[0-9]){8})\b",
     ])
-    raw_id = raw_id.upper().replace(" ", "")
+    raw_id = re.sub(r"\s+", "", raw_id.upper())
     info["owner_id"] = raw_id
     info["owner_identity_no"] = raw_id
 
