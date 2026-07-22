@@ -22496,6 +22496,7 @@ print('✅ LINE URI 長度修正已載入：加入行事曆按鈕不再塞入超
 CASE_DETAIL_FIELD_KEYS = [
     "property_title", "community_name", "case_address", "case_price", "layout",
     "total_ping", "main_ping", "attached_ping", "public_ping", "land_ping", "parking_ping",
+    "base_land_ping", "land_share_ping", "total_land_raw_ping", "base_land_m2", "land_share_m2",
     "floor", "floor_total", "building_age", "facing", "showing_method", "case_note",
     "life_note", "property_highlight_note", "target_customer_note", "raw_group_text", "source_url",
     # 謄本 PDF / 案件輸入表自動填寫欄位
@@ -22524,7 +22525,10 @@ CASE_BASIC_LABELS = {
     "main_ping": "主建坪",
     "attached_ping": "附屬坪",
     "public_ping": "公設坪",
-    "land_ping": "地坪",
+    "land_ping": "實際持有土地合計",
+    "base_land_ping": "基地面積（肉地/1分之1）",
+    "land_share_ping": "持分面積（非1分之1）",
+    "total_land_raw_ping": "地號登記面積原始加總",
     "parking_ping": "車位坪",
     "floor": "所在樓層",
     "floor_total": "樓高/總樓層",
@@ -22652,6 +22656,11 @@ def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     data["attached_ping"] = seller.get("attached_ping") or ""
     data["public_ping"] = seller.get("public_ping") or ""
     data["land_ping"] = seller.get("land_ping") or ""
+    data["base_land_ping"] = seller.get("base_land_ping") or ""
+    data["land_share_ping"] = seller.get("land_share_ping") or ""
+    data["total_land_raw_ping"] = seller.get("total_land_raw_ping") or ""
+    data["base_land_m2"] = seller.get("base_land_m2") or ""
+    data["land_share_m2"] = seller.get("land_share_m2") or ""
     data["parking_ping"] = seller.get("parking_ping") or ""
     data["floor"] = seller.get("floor") or ""
     data["floor_total"] = seller.get("floor_total") or seller.get("total_floors") or ""
@@ -22699,6 +22708,7 @@ def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     data["cadastral_pdf_filename"] = seller.get("cadastral_pdf_filename") or ""
     data["cadastral_road_access"] = seller.get("cadastral_road_access") or ""
     data["deed_ai_note"] = seller.get("deed_ai_note") or ""
+    data["deed_ai_status"] = seller.get("deed_ai_status") or ""
     data["deed_analysis_source"] = seller.get("deed_analysis_source") or ""
     data["cadastral_ai_note"] = seller.get("cadastral_ai_note") or ""
     data["cadastral_direction_note"] = seller.get("cadastral_direction_note") or ""
@@ -23188,7 +23198,7 @@ DEED_CASE_FORM_HTML = r"""
           <tbody>
             <tr><th style="width:150px;">謄本檔名</th><td>{{ case_data.deed_pdf_filename or '-' }}</td></tr>
             <tr><th>所有權人</th><td>{{ case_data.deed_owner or case_data.owner_name or '-' }}</td></tr>
-            <tr><th>身分證字號</th><td>{{ case_data.owner_identity_no or case_data.owner_id or '-' }}</td></tr>
+            <tr><th>統一編號/身分證字號</th><td>{{ case_data.owner_identity_no or case_data.owner_id or '-' }}</td></tr>
             <tr><th>性別</th><td>{{ case_data.owner_gender or '-' }}</td></tr>
             <tr><th>出生日期</th><td>{{ case_data.owner_birth_year or '-' }} 年 {{ case_data.owner_birth_month or '-' }} 月 {{ case_data.owner_birth_day or '-' }} 日</td></tr>
             <tr><th>戶籍地址</th><td>{{ case_data.owner_household_address or case_data.registered_address or case_data.household_address or '-' }}</td></tr>
@@ -35233,6 +35243,9 @@ CASE_FORM_V19_UPLOAD_HTML = r"""
             <tr><th>出生日期</th><td>{{ case_data.owner_birth_year or '-' }} 年 {{ case_data.owner_birth_month or '-' }} 月 {{ case_data.owner_birth_day or '-' }} 日</td></tr>
             <tr><th>戶籍地址/住址</th><td>{{ case_data.owner_household_address or case_data.registered_address or case_data.household_address or '-' }}</td></tr>
             <tr><th>物件地址</th><td>{{ case_data.case_address or seller.address or '-' }}</td></tr>
+            <tr><th>基地面積（肉地/1分之1）</th><td>{{ case_data.base_land_ping or '-' }} 坪</td></tr>
+            <tr><th>持分面積（非1分之1）</th><td>{{ case_data.land_share_ping or '-' }} 坪</td></tr>
+            <tr><th>實際持有土地合計</th><td>{{ case_data.land_ping or '-' }} 坪</td></tr>
             <tr><th>AI 狀態</th><td>{{ case_data.deed_ai_status or '-' }}</td></tr>
           </tbody>
         </table>
@@ -35292,23 +35305,83 @@ def _case_v19_gemini_json_from_text(prompt: str):
 
 
 def _case_v19_gemini_json_from_file(prompt: str, file_bytes: bytes, mime_type: str = "application/pdf"):
+    """直接把 PDF/圖片交給 Gemini；SDK 失敗時用 REST inline_data 備援。"""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("尚未設定 GEMINI_API_KEY")
+    if not file_bytes:
+        return _case_v19_gemini_json_from_text(prompt)
+
+    model = os.environ.get("GEMINI_MODEL", globals().get("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash")).strip() or "gemini-2.5-flash"
+    sdk_error = None
     try:
         from google import genai
         from google.genai import types
         client = genai.Client(api_key=api_key)
-        res = client.models.generate_content(
-            model=os.environ.get("GEMINI_MODEL", globals().get("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash")),
-            contents=[
+        config = None
+        try:
+            config = types.GenerateContentConfig(
+                temperature=0.1,
+                response_mime_type="application/json",
+            )
+        except Exception:
+            config = None
+        kwargs = {
+            "model": model,
+            "contents": [
                 types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
                 prompt,
             ],
-        )
-        return _case_v19_ai_json_loads(getattr(res, "text", "") or "")
+        }
+        if config is not None:
+            kwargs["config"] = config
+        res = client.models.generate_content(**kwargs)
+        data = _case_v19_ai_json_loads(getattr(res, "text", "") or "")
+        if data:
+            return data
+        raise RuntimeError("SDK 回傳內容無法解析成 JSON")
     except Exception as exc:
-        raise RuntimeError(f"Gemini 檔案分析失敗：{exc}")
+        sdk_error = exc
+
+    try:
+        import urllib.request
+        import urllib.error
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {
+                        "mime_type": mime_type,
+                        "data": base64.b64encode(file_bytes).decode("ascii"),
+                    }},
+                ],
+            }],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+            },
+        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=90) as res:
+            body = json.loads(res.read().decode("utf-8"))
+        parts = (((body.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+        text = "\n".join(str(part.get("text") or "") for part in parts)
+        data = _case_v19_ai_json_loads(text)
+        if data:
+            return data
+        raise RuntimeError("REST 回傳內容無法解析成 JSON")
+    except Exception as rest_exc:
+        raise RuntimeError(f"Gemini 檔案分析失敗；SDK={sdk_error}；REST={rest_exc}")
 
 
 def _case_v19_extract_upload(upload_file):
@@ -35352,6 +35425,72 @@ def _case_v19_nonempty(data: dict):
     return {k: v for k, v in (data or {}).items() if str(v or "").strip()}
 
 
+def _case_v19_normalize_owner_ai_data(data: dict):
+    """統一 AI 的所有權人欄位，並把 owners 陣列第一筆完整資料映射到案件表欄位。"""
+    out = dict(data or {}) if isinstance(data, dict) else {}
+    owners = out.get("owners")
+    if isinstance(owners, list):
+        candidates = [x for x in owners if isinstance(x, dict)]
+        if candidates:
+            def score(item):
+                return sum(bool(str(item.get(k) or "").strip()) for k in (
+                    "owner_name", "owner_id", "owner_identity_no", "owner_birth_date", "owner_household_address", "registered_address"
+                ))
+            primary = sorted(candidates, key=score, reverse=True)[0]
+            for k, v in primary.items():
+                if str(v or "").strip() and not str(out.get(k) or "").strip():
+                    out[k] = v
+
+    owner_name = str(out.get("owner_name") or out.get("deed_owner") or "").strip()
+    owner_id = str(out.get("owner_id") or out.get("owner_identity_no") or out.get("identity_no") or "").upper().replace(" ", "")
+    id_match = re.search(r"[A-Z][12][0-9]{8}", owner_id)
+    owner_id = id_match.group(0) if id_match else owner_id
+    address = str(
+        out.get("owner_household_address")
+        or out.get("registered_address")
+        or out.get("household_address")
+        or out.get("address")
+        or ""
+    ).strip()
+    birth = str(out.get("owner_birth_date") or out.get("birth_date") or "").strip()
+    by = str(out.get("owner_birth_year") or "").strip()
+    bm = str(out.get("owner_birth_month") or "").strip()
+    bd = str(out.get("owner_birth_day") or "").strip()
+    try:
+        from deed_case_form_tool import parse_minguo_date
+        parsed_birth = parse_minguo_date(birth)
+        by = by or parsed_birth.get("year", "")
+        bm = bm or parsed_birth.get("month", "")
+        bd = bd or parsed_birth.get("day", "")
+        birth = birth or parsed_birth.get("display", "")
+    except Exception:
+        pass
+    if not birth and by and bm and bd:
+        birth = f"民國{int(by):03d}年{int(bm):02d}月{int(bd):02d}日"
+
+    if owner_name:
+        out["owner_name"] = owner_name
+        out["deed_owner"] = owner_name
+    if owner_id:
+        out["owner_id"] = owner_id
+        out["owner_identity_no"] = owner_id
+        if not str(out.get("owner_gender") or "").strip() and len(owner_id) >= 2:
+            out["owner_gender"] = "男" if owner_id[1] == "1" else "女" if owner_id[1] == "2" else ""
+    if birth:
+        out["owner_birth_date"] = birth
+    if by:
+        out["owner_birth_year"] = str(int(by)) if str(by).isdigit() else by
+    if bm:
+        out["owner_birth_month"] = str(int(bm)) if str(bm).isdigit() else bm
+    if bd:
+        out["owner_birth_day"] = str(int(bd)) if str(bd).isdigit() else bd
+    if address:
+        out["owner_household_address"] = address
+        out["registered_address"] = address
+        out["household_address"] = address
+    return out
+
+
 def _case_v19_owner_missing(case_data: dict):
     return not (
         str(case_data.get("owner_id") or case_data.get("owner_identity_no") or "").strip()
@@ -35364,18 +35503,40 @@ def _case_v19_owner_missing(case_data: dict):
 
 def _case_v19_ai_analyze_deed(raw_text: str = "", file_bytes: bytes = b"", mime_type: str = "application/pdf"):
     prompt = f"""
-你是台灣不動產謄本資料擷取助手。
-請從上傳的土地/建物登記謄本或以下文字，擷取自然人所有權人的資料。
-若欄位沒有出現，請留空字串。只輸出 JSON，不要輸出其他文字。
+你是台灣不動產登記謄本的資料擷取助手。請直接閱讀上傳的完整 PDF/圖片版面與文字，辨識「所有權部」中的自然人所有權人資料。
 
-要抓的重點：
-- 統一編號 / 身分證字號，例如 C120801873
-- 出生日期，例如 民國066年01月04日，要拆成年月日
-- 住址，這就是案件輸入表上方客戶資料的戶籍地址
-- 性別，如果謄本沒有寫，但身分證字號第二碼是 1=男、2=女，請推論
+本次四個必查欄位：
+1. 所有權人姓名
+2. 出生日期
+3. 統一編號（自然人即身分證字號）
+4. 住址
 
-輸出 JSON 格式：
+規則：
+- 不可用物件門牌、建物門牌、土地坐落代替所有權人的住址。
+- 不可把抵押權人、債權人、銀行或代理人當成所有權人。
+- 有多位自然人所有權人時，全部放進 owners；頂層欄位放資料最完整的第一位。
+- 出生日期以民國年月日輸出，並拆出年、月、日。
+- 身分證字號第二碼 1=男、2=女；謄本未寫性別時可依此推論。
+- 看不清楚或文件沒有的欄位留空，不要猜。
+- 只輸出 JSON，不要輸出其他文字。
+
+輸出 JSON：
 {{
+  "owners": [
+    {{
+      "owner_name": "",
+      "owner_id": "",
+      "owner_identity_no": "",
+      "owner_gender": "",
+      "owner_birth_date": "",
+      "owner_birth_year": "",
+      "owner_birth_month": "",
+      "owner_birth_day": "",
+      "owner_household_address": "",
+      "registered_address": "",
+      "household_address": ""
+    }}
+  ],
   "owner_name": "",
   "owner_id": "",
   "owner_identity_no": "",
@@ -35387,15 +35548,15 @@ def _case_v19_ai_analyze_deed(raw_text: str = "", file_bytes: bytes = b"", mime_
   "owner_household_address": "",
   "registered_address": "",
   "household_address": "",
-  "deed_ai_note": ""
+  "deed_ai_note": "請簡短說明四項資料是否都有辨識到"
 }}
 
-謄本文字：
-{str(raw_text or "")[:12000]}
+PDF 抽出的文字僅供輔助，仍要以實際上傳檔案版面為主：
+{str(raw_text or "")[:16000]}
 """.strip()
 
     if not _case_v19_ai_available():
-        return {"deed_ai_status": "未設定 GEMINI_API_KEY，僅使用規則/OCR文字解析"}
+        return {"deed_ai_status": "未設定 GEMINI_API_KEY，無法執行 PDF AI；僅使用規則/OCR文字解析"}
 
     try:
         if file_bytes:
@@ -35404,11 +35565,21 @@ def _case_v19_ai_analyze_deed(raw_text: str = "", file_bytes: bytes = b"", mime_
             data = _case_v19_gemini_json_from_text(prompt)
         if not isinstance(data, dict):
             raise RuntimeError("AI 回傳不是 JSON")
-        data["deed_ai_status"] = "AI 已分析謄本"
+        data = _case_v19_normalize_owner_ai_data(data)
+        required = {
+            "所有權人": data.get("owner_name"),
+            "出生日期": data.get("owner_birth_date") or (data.get("owner_birth_year") and data.get("owner_birth_month") and data.get("owner_birth_day")),
+            "統一編號": data.get("owner_identity_no") or data.get("owner_id"),
+            "住址": data.get("owner_household_address") or data.get("registered_address") or data.get("household_address"),
+        }
+        found = [name for name, value in required.items() if str(value or "").strip()]
+        missing = [name for name, value in required.items() if not str(value or "").strip()]
+        data["deed_ai_status"] = "PDF AI 已分析：" + "、".join(found or ["未辨識到四項資料"])
+        if missing:
+            data["deed_ai_status"] += "；缺少：" + "、".join(missing)
         return data
     except Exception as exc:
-        return {"deed_ai_status": f"AI 分析謄本失敗：{exc}"}
-
+        return {"deed_ai_status": f"PDF AI 分析謄本失敗：{exc}"}
 
 def _case_v19_ai_analyze_cadastral(raw_text: str = "", file_bytes: bytes = b"", mime_type: str = "application/pdf"):
     prompt = f"""
@@ -35480,27 +35651,33 @@ def _case_v19_parse_deed_item(item: dict):
 
     case_data = dict((parsed.get("case_data") or {}))
 
-    # 規則解析所有權人，即使 parse_deed_text 沒抓到也再跑一次。
+    # 先用規則解析，保留土地/建物面積與其他謄本欄位。
     try:
         owner_info = parse_owner_personal_info(raw_text)
         for k, v in owner_info.items():
             if str(v or "").strip() and not str(case_data.get(k) or "").strip():
                 case_data[k] = v
     except Exception as exc:
-        case_data["deed_ai_status"] = f"規則解析所有權人失敗：{exc}"
+        case_data["deed_rule_status"] = f"規則解析所有權人失敗：{exc}"
 
-    if _case_v19_owner_missing(case_data):
-        ai_data = _case_v19_ai_analyze_deed(raw_text, file_bytes, mime_type)
-        for k, v in _case_v19_nonempty(ai_data).items():
-            # AI 結果填空欄為主；status/note 直接寫入。
-            if k.endswith("_status") or k.endswith("_note") or not str(case_data.get(k) or "").strip():
-                case_data[k] = v
-    else:
-        case_data["deed_ai_status"] = case_data.get("deed_ai_status") or "規則/OCR 已抓到身分證、生日、戶籍地址"
+    # v20：只要有 GEMINI_API_KEY，每一份謄本 PDF/圖片都必定交給 AI，
+    # 不再等規則解析缺資料才 fallback。
+    ai_data = _case_v19_ai_analyze_deed(raw_text, file_bytes, mime_type)
+    ai_data = _case_v19_normalize_owner_ai_data(ai_data)
+    owner_priority_keys = {
+        "owner_name", "deed_owner", "owner_id", "owner_identity_no", "owner_gender",
+        "owner_birth_date", "owner_birth_year", "owner_birth_month", "owner_birth_day",
+        "owner_household_address", "registered_address", "household_address",
+    }
+    for k, v in _case_v19_nonempty(ai_data).items():
+        if k in owner_priority_keys or k.endswith("_status") or k.endswith("_note") or not str(case_data.get(k) or "").strip():
+            case_data[k] = v
 
+    # AI 空白時仍保留規則結果；AI 成功時四項欄位以 AI PDF 判讀為主。
+    case_data = _case_v19_normalize_owner_ai_data(case_data)
     parsed["case_data"] = case_data
+    parsed["ai_owner_result"] = ai_data
     return parsed
-
 
 def _case_v19_parse_cadastral_item(item: dict):
     from deed_case_form_tool import parse_deed_text
@@ -35527,18 +35704,61 @@ def _case_v19_merge_deed_parsed(items: list):
     merged = {"case_data": {}, "parts": []}
     raw_texts = []
     filenames = []
+    sum_keys = {"base_land_ping", "land_share_ping", "land_ping", "total_land_raw_ping", "base_land_m2", "land_share_m2"}
+    sums = {k: 0.0 for k in sum_keys}
+    has_sum = {k: False for k in sum_keys}
+    lot_values = []
+    notes = []
+    statuses = []
+    ai_notes = []
+
+    def add_number(key, value):
+        try:
+            number = float(str(value).replace(",", "").strip())
+        except Exception:
+            return
+        sums[key] += number
+        has_sum[key] = True
+
     for item in items:
         parsed = _case_v19_parse_deed_item(item)
         merged["parts"].append(parsed)
-        for k, v in _case_v19_nonempty(parsed.get("case_data") or {}).items():
-            if not str(merged["case_data"].get(k) or "").strip() or k in {"deed_ai_status", "deed_ai_note"}:
+        case_part = parsed.get("case_data") or {}
+        for k, v in _case_v19_nonempty(case_part).items():
+            if k in sum_keys:
+                add_number(k, v)
+                continue
+            if k == "land_lot_no":
+                lot_values.extend([x.strip() for x in re.split(r"[、,，]+", str(v)) if x.strip()])
+                continue
+            if k == "deed_parsed_note":
+                notes.append(str(v).strip())
+                continue
+            if k == "deed_ai_status":
+                statuses.append(str(v).strip())
+                continue
+            if k == "deed_ai_note":
+                ai_notes.append(str(v).strip())
+                continue
+            if not str(merged["case_data"].get(k) or "").strip():
                 merged["case_data"][k] = v
         if item.get("text"):
             raw_texts.append(item.get("text"))
         if item.get("filename"):
             filenames.append(item.get("filename"))
-    return merged, "\n\n---謄本分隔---\n\n".join(raw_texts), "+".join(filenames)
 
+    for key in sum_keys:
+        if has_sum[key]:
+            merged["case_data"][key] = (f"{sums[key]:.4f}").rstrip("0").rstrip(".")
+    if lot_values:
+        merged["case_data"]["land_lot_no"] = "、".join(dict.fromkeys(lot_values))
+    if notes:
+        merged["case_data"]["deed_parsed_note"] = "\n\n".join(dict.fromkeys(notes))
+    if statuses:
+        merged["case_data"]["deed_ai_status"] = "；".join(dict.fromkeys(statuses))
+    if ai_notes:
+        merged["case_data"]["deed_ai_note"] = "；".join(dict.fromkeys(ai_notes))
+    return merged, "\n\n---謄本分隔---\n\n".join(raw_texts), "+".join(filenames)
 
 def _case_v19_merge_cadastral_parsed(items: list):
     merged = {"case_data": {}, "parts": []}
@@ -35580,7 +35800,13 @@ def _case_v19_apply_upload_result(seller_id: str, deed_result=None, cadastral_re
         except Exception:
             pass
         updates["deed_parsed_at"] = now_taipei().isoformat()
-        updates["deed_analysis_source"] = "OCR/文字 + AI fallback"
+        ai_status_text = str(deed_case.get("deed_ai_status") or "")
+        if "PDF AI 已分析" in ai_status_text:
+            updates["deed_analysis_source"] = "PDF AI + 規則/OCR解析"
+        elif _case_v19_ai_available():
+            updates["deed_analysis_source"] = "PDF AI 嘗試失敗 + 規則/OCR解析"
+        else:
+            updates["deed_analysis_source"] = "規則/OCR解析（未設定 GEMINI_API_KEY）"
 
     if cadastral_result:
         cadastral_parsed, cadastral_raw_text, cadastral_filename = cadastral_result

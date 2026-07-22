@@ -183,17 +183,43 @@ def first_match(text: str, patterns: list[str], default: str = "", flags=re.S | 
 
 def parse_right_scope(text: str) -> str:
     value = first_match(text, [
-        r"權利範圍:([^\n]+)",
-        r"設定權利範圍:([^\n]+)",
+        r"權利範圍\s*:([^\n]+)",
+        r"設定權利範圍\s*:([^\n]+)",
     ])
     if not value:
         return ""
-    if "全部" in value and "1分之1" in value:
+    value = value.replace("*", "").replace(" ", "").strip()
+    if "全部" in value:
         return "1/1"
     m = re.search(r"(\d+)\s*分之\s*(\d+)", value)
     if m:
-        return f"{m.group(2)}/{m.group(1)}"
-    return value.replace("*", "").strip()
+        return f"{int(m.group(2))}/{int(m.group(1))}"
+    m = re.search(r"(\d+)\s*/\s*(\d+)", value)
+    if m:
+        return f"{int(m.group(1))}/{int(m.group(2))}"
+    return value
+
+
+def right_scope_ratio(value: Any) -> float | None:
+    """把權利範圍轉成持有比例。1/1 或全部為 1，其餘分數回傳小數。"""
+    text = normalize_text(clean(value)).replace("*", "").replace(" ", "")
+    if not text:
+        return None
+    if "全部" in text:
+        return 1.0
+    m = re.search(r"(\d+)分之(\d+)", text)
+    if m:
+        denominator = int(m.group(1))
+        numerator = int(m.group(2))
+    else:
+        m = re.search(r"(\d+)/(\d+)", text)
+        if not m:
+            return None
+        numerator = int(m.group(1))
+        denominator = int(m.group(2))
+    if denominator <= 0 or numerator < 0:
+        return None
+    return numerator / denominator
 
 
 def parse_mortgages(block_text: str) -> list[dict[str, str]]:
@@ -241,6 +267,7 @@ def parse_land_block(block_text: str) -> dict[str, Any]:
     use_category = first_match(text, [r"使用地類別:([^\n]+)"])
     current_land_value = first_match(text, [r"公告土地現值:\*+([\d,]+元/平方公尺|[\d,]+元／平方公尺)"])
     right_scope = parse_right_scope(text)
+    ownership_ratio = right_scope_ratio(right_scope)
     deed_no = first_match(text, [r"權狀字號:([^\n]+)"])
     restrictions = []
     if "禁止處分" in text:
@@ -259,6 +286,10 @@ def parse_land_block(block_text: str) -> dict[str, Any]:
         "use_category": use_category.replace("（空白）", "").strip(),
         "current_land_value": current_land_value,
         "right_scope": right_scope,
+        "ownership_ratio": ownership_ratio,
+        "is_full_ownership": ownership_ratio is not None and abs(ownership_ratio - 1.0) < 1e-9,
+        "held_area_m2": round((float(area_m2) if area_m2 else 0.0) * ownership_ratio, 4) if ownership_ratio is not None else 0.0,
+        "held_area_ping": m2_to_ping((float(area_m2) if area_m2 else 0.0) * ownership_ratio) if ownership_ratio is not None else 0.0,
         "deed_no": deed_no,
         "restrictions": restrictions,
         "mortgages": mortgages,
@@ -498,8 +529,30 @@ def parse_deed_text(text: str) -> dict[str, Any]:
             if rec.get("building_no") or rec.get("address"):
                 building_records.append(rec)
 
-    total_land_m2 = round(sum(float(r.get("area_m2") or 0) for r in land_records), 2)
+    # 土地面積分成兩類：
+    # 1. 肉地/基地面積：權利範圍為 1/1（全部）的土地登記面積加總。
+    # 2. 持分面積：權利範圍非 1/1 的土地，以「登記面積 x 持有比例」後加總。
+    total_land_m2 = round(sum(float(r.get("area_m2") or 0) for r in land_records), 4)
     total_land_ping = m2_to_ping(total_land_m2) if total_land_m2 else 0.0
+    base_land_m2 = round(sum(
+        float(r.get("area_m2") or 0)
+        for r in land_records
+        if r.get("is_full_ownership")
+    ), 4)
+    base_land_ping = m2_to_ping(base_land_m2) if base_land_m2 else 0.0
+    land_share_m2 = round(sum(
+        float(r.get("held_area_m2") or 0)
+        for r in land_records
+        if r.get("ownership_ratio") is not None and not r.get("is_full_ownership")
+    ), 4)
+    land_share_ping = m2_to_ping(land_share_m2) if land_share_m2 else 0.0
+    actual_land_m2 = round(base_land_m2 + land_share_m2, 4)
+    actual_land_ping = m2_to_ping(actual_land_m2) if actual_land_m2 else 0.0
+    unknown_scope_lots = [
+        r.get("full_lot_no") or r.get("lot_no") or "未辨識地號"
+        for r in land_records
+        if r.get("ownership_ratio") is None
+    ]
 
     building = building_records[0] if building_records else {}
 
@@ -532,6 +585,13 @@ def parse_deed_text(text: str) -> dict[str, Any]:
         "building_records": building_records,
         "total_land_m2": total_land_m2,
         "total_land_ping": total_land_ping,
+        "base_land_m2": base_land_m2,
+        "base_land_ping": base_land_ping,
+        "land_share_m2": land_share_m2,
+        "land_share_ping": land_share_ping,
+        "actual_land_m2": actual_land_m2,
+        "actual_land_ping": actual_land_ping,
+        "unknown_scope_lots": unknown_scope_lots,
         "building_record": building,
         "warnings": warning_parts,
         "owner_info": owner_info,
@@ -579,8 +639,16 @@ def to_case_data(parsed: dict[str, Any]) -> dict[str, Any]:
         deed_parsed_lines.append(f"主要建材：{building.get('material')}")
     if building.get("completed_date"):
         deed_parsed_lines.append(f"建築完成日期：{building.get('completed_date')}")
+    if parsed.get("base_land_ping"):
+        deed_parsed_lines.append(f"基地面積（肉地/1分之1）：約 {fmt_num(parsed.get('base_land_ping'))} 坪")
+    if parsed.get("land_share_ping"):
+        deed_parsed_lines.append(f"持分面積（非1分之1實際持有）：約 {fmt_num(parsed.get('land_share_ping'))} 坪")
+    if parsed.get("actual_land_ping"):
+        deed_parsed_lines.append(f"實際持有土地合計：約 {fmt_num(parsed.get('actual_land_ping'))} 坪")
     if parsed.get("total_land_ping"):
-        deed_parsed_lines.append(f"土地總面積：約 {fmt_num(parsed.get('total_land_ping'))} 坪（{fmt_num(parsed.get('total_land_m2'))} 平方公尺）")
+        deed_parsed_lines.append(f"各地號登記面積原始加總：約 {fmt_num(parsed.get('total_land_ping'))} 坪（未乘持分）")
+    if parsed.get("unknown_scope_lots"):
+        deed_parsed_lines.append("權利範圍未辨識，未列入基地/持分：" + "、".join(parsed.get("unknown_scope_lots") or []))
     if building.get("total_registered_ping"):
         deed_parsed_lines.append(f"建物登記總面積：約 {fmt_num(building.get('total_registered_ping'))} 坪")
     if cadastral_info.get("cadastral_lot"):
@@ -596,6 +664,7 @@ def to_case_data(parsed: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "owner_name": owner_info.get("owner_name", ""),
+        "deed_owner": owner_info.get("owner_name", ""),
         "owner_id": owner_info.get("owner_id", ""),
         "owner_identity_no": owner_info.get("owner_identity_no") or owner_info.get("owner_id", ""),
         "owner_gender": owner_info.get("owner_gender", ""),
@@ -620,7 +689,13 @@ def to_case_data(parsed: dict[str, Any]) -> dict[str, Any]:
         "public_ping": "",
         "parking_ping": "",
         "total_ping": fmt_num(building.get("total_registered_ping")) if building.get("total_registered_ping") else "",
-        "land_ping": fmt_num(parsed.get("total_land_ping")) if parsed.get("total_land_ping") else "",
+        # land_ping 使用實際持有合計；PDF 的基地面積與持分各自使用獨立欄位。
+        "land_ping": fmt_num(parsed.get("actual_land_ping")) if parsed.get("actual_land_ping") else "",
+        "base_land_ping": fmt_num(parsed.get("base_land_ping")) if parsed.get("base_land_ping") else "",
+        "land_share_ping": fmt_num(parsed.get("land_share_ping")) if parsed.get("land_share_ping") else "",
+        "total_land_raw_ping": fmt_num(parsed.get("total_land_ping")) if parsed.get("total_land_ping") else "",
+        "base_land_m2": fmt_num(parsed.get("base_land_m2")) if parsed.get("base_land_m2") else "",
+        "land_share_m2": fmt_num(parsed.get("land_share_m2")) if parsed.get("land_share_m2") else "",
         "deed_right_scope": land_right_scope or building.get("right_scope", ""),
         "deed_completed_date": building.get("completed_date", ""),
         "completed_minguo_year": building.get("completed_minguo_year", ""),
@@ -851,8 +926,8 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
     put("public_ping", case_data.get("public_ping"))
     put("parking_ping", case_data.get("parking_ping"))
     put("land_ping", case_data.get("land_ping"))
-    put("base_land_ping", case_data.get("land_ping"))
-    put("land_share_ping", case_data.get("land_ping"))
+    put("base_land_ping", case_data.get("base_land_ping"))
+    put("land_share_ping", case_data.get("land_share_ping"))
     put("case_price", case_data.get("case_price"), seller.get("expected_price"))
     put("rent_price", case_data.get("rent_price"))
     put("deposit", case_data.get("deposit"))

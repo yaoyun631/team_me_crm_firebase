@@ -736,8 +736,10 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
     put("public_ping", fmt_num(case_data.get("public_ping")))
     put("parking_ping", fmt_num(case_data.get("parking_ping")))
     put("land_ping", fmt_num(case_data.get("land_ping")))
-    put("base_land_ping", fmt_num(case_data.get("base_land_ping")), fmt_num(case_data.get("land_ping")))
-    put("land_share_ping", fmt_num(case_data.get("land_share_ping")), fmt_num(case_data.get("land_ping")))
+    # 基地面積只填 1/1 肉地；持分只填非 1/1 的實際持有面積。
+    # 不再把 land_ping 同時塞進兩格，避免基地與持分顯示相同錯誤數字。
+    put("base_land_ping", fmt_num(case_data.get("base_land_ping")))
+    put("land_share_ping", fmt_num(case_data.get("land_share_ping")))
     put("case_price", normalize_price_text(case_data.get("case_price") or seller.get("expected_price")))
     put("rent_price", normalize_price_text(case_data.get("rent_price")))
     put("deposit", normalize_price_text(case_data.get("deposit")))
