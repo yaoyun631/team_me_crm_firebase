@@ -12,9 +12,10 @@
 {% if diagnostics %}
 <div class="alert alert-{{ diagnostics.level }} mb-4">
   <div class="fw-bold mb-1">系統判斷</div><div>{{ diagnostics.diagnosis }}</div>
-  <div class="small mt-2">公開集合 {{ diagnostics.public_total or 0 }} 筆｜市場即時備援 {{ diagnostics.fallback_total or 0 }} 筆｜頁面版本 {{ diagnostics.version or 'v35' }}</div>
+  <div class="small mt-2">公開集合 {{ diagnostics.public_total or 0 }} 筆｜市場即時備援 {{ diagnostics.fallback_total or 0 }} 筆｜頁面版本 {{ diagnostics.version or 'v36' }}</div>
   {% set run=diagnostics.latest_run or {} %}{% if run %}<div class="small mt-1">最近掃描：{{ run.get('started_at') or '-' }}｜{{ run.get('status') or '-' }}｜掃描 {{ run.get('scanned_count') or 0 }}｜公開頁成功 {{ run.get('public_items_saved') or 0 }}／失敗 {{ run.get('public_items_failed') or 0 }}</div>{% endif %}
   {% set ss=diagnostics.source_status or {} %}<div class="small mt-1">來源掃描：591 抓取 {{ (ss.get('591') or {}).get('collected') or 0 }}／新增 {{ (ss.get('591') or {}).get('new') or 0 }}；樂屋抓取 {{ (ss.get('rakuya') or {}).get('collected') or 0 }}／新增 {{ (ss.get('rakuya') or {}).get('new') or 0 }}</div>
+  {% set rh=diagnostics.rakuya_health or {} %}{% if rh %}<div class="small mt-1">樂屋入庫狀態：{{ rh.get('status') or '-' }}｜行政區 {{ rh.get('district') or '-' }}｜寫入 {{ rh.get('collected') or 0 }}｜區域略過 {{ rh.get('invalid_scope_items') or 0 }}{% if rh.get('error') %}｜錯誤 {{ rh.get('error') }}{% endif %}</div>{% endif %}
 </div>
 {% endif %}
 

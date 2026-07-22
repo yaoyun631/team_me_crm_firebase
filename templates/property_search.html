@@ -40,9 +40,71 @@
       <div class="row g-2">{% for label,key,unit in [('總價','price_wan','萬'),('權狀坪數','building_area_ping','坪'),('主建物','main_area_ping','坪'),('地坪','land_area_ping','坪'),('格局','layout_text',''),('樓層','floor_text',''),('屋齡','building_age','年'),('類型','property_type','')] %}<div class="col-6 col-md-3"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">{{ label }}</div><div class="fw-bold">{{ parsed.get(key) if parsed.get(key) not in (none,'') else '—' }}{% if parsed.get(key) not in (none,'') and unit %} {{ unit }}{% endif %}</div></div></div>{% endfor %}</div>
     </div>
   </div>
-  <div class="card dashboard-card mb-4"><div class="card-header bg-white border-0 pt-3 d-flex justify-content-between"><div><div class="fw-bold">符合條件的可能門牌</div><div class="small text-muted">依區域、道路、坪數、主建物、地坪、樓層、屋齡、格局與類型排序；結果為推測候選，不代表正式門牌確認。</div></div><span class="badge text-bg-light">{{ candidates|length }} 個</span></div><div class="card-body pt-2"><div class="table-responsive"><table class="table table-sm table-hover align-middle"><thead><tr><th>順位</th><th>候選地址</th><th>比對分數</th><th>符合條件</th><th>實價證據</th></tr></thead><tbody>{% for item in candidates %}<tr {% if loop.first %}class="table-success"{% endif %}><td>{{ loop.index }}</td><td class="fw-semibold">{{ item.get('address') or item.get('full_address') or '-' }}</td><td>{{ item.get('match_percent') if item.get('match_percent') not in (none,'') else item.get('confidence') or item.get('score') or '-' }}%{% if item.get('confidence_label') %}（{{ item.get('confidence_label') }}）{% endif %}</td><td>{% set reasons=item.get('matched_reasons') or [] %}{{ reasons|join('、') if reasons else '-' }}</td><td class="small">{{ item.get('transaction_date') or '-' }}｜建坪 {{ item.get('building_area_ping') if item.get('building_area_ping') not in (none,'') else '-' }}｜主建 {{ item.get('main_building_area_ping') if item.get('main_building_area_ping') not in (none,'') else '-' }}｜地坪 {{ item.get('land_area_ping') if item.get('land_area_ping') not in (none,'') else '-' }}｜樓層 {{ item.get('transfer_floor') if item.get('transfer_floor') not in (none,'') else '-' }}/{{ item.get('total_floors') if item.get('total_floors') not in (none,'') else '-' }}｜屋齡 {{ item.get('building_age') if item.get('building_age') not in (none,'') else '-' }}</td></tr>{% else %}<tr><td colspan="5" class="text-center text-muted py-4">本機實價資料庫中沒有至少兩項結構條件吻合的可能門牌。</td></tr>{% endfor %}</tbody></table></div></div></div>
-  {% else %}
-  {% set summary = result.get('summary') or {} %}{% set settings = result.get('query_settings') or search_settings or {} %}{% set target = result.get('target') or {} %}{% set exact_rows = result.get('transactions') or result.get('exact_transactions') or [] %}{% set nearby_rows = result.get('nearby_transactions') or result.get('nearby_records') or result.get('nearby_rows') or result.get('records') or result.get('items') or [] %}
+  <div class="card dashboard-card mb-4">
+    <div class="card-header bg-white border-0 pt-3 d-flex justify-content-between gap-2">
+      <div>
+        <div class="fw-bold">符合條件的可能門牌</div>
+        <div class="small text-muted">只比較：平台公開地址、主建坪、地坪、類型、屋齡、樓層。符合時直接在資料後顯示 ✓；結果為推測候選，不代表正式門牌確認。</div>
+      </div>
+      <span class="badge text-bg-light">{{ candidates|length }} 個</span>
+    </div>
+    <div class="card-body pt-2">
+      <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle" style="min-width:1180px">
+          <thead><tr>
+            <th>順位</th><th>候選地址／地址比對</th><th>主建坪</th><th>地坪</th>
+            <th>類型</th><th>屋齡</th><th>樓層</th><th>比對分數</th><th>實價日期</th>
+          </tr></thead>
+          <tbody>
+          {% for item in candidates %}
+            {% set flags=item.get('match_flags') or {} %}
+            {% set expected=item.get('expected_values') or {} %}
+            <tr {% if loop.first %}class="table-success"{% endif %}>
+              <td>{{ loop.index }}</td>
+              <td class="fw-semibold">
+                {{ item.get('address') or item.get('full_address') or '-' }}
+                {% if flags.get('address') %}<span class="text-success fw-bold">✓</span>{% endif %}
+                <div class="small text-muted fw-normal">平台：{{ expected.get('platform_address') or parsed.get('public_address') or '-' }}</div>
+              </td>
+              <td>
+                {{ item.get('main_building_area_ping') if item.get('main_building_area_ping') not in (none,'') else '-' }}{% if item.get('main_building_area_ping') not in (none,'') %} 坪{% endif %}
+                {% if flags.get('main_area') %}<span class="text-success fw-bold">✓</span>{% endif %}
+                <div class="small text-muted">平台 {{ expected.get('main_area_ping') if expected.get('main_area_ping') not in (none,'') else parsed.get('main_area_ping') or '-' }}</div>
+              </td>
+              <td>
+                {{ item.get('land_area_ping') if item.get('land_area_ping') not in (none,'') else '-' }}{% if item.get('land_area_ping') not in (none,'') %} 坪{% endif %}
+                {% if flags.get('land_area') %}<span class="text-success fw-bold">✓</span>{% endif %}
+                <div class="small text-muted">平台 {{ expected.get('land_area_ping') if expected.get('land_area_ping') not in (none,'') else parsed.get('land_area_ping') or '-' }}</div>
+              </td>
+              <td>
+                {{ item.get('property_category') or '-' }}
+                {% if flags.get('property_type') %}<span class="text-success fw-bold">✓</span>{% endif %}
+                <div class="small text-muted">平台 {{ parsed.get('property_type') or parsed.get('building_type') or '-' }}</div>
+              </td>
+              <td>
+                {{ item.get('building_age') if item.get('building_age') not in (none,'') else '-' }}{% if item.get('building_age') not in (none,'') %} 年{% endif %}
+                {% if flags.get('building_age') %}<span class="text-success fw-bold">✓</span>{% endif %}
+                <div class="small text-muted">平台 {{ expected.get('building_age') if expected.get('building_age') not in (none,'') else parsed.get('building_age') or '-' }}</div>
+              </td>
+              <td>
+                {{ item.get('transfer_floor') if item.get('transfer_floor') not in (none,'') else '-' }}/{{ item.get('total_floors') if item.get('total_floors') not in (none,'') else '-' }}
+                {% if flags.get('floor') %}<span class="text-success fw-bold">✓</span>{% endif %}
+                <div class="small text-muted">平台 {{ expected.get('floor') if expected.get('floor') not in (none,'') else parsed.get('floor') or '-' }}/{{ expected.get('total_floors') if expected.get('total_floors') not in (none,'') else parsed.get('total_floors') or '-' }}</div>
+              </td>
+              <td>
+                {{ item.get('match_percent') if item.get('match_percent') not in (none,'') else item.get('confidence') or item.get('score') or '-' }}%
+                <div class="small text-muted">{{ item.get('condition_match_count') or 0 }}/{{ item.get('condition_available_count') or 0 }} 項</div>
+              </td>
+              <td>{{ item.get('transaction_date') or '-' }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="9" class="text-center text-muted py-4">本機實價資料庫中沒有至少兩項條件吻合的可能門牌。</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
   {% if result.get('source_kind') == 'url' %}{% set url_parsed = result.get('url_parsed') or {} %}<div class="card dashboard-card mb-4 border-success"><div class="card-header bg-white fw-bold border-0 pt-3">網址已解析為地址</div><div class="card-body"><h5>{{ url_parsed.get('title') or '網址物件' }}</h5><div class="row g-2"><div class="col-md-8"><div class="p-3 rounded bg-light"><div class="small text-muted">採用的正確地址候選</div><div class="fw-bold fs-5">{{ result.get('resolved_address') or target.get('full_address') or '-' }}</div><div class="small text-muted mt-1">判斷方式：{{ result.get('address_resolution_method') or '-' }}{% if result.get('address_resolution_confidence') %}｜符合分數 {{ result.get('address_resolution_confidence') }}{% endif %}</div></div></div><div class="col-md-4"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">原物件網址</div>{% if result.get('listing_url') %}<a class="text-break" href="{{ result.get('listing_url') }}" target="_blank" rel="noopener">開啟物件頁</a>{% else %}-{% endif %}</div></div></div></div></div>{% endif %}
   <div class="card dashboard-card mb-4"><div class="card-header bg-white fw-bold border-0 pt-3">地址行情結果</div><div class="card-body"><h5>{{ target.get('full_address') or result.get('query') or query or '地址查詢' }}</h5><div class="d-flex gap-2 flex-wrap mb-2"><span class="filter-chip">{{ settings.get('radius') or 500 }} 公尺</span><span class="filter-chip">最近 {{ settings.get('years') or 5 }} 年</span><span class="filter-chip">{{ settings.get('age_label') or search_settings.age_label or '全部屋齡' }}</span><span class="filter-chip">{{ settings.get('category') or '全部' }}</span></div><div class="row g-2 mt-1">{% for label,value,unit in [('附近成交',summary.get('count') or nearby_rows|length or 0,''),('單價中位數',summary.get('median_unit') or '—','萬／坪'),('平均單價',summary.get('average_unit') or '—','萬／坪'),('總價中位數',summary.get('median_total') or '—','萬元'),('最近成交',summary.get('latest') or '—','')] %}<div class="col-6 col-md"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">{{ label }}</div><div class="fs-4 fw-bold">{{ value }}</div>{% if unit %}<div class="small text-muted">{{ unit }}</div>{% endif %}</div></div>{% endfor %}</div></div></div>
 

@@ -40510,6 +40510,102 @@ print("✅ Team M.E v35 已啟用：591 每日物件網址以卡片 ID／標題 
 # Team M.E v35 End
 # =============================================================================
 
+
+# =============================================================================
+# Team M.E v36｜樂屋資料庫健康狀態與逐來源診斷
+# =============================================================================
+
+def _v36_source_health(source):
+    try:
+        snap = db.collection("property_radar_system").document("source_health_" + source).get()
+        return snap.to_dict() or {} if snap.exists else {}
+    except Exception:
+        return {}
+
+
+@login_required
+def daily_new_properties_v36():
+    filters = {
+        "date": (request.args.get("date") or now_taipei().strftime("%Y-%m-%d")).strip(),
+        "source": (request.args.get("source") or "").strip(),
+        "area": (request.args.get("area") or "").strip(),
+        "q": (request.args.get("q") or "").strip(),
+    }
+    all_items, origin_counts, all_source_counts = _v34_items_for_date(filters["date"])
+    items = list(all_items)
+    if filters["source"]:
+        items = [item for item in items if item.get("source_platform") == filters["source"]]
+    if filters["area"]:
+        area = filters["area"]
+        items = [item for item in items if area in (item.get("area") or "") or area in (item.get("address") or "") or area in (item.get("title") or "")]
+    if filters["q"]:
+        q = filters["q"].lower()
+        items = [item for item in items if q in f"{item.get('title','')} {item.get('address','')} {item.get('url','')}".lower()]
+    filtered_counts = {"591": 0, "rakuya": 0}
+    for item in items:
+        platform = item.get("source_platform")
+        if platform in filtered_counts:
+            filtered_counts[platform] += 1
+
+    scan_sources, latest = _v34_latest_source_scan_status()
+    rakuya_health = _v36_source_health("rakuya")
+    rakuya_owner_health = _v36_source_health("rakuya_owner")
+    health = rakuya_health or rakuya_owner_health
+    if all_source_counts["rakuya"]:
+        diagnosis = f"已分平台載入：591 {all_source_counts['591']} 筆、樂屋 {all_source_counts['rakuya']} 筆。"
+        level = "success"
+    elif health.get("status") == "failed":
+        diagnosis = "樂屋已執行但入庫失敗：" + str(health.get("error") or "未知錯誤")
+        level = "danger"
+    elif health:
+        collected = int(health.get("collected") or 0)
+        invalid = int(health.get("invalid_scope_items") or 0)
+        if collected > 0:
+            diagnosis = f"樂屋已寫入市場資料庫 {collected} 筆，但所選日期沒有非 baseline 新物件；第一次建立的物件只作基準線，不會顯示為新上架。"
+            level = "info"
+        else:
+            diagnosis = f"樂屋本輪可入庫為 0 筆；區域驗證略過 {invalid} 筆。請執行 v36 樂屋修復掃描並查看逐區結果。"
+            level = "warning"
+    elif scan_sources["rakuya"]["scopes"] == 0:
+        diagnosis = "最近掃描沒有 rakuya scope，代表規則尚未包含樂屋，或尚未執行 v36 修復掃描。"
+        level = "warning"
+    elif scan_sources["rakuya"]["collected"] == 0:
+        diagnosis = "樂屋 scope 有執行，但寫入資料庫前為 0 筆；v36 已改為逐行政區掃描並補出 district_verified／ehid。"
+        level = "warning"
+    else:
+        diagnosis = "樂屋有市場資料，但所選日期沒有非 baseline 新物件或尚未同步到公開頁。"
+        level = "info"
+
+    diagnostics = {
+        "diagnosis": diagnosis,
+        "level": level,
+        "public_total": origin_counts["public"],
+        "fallback_total": origin_counts["fallback"],
+        "selected_total": len(all_items),
+        "version": "v36",
+        "source_status": scan_sources,
+        "rakuya_health": health,
+        "latest_run": {
+            "status": latest.get("status") or "",
+            "started_at": latest.get("started_at") or "",
+            "scanned_count": latest.get("scanned_count") or 0,
+            "public_items_saved": latest.get("public_items_saved") or 0,
+            "public_items_failed": latest.get("public_items_failed") or 0,
+        },
+    }
+    return render_template(
+        "new_properties_daily.html", filters=filters, items=items,
+        source_options=["591", "rakuya"], source_counts=filtered_counts,
+        all_source_counts=all_source_counts, diagnostics=diagnostics, available_dates=[],
+    )
+
+
+app.view_functions["daily_new_properties"] = daily_new_properties_v36
+print("✅ Team M.E v36 已啟用：六項勾選地址比對／樂屋逐區掃描與入庫健康診斷。")
+# =============================================================================
+# Team M.E v36 End
+# =============================================================================
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
     print("Routes:", app.url_map)
