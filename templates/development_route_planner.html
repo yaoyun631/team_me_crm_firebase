@@ -1,69 +1,72 @@
 {% extends "base.html" %}
+{% block title %}開發路線排程｜厝米 Team M.E{% endblock %}
 {% block content %}
+<style>
+.route-time{font-variant-numeric:tabular-nums;white-space:nowrap}
+.route-table th{white-space:nowrap}.route-table td{vertical-align:middle}
+.route-summary-card{border:1px solid #eee;border-radius:12px;background:#fafafa;padding:14px;height:100%}
+.route-summary-card .value{font-size:1.35rem;font-weight:700}
+@media(max-width:768px){.route-table{font-size:.84rem}}
+</style>
 <div class="container-fluid py-3">
-  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
     <div>
-      <h3 class="mb-1">開發路線安排</h3>
-      <div class="text-muted small">勾選今天要跑的開發點，系統以客戶戶籍地址為優先，自動排成順路拜訪順序並產生 Google Maps 路線。</div>
+      <h3 class="mb-1">開發路線排程</h3>
+      <div class="text-muted small">依戶籍地址、出發時間及道路車程安排最順拜訪順序，並估算每一站到達與離開時間。</div>
     </div>
     <div class="d-flex gap-2 flex-wrap">
+      <a class="btn btn-warning" href="{{ url_for('development_route_planner', only_run_development='1', next_action='跑開發') }}">只看下一步＝跑開發</a>
+      <a class="btn btn-outline-secondary" href="{{ url_for('development_route_planner') }}">清除篩選</a>
       <a class="btn btn-outline-secondary" href="{{ url_for('developments') }}">回開發列表</a>
     </div>
   </div>
 
   <div class="alert alert-info small">
-    <strong>排序邏輯：</strong>
-    有經緯度資料時會使用最近鄰加 2-opt 改善路線；沒有經緯度時，會依戶籍地址區域、開發分數及下次行動日期排序。
-    若有設定 <span class="code">GOOGLE_MAPS_API_KEY</span>，系統會嘗試把地址轉經緯度後再排序。
+    有啟用 Google Routes API 時，系統會依出發時間、道路行車時間與轉彎等因素調整中途點順序；未啟用時則使用地址座標、最近鄰與 2-opt，再以道路距離推估時間。
   </div>
 
   {% if route_result %}
   <div class="card mb-4">
-    <div class="card-header fw-bold">今日開發路線結果</div>
+    <div class="card-header bg-white fw-bold border-0 pt-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <span>{{ route_result.route_date }} 開發行程</span>
+      {% if route_result.api_optimized %}<span class="badge text-bg-success">Google 交通時間最佳化</span>{% else %}<span class="badge text-bg-warning">距離時間推估</span>{% endif %}
+    </div>
     <div class="card-body">
-      <div class="d-flex gap-2 flex-wrap mb-3">
-        {% if route_result.google_url %}
-          <a class="btn btn-success" target="_blank" href="{{ route_result.google_url }}">開啟 Google Maps 路線</a>
-        {% endif %}
-        <button class="btn btn-outline-secondary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('routeText').value); alert('已複製今日開發路線');">複製路線文字</button>
+      <div class="row g-2 mb-3">
+        <div class="col-6 col-md-3"><div class="route-summary-card"><div class="text-muted small">開始時間</div><div class="value">{{ route_result.start_time }}</div></div></div>
+        <div class="col-6 col-md-3"><div class="route-summary-card"><div class="text-muted small">預計完成{% if route_result.return_to_start %}（回到出發地）{% endif %}</div><div class="value">{{ route_result.finish_time }}</div></div></div>
+        <div class="col-6 col-md-3"><div class="route-summary-card"><div class="text-muted small">行車時間</div><div class="value">{{ route_result.driving_minutes }} 分</div>{% if route_result.return_to_start %}<div class="small text-muted">末站返回約 {{ route_result.return_travel_minutes }} 分</div>{% endif %}</div></div>
+        <div class="col-6 col-md-3"><div class="route-summary-card"><div class="text-muted small">總距離</div><div class="value">{{ route_result.total_distance_km }} km</div></div></div>
       </div>
 
-      {% if route_result.warning %}
-        <div class="alert alert-warning small">{{ route_result.warning }}</div>
-      {% endif %}
-
-      <textarea id="routeText" class="form-control mb-3" rows="10" readonly>{{ route_result.share_text }}</textarea>
+      <div class="d-flex gap-2 flex-wrap mb-3">
+        {% if route_result.google_url %}<a class="btn btn-success" target="_blank" rel="noopener" href="{{ route_result.google_url }}">開啟 Google Maps 路線</a>{% endif %}
+        <button class="btn btn-outline-secondary" type="button" id="copyRouteButton">複製行程文字</button>
+      </div>
+      {% if route_result.warning %}<div class="alert alert-warning py-2 small">{{ route_result.warning }}</div>{% endif %}
+      <textarea id="routeText" class="form-control mb-3" rows="11" readonly>{{ route_result.share_text }}</textarea>
 
       <div class="table-responsive">
-        <table class="table table-sm table-hover align-middle">
-          <thead>
-            <tr>
-              <th style="width:70px;">順序</th>
-              <th>名稱</th>
-              <th>地址</th>
-              <th>電話</th>
-              <th>開發原因</th>
-              <th>導航</th>
-            </tr>
-          </thead>
+        <table class="table table-sm table-hover route-table align-middle">
+          <thead><tr><th>順序</th><th>預計時間</th><th>名稱</th><th>戶籍／導航地址</th><th>前段車程</th><th>電話</th><th>導航</th></tr></thead>
           <tbody>
-            {% for item in route_result.ordered_items %}
+          {% for item in route_result.ordered_items %}
             <tr>
-              <td class="fw-bold">第 {{ loop.index }} 站</td>
-              <td>
-                <a href="{{ url_for('development_detail', development_id=item.id) }}">{{ item.name or "未命名" }}</a>
-                <div class="text-muted small">{{ item.current_stage or item.stage or "-" }}｜{{ item.next_action or "-" }}</div>
+              <td class="fw-bold">第 {{ item.route_order or loop.index }} 站</td>
+              <td class="route-time">
+                <div class="fw-semibold">{{ item.schedule_arrival }}</div>
+                <div class="small text-muted">{{ item.schedule_visit_start }}–{{ item.schedule_visit_end }}</div>
               </td>
-              <td>{{ item.route_address }}</td>
-              <td>{{ item.phone or "-" }}</td>
-              <td class="small">{{ item.route_reason }}</td>
               <td>
-                {% if item.route_nav_url %}
-                  <a class="btn btn-sm btn-outline-primary" target="_blank" href="{{ item.route_nav_url }}">導航</a>
-                {% endif %}
+                {% if item.id %}<a href="{{ url_for('development_detail', development_id=item.id) }}">{{ item.name or '未命名' }}</a>{% else %}{{ item.name or '未命名' }}{% endif %}
+                <div class="small text-muted">{{ item.current_stage or item.stage or '-' }}｜{{ item.next_action or '-' }}</div>
               </td>
+              <td style="min-width:240px">{{ item.route_address or '-' }}</td>
+              <td class="text-nowrap">約 {{ item.travel_minutes_from_previous or 0 }} 分<br><span class="small text-muted">{{ item.distance_km_from_previous or 0 }} km</span></td>
+              <td class="text-nowrap">{{ item.phone or '-' }}</td>
+              <td>{% if item.route_nav_url %}<a class="btn btn-sm btn-outline-primary" target="_blank" rel="noopener" href="{{ item.route_nav_url }}">導航</a>{% endif %}</td>
             </tr>
-            {% endfor %}
+          {% endfor %}
           </tbody>
         </table>
       </div>
@@ -72,124 +75,72 @@
   {% endif %}
 
   <form method="get" class="card mb-3">
-    <div class="card-header fw-bold">篩選開發名單</div>
+    <div class="card-header bg-white fw-bold border-0 pt-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <span>篩選開發名單</span>
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" role="switch" id="onlyRunDevelopment" name="only_run_development" value="1" {% if filters.only_run_development == '1' %}checked{% endif %}>
+        <label class="form-check-label" for="onlyRunDevelopment">只顯示下一步是跑開發</label>
+      </div>
+    </div>
     <div class="card-body">
       <div class="row g-2">
-        <div class="col-md-3">
-          <label class="form-label">關鍵字</label>
-          <input name="q" class="form-control" value="{{ filters.q }}" placeholder="姓名 / 電話 / 地址">
-        </div>
-        <div class="col-md-2">
-          <label class="form-label">目前狀態</label>
-          <select name="current_stage" class="form-select">
-            <option value="">全部</option>
-            {% for opt in stage_options %}
-              <option value="{{ opt }}" {% if filters.current_stage == opt %}selected{% endif %}>{{ opt }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div class="col-md-2">
-          <label class="form-label">下一動作</label>
-          <select name="next_action" class="form-select">
-            <option value="">全部</option>
-            {% for opt in action_options %}
-              <option value="{{ opt }}" {% if filters.next_action == opt %}selected{% endif %}>{{ opt }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div class="col-md-2">
-          <label class="form-label">來源</label>
-          <select name="source" class="form-select">
-            <option value="">全部</option>
-            {% for opt in source_options %}
-              <option value="{{ opt }}" {% if filters.source == opt %}selected{% endif %}>{{ opt }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div class="col-md-2">
-          <label class="form-label">區域</label>
-          <input name="area" class="form-control" value="{{ filters.area }}" placeholder="沙鹿 / 清水">
-        </div>
-        <div class="col-md-1 d-flex align-items-end">
-          <button class="btn btn-outline-primary w-100" type="submit">篩選</button>
-        </div>
+        <div class="col-md-3"><label class="form-label">關鍵字</label><input name="q" class="form-control" value="{{ filters.q }}" placeholder="姓名／電話／地址"></div>
+        <div class="col-md-2"><label class="form-label">目前狀態</label><select name="current_stage" class="form-select"><option value="">全部</option>{% for opt in stage_options %}<option value="{{ opt }}" {% if filters.current_stage == opt %}selected{% endif %}>{{ opt }}</option>{% endfor %}</select></div>
+        <div class="col-md-2"><label class="form-label">下一動作</label><select name="next_action" class="form-select"><option value="">全部</option>{% for opt in action_options %}<option value="{{ opt }}" {% if filters.next_action == opt %}selected{% endif %}>{{ opt }}</option>{% endfor %}</select></div>
+        <div class="col-md-2"><label class="form-label">來源</label><select name="source" class="form-select"><option value="">全部</option>{% for opt in source_options %}<option value="{{ opt }}" {% if filters.source == opt %}selected{% endif %}>{{ opt }}</option>{% endfor %}</select></div>
+        <div class="col-md-2"><label class="form-label">區域</label><input name="area" class="form-control" value="{{ filters.area }}" placeholder="沙鹿／清水"></div>
+        <div class="col-md-1 d-flex align-items-end"><button class="btn btn-outline-primary w-100" type="submit">篩選</button></div>
       </div>
     </div>
   </form>
 
   <form method="post" class="card">
-    <div class="card-header fw-bold d-flex justify-content-between align-items-center flex-wrap gap-2">
-      <span>勾選今天要跑的開發點</span>
-      <span class="text-muted small">目前顯示 {{ items|length }} 筆</span>
-    </div>
-
+    <div class="card-header bg-white fw-bold border-0 pt-3 d-flex justify-content-between align-items-center flex-wrap gap-2"><span>勾選要拜訪的開發點</span><span class="text-muted small">目前顯示 {{ items|length }} 筆</span></div>
     <div class="card-body">
-      <input type="hidden" name="q" value="{{ filters.q }}">
-      <input type="hidden" name="current_stage" value="{{ filters.current_stage }}">
-      <input type="hidden" name="next_action" value="{{ filters.next_action }}">
-      <input type="hidden" name="source" value="{{ filters.source }}">
-      <input type="hidden" name="area" value="{{ filters.area }}">
+      <input type="hidden" name="q" value="{{ filters.q }}"><input type="hidden" name="current_stage" value="{{ filters.current_stage }}"><input type="hidden" name="next_action" value="{{ filters.next_action }}"><input type="hidden" name="source" value="{{ filters.source }}"><input type="hidden" name="area" value="{{ filters.area }}"><input type="hidden" name="only_run_development" value="{{ filters.only_run_development }}">
 
       <div class="row g-2 mb-3">
-        <div class="col-md-5">
-          <label class="form-label">出發地</label>
-          <input name="start_address" class="form-control" value="{{ start_address or '' }}" placeholder="例：公司、沙鹿靜宜店、目前位置地址">
-          <div class="form-text">Google Maps 可接受「目前位置」，但後台排序要有地址或經緯度才會更準。</div>
-        </div>
-        <div class="col-md-3">
-          <label class="form-label">路線模式</label>
-          <select name="return_mode" class="form-select">
-            <option value="last">最後一站結束</option>
-            <option value="round_trip">最後回到出發地</option>
-          </select>
-        </div>
-        <div class="col-md-4 d-flex align-items-end gap-2">
-          <button class="btn btn-success" type="submit">產生最佳開發路線</button>
-          <button class="btn btn-outline-secondary" type="button" onclick="document.querySelectorAll('.dev-check').forEach(x=>x.checked=true)">全選</button>
-          <button class="btn btn-outline-secondary" type="button" onclick="document.querySelectorAll('.dev-check').forEach(x=>x.checked=false)">取消全選</button>
-        </div>
+        <div class="col-lg-4"><label class="form-label">出發地</label><input name="start_address" class="form-control" value="{{ start_address or '' }}" placeholder="公司或目前所在地址"><div class="form-text">填完整地址，排序及時間會更準。</div></div>
+        <div class="col-6 col-md-3 col-lg-2"><label class="form-label">日期</label><input type="date" name="route_date" class="form-control" value="{{ route_date }}"></div>
+        <div class="col-6 col-md-3 col-lg-2"><label class="form-label">開始時間</label><input type="time" name="start_time" class="form-control" value="{{ start_time }}"></div>
+        <div class="col-6 col-md-3 col-lg-2"><label class="form-label">每站拜訪</label><div class="input-group"><input type="number" name="visit_minutes" class="form-control" value="{{ visit_minutes }}" min="5" max="180"><span class="input-group-text">分</span></div></div>
+        <div class="col-6 col-md-3 col-lg-2"><label class="form-label">每站緩衝</label><div class="input-group"><input type="number" name="buffer_minutes" class="form-control" value="{{ buffer_minutes }}" min="0" max="60"><span class="input-group-text">分</span></div></div>
+        <div class="col-md-3"><label class="form-label">結束方式</label><select name="return_mode" class="form-select"><option value="last" {% if return_mode == 'last' %}selected{% endif %}>最後一站結束</option><option value="round_trip" {% if return_mode == 'round_trip' %}selected{% endif %}>最後回到出發地</option></select></div>
+        <div class="col-md-9 d-flex align-items-end gap-2 flex-wrap"><button class="btn btn-success" type="submit">產生最佳路線與時間表</button><button class="btn btn-outline-secondary" type="button" id="selectAllDev">全選</button><button class="btn btn-outline-secondary" type="button" id="clearAllDev">取消全選</button></div>
       </div>
 
       <div class="table-responsive">
-        <table class="table table-sm table-hover align-middle">
-          <thead>
-            <tr>
-              <th style="width:44px;">選</th>
-              <th>名稱</th>
-              <th>地址</th>
-              <th>電話</th>
-              <th>狀態 / 下一步</th>
-              <th>分數</th>
-              <th>來源</th>
-            </tr>
-          </thead>
+        <table class="table table-sm table-hover align-middle route-table">
+          <thead><tr><th>選</th><th>名稱</th><th>戶籍／導航地址</th><th>電話</th><th>狀態／下一步</th><th>分數</th><th>來源</th></tr></thead>
           <tbody>
           {% for item in items %}
             <tr>
               <td><input class="form-check-input dev-check" type="checkbox" name="development_ids" value="{{ item.id }}"></td>
-              <td>
-                <a href="{{ url_for('development_detail', development_id=item.id) }}">{{ item.name or "未命名" }}</a>
-                <div class="text-muted small">{{ item.created_at or "" }}</div>
-              </td>
-              <td>
-                {{ item.route_address or "-" }}
-                {% if not item.route_address %}
-                  <div class="text-danger small">缺地址，無法排導航</div>
-                {% endif %}
-              </td>
-              <td>{{ item.phone or "-" }}</td>
-              <td class="small">
-                {{ item.current_stage or item.stage or "-" }}<br>
-                <span class="text-muted">{{ item.next_action or "-" }} {{ item.next_action_date or "" }}</span>
-              </td>
+              <td>{% if item.id %}<a href="{{ url_for('development_detail', development_id=item.id) }}">{{ item.name or '未命名' }}</a>{% else %}{{ item.name or '未命名' }}{% endif %}</td>
+              <td style="min-width:250px">{{ item.route_address or '-' }}{% if not item.route_address %}<div class="text-danger small">缺地址，無法排導航</div>{% endif %}</td>
+              <td class="text-nowrap">{{ item.phone or '-' }}</td>
+              <td class="small">{{ item.current_stage or item.stage or '-' }}<br><span class="text-muted">{{ item.next_action or '-' }} {{ item.next_action_date or '' }}</span></td>
               <td><span class="badge text-bg-primary">{{ item.route_score }}</span></td>
-              <td>{{ item.source or "-" }}</td>
+              <td>{{ item.source or '-' }}</td>
             </tr>
-          {% endfor %}
+          {% else %}<tr><td colspan="7" class="text-center text-muted py-4">目前篩選條件沒有開發資料。</td></tr>{% endfor %}
           </tbody>
         </table>
       </div>
     </div>
   </form>
 </div>
+{% endblock %}
+{% block scripts %}
+<script>
+(function(){
+  const all = () => document.querySelectorAll('.dev-check');
+  document.getElementById('selectAllDev')?.addEventListener('click',()=>all().forEach(x=>x.checked=true));
+  document.getElementById('clearAllDev')?.addEventListener('click',()=>all().forEach(x=>x.checked=false));
+  document.getElementById('copyRouteButton')?.addEventListener('click', async ()=>{
+    const text = document.getElementById('routeText')?.value || '';
+    try{ await navigator.clipboard.writeText(text); alert('已複製開發行程'); }catch(e){ alert('複製失敗，請手動選取文字'); }
+  });
+})();
+</script>
 {% endblock %}

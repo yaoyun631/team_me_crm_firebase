@@ -1,266 +1,65 @@
 {% extends "base.html" %}
 {% block title %}實價登錄查詢｜厝米 Team M.E{% endblock %}
 {% block content %}
-
 <style>
-.property-table-wrap{max-height:70vh;overflow:auto;border:1px solid #eee;border-radius:12px}
-.property-detail-table thead th{background:#fff8f0;white-space:nowrap;z-index:2}
-.property-detail-table td,.property-detail-table th{padding:.65rem .7rem}
-@media (max-width:768px){.property-table-wrap{max-height:65vh}.property-detail-table{font-size:.82rem}}
+.property-table-wrap{max-height:72vh;overflow:auto;border:1px solid #eee;border-radius:12px}
+.property-detail-table thead th{background:#fff8f0;white-space:nowrap;z-index:2;cursor:pointer;user-select:none}
+.property-detail-table thead th.no-sort{cursor:default}.property-detail-table td,.property-detail-table th{padding:.65rem .7rem}
+.sort-indicator{font-size:.7rem;color:#999;margin-left:4px}.filter-chip{display:inline-block;border-radius:999px;padding:4px 9px;background:#fff3e6;color:#8b4d1a;font-size:.82rem}
+@media(max-width:768px){.property-table-wrap{max-height:66vh}.property-detail-table{font-size:.82rem}}
 </style>
 <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-3">
-  <div>
-    <h2 class="mb-1">實價登錄查詢</h2>
-    <div class="text-muted">輸入台中市地址，或貼上樂屋／591物件網址，由 ELLEN-PC 查詢實價資料庫。</div>
-  </div>
+  <div><h2 class="mb-1">實價登錄查詢</h2><div class="text-muted">可選搜尋距離、成交期間及屋齡範圍，逐筆表格可點欄位排序。</div></div>
   <a class="btn btn-outline-secondary" href="{{ url_for('index') }}">回首頁</a>
 </div>
 
-<div class="card dashboard-card mb-4">
-  <div class="card-body">
-    <form method="post" class="row g-2 align-items-end">
-      <div class="col-lg-9">
-        <label class="form-label fw-bold">地址或物件網址</label>
-        <input type="text" name="query" class="form-control form-control-lg" required
-               value="{{ query or '' }}"
-               placeholder="例：臺中市梧棲區文化路二段123號，或貼樂屋／591網址">
-        <div class="form-text">地址查詢會找本戶歷史成交及附近行情；網址查詢會先解析物件，再比對可能地址與實價。</div>
-      </div>
-      <div class="col-lg-3 d-grid">
-        <button type="submit" class="btn btn-primary btn-lg">建立查詢任務</button>
-      </div>
-    </form>
-  </div>
-</div>
+<div class="card dashboard-card mb-4"><div class="card-body">
+  <form method="post" class="row g-2 align-items-end">
+    <div class="col-12"><label class="form-label fw-bold">地址或物件網址</label><input type="text" name="query" class="form-control form-control-lg" required value="{{ query or '' }}" placeholder="例：臺中市梧棲區文化路二段123號，或貼樂屋／591網址"></div>
+    <div class="col-6 col-md-3 col-xl-2"><label class="form-label">搜尋距離</label><select name="radius" class="form-select">{% for value,label in [(250,'250公尺'),(500,'500公尺'),(1000,'1公里'),(2000,'2公里'),(3000,'3公里'),(5000,'5公里')] %}<option value="{{ value }}" {% if search_settings.radius == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+    <div class="col-6 col-md-3 col-xl-2"><label class="form-label">成交期間</label><select name="years" class="form-select">{% for value in [3,5,10] %}<option value="{{ value }}" {% if search_settings.years == value %}selected{% endif %}>最近 {{ value }} 年</option>{% endfor %}</select></div>
+    <div class="col-6 col-md-3 col-xl-2"><label class="form-label">屋齡範圍</label><select name="age_range" class="form-select">{% for key,values in age_range_options.items() %}<option value="{{ key }}" {% if search_settings.age_range == key %}selected{% endif %}>{{ values[2] }}</option>{% endfor %}</select></div>
+    <div class="col-6 col-md-3 col-xl-2"><label class="form-label">物件類型</label><select name="category" class="form-select">{% for opt in ['全部','住宅大樓','華廈','公寓','套房','透天厝','透天店面','店面','辦公商業','工廠廠辦','農舍','純土地'] %}<option value="{{ opt }}" {% if search_settings.category == opt %}selected{% endif %}>{{ opt }}</option>{% endfor %}</select></div>
+    <div class="col-6 col-md-3 col-xl-2"><div class="form-check mt-4"><input class="form-check-input" type="checkbox" name="include_special" value="1" id="includeSpecial" {% if search_settings.include_special %}checked{% endif %}><label class="form-check-label" for="includeSpecial">包含特殊交易</label></div></div>
+    <div class="col-6 col-md-3 col-xl-2 d-grid"><button type="submit" class="btn btn-primary">建立查詢任務</button></div>
+  </form>
+</div></div>
 
-{% if task_id %}
-<div class="card dashboard-card mb-4" id="taskCard" data-task-id="{{ task_id }}">
-  <div class="card-header bg-white fw-bold border-0 pt-3">查詢進度</div>
-  <div class="card-body pt-2">
-    <div class="d-flex align-items-center gap-3 flex-wrap">
-      <div id="taskSpinner" class="spinner-border spinner-border-sm text-primary" role="status"></div>
-      <div>
-        <div>任務：<code>{{ task_id }}</code></div>
-        <div class="small text-muted">狀態：<span id="taskStatus">{{ task_status or 'queued' }}</span></div>
-      </div>
-      <button type="button" class="btn btn-sm btn-outline-secondary" onclick="window.location.reload()">重新整理</button>
-    </div>
-    <div id="taskMessage" class="small text-muted mt-2">頁面會自動檢查 ELLEN-PC 回傳結果。</div>
-  </div>
-</div>
-{% endif %}
+{% if task_id %}<div class="card dashboard-card mb-4" id="taskCard" data-task-id="{{ task_id }}"><div class="card-header bg-white fw-bold border-0 pt-3">查詢進度</div><div class="card-body pt-2"><div class="d-flex align-items-center gap-3 flex-wrap"><div id="taskSpinner" class="spinner-border spinner-border-sm text-primary"></div><div><div>任務：<code>{{ task_id }}</code></div><div class="small text-muted">狀態：<span id="taskStatus">{{ task_status or 'queued' }}</span></div></div><button type="button" class="btn btn-sm btn-outline-secondary" onclick="window.location.reload()">重新整理</button></div><div id="taskMessage" class="small text-muted mt-2">頁面會自動檢查 ELLEN-PC 回傳結果。</div></div></div>{% endif %}
 
 {% if result %}
   {% set kind = result.get('kind') or '' %}
   {% if kind == 'url' %}
-  <div class="card dashboard-card mb-4">
-    <div class="card-header bg-white fw-bold border-0 pt-3">物件解析</div>
-    <div class="card-body">
-      {% set parsed = result.get('parsed') or {} %}
-      <h5>{{ parsed.get('title') or result.get('query') or '物件資料' }}</h5>
-      <div class="row g-2 mt-1">
-        <div class="col-6 col-md-2"><div class="p-3 rounded bg-light"><div class="small text-muted">總建坪</div><div class="fw-bold">{{ parsed.get('building_area_ping') or '—' }}</div></div></div>
-        <div class="col-6 col-md-2"><div class="p-3 rounded bg-light"><div class="small text-muted">主建物</div><div class="fw-bold">{{ parsed.get('main_area_ping') or '—' }}</div></div></div>
-        <div class="col-6 col-md-2"><div class="p-3 rounded bg-light"><div class="small text-muted">地坪</div><div class="fw-bold">{{ parsed.get('land_area_ping') or '—' }}</div></div></div>
-        <div class="col-6 col-md-2"><div class="p-3 rounded bg-light"><div class="small text-muted">區域</div><div class="fw-bold">{{ parsed.get('district') or '—' }}</div></div></div>
-        <div class="col-6 col-md-2"><div class="p-3 rounded bg-light"><div class="small text-muted">樓層</div><div class="fw-bold">{{ parsed.get('floor_text') or parsed.get('total_floors') or '—' }}</div></div></div>
-        <div class="col-6 col-md-2"><div class="p-3 rounded bg-light"><div class="small text-muted">屋齡</div><div class="fw-bold">{{ parsed.get('building_age') or '—' }}</div></div></div>
-      </div>
-    </div>
-  </div>
-
-  <div class="card dashboard-card mb-4">
-    <div class="card-header bg-white fw-bold border-0 pt-3">可能地址與實價候選</div>
-    <div class="card-body pt-2 table-responsive">
-      <table class="table table-hover align-middle">
-        <thead><tr><th>#</th><th>地址</th><th>符合率</th><th>總建坪</th><th>主建物</th><th>樓層</th><th>屋齡</th></tr></thead>
-        <tbody>
-          {% for c in result.get('candidates') or [] %}
-          <tr>
-            <td>{{ loop.index }}</td><td>{{ c.get('address') or '-' }}</td><td>{{ c.get('core_exact_match_ratio') or '-' }}%</td>
-            <td>{{ c.get('building_area_ping') or '-' }}</td><td>{{ c.get('main_building_area_ping') or '-' }}</td>
-            <td>{{ c.get('transfer_floor') or '-' }}/{{ c.get('total_floors') or '-' }}</td><td>{{ c.get('candidate_current_age') or '-' }}</td>
-          </tr>
-          {% else %}<tr><td colspan="7" class="text-center text-muted">目前沒有候選地址</td></tr>{% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
+  <div class="card dashboard-card mb-4"><div class="card-header bg-white fw-bold border-0 pt-3">物件解析</div><div class="card-body">{% set parsed = result.get('parsed') or {} %}<h5>{{ parsed.get('title') or result.get('query') or '物件資料' }}</h5><div class="row g-2 mt-1">{% for label,key in [('總建坪','building_area_ping'),('主建物','main_area_ping'),('地坪','land_area_ping'),('區域','district'),('樓層','floor_text'),('屋齡','building_age')] %}<div class="col-6 col-md-2"><div class="p-3 rounded bg-light"><div class="small text-muted">{{ label }}</div><div class="fw-bold">{{ parsed.get(key) or '—' }}</div></div></div>{% endfor %}</div></div></div>
   {% else %}
-  {% set summary = result.get('summary') or {} %}
-  {% set settings = result.get('query_settings') or {} %}
-  {% set target = result.get('target') or {} %}
-  {% set exact_rows = result.get('transactions') or result.get('exact_transactions') or [] %}
-  {% set nearby_rows = result.get('nearby_transactions') or result.get('nearby_records') or result.get('nearby_rows') or result.get('records') or result.get('items') or [] %}
-  <div class="card dashboard-card mb-4">
-    <div class="card-header bg-white fw-bold border-0 pt-3">地址行情結果</div>
-    <div class="card-body">
-      <h5>{{ target.get('full_address') or result.get('query') or query or '地址查詢' }}</h5>
-      {% if target.get('full_address') and result.get('query') and target.get('full_address') != result.get('query') %}
-      <div class="small text-muted mb-2">輸入地址：{{ result.get('query') }}</div>
-      {% endif %}
-      <div class="row g-2 mt-1">
-        <div class="col-6 col-md-4 col-xl-2"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">附近成交</div><div class="fs-4 fw-bold">{{ summary.get('count') or nearby_rows|length or 0 }}</div></div></div>
-        <div class="col-6 col-md-4 col-xl-2"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">單價中位數</div><div class="fs-4 fw-bold">{{ summary.get('median_unit') or '—' }}</div><div class="small text-muted">萬／坪</div></div></div>
-        <div class="col-6 col-md-4 col-xl-2"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">平均單價</div><div class="fs-4 fw-bold">{{ summary.get('average_unit') or '—' }}</div><div class="small text-muted">萬／坪</div></div></div>
-        <div class="col-6 col-md-4 col-xl-2"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">總價中位數</div><div class="fs-4 fw-bold">{{ summary.get('median_total') or '—' }}</div><div class="small text-muted">萬元</div></div></div>
-        <div class="col-6 col-md-4 col-xl-2"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">最近成交</div><div class="fw-bold mt-1">{{ summary.get('latest') or '—' }}</div></div></div>
-        <div class="col-6 col-md-4 col-xl-2"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">查詢範圍</div><div class="fw-bold mt-1">{{ settings.get('radius') or 500 }} 公尺</div><div class="small text-muted">最近 {{ settings.get('years') or 5 }} 年</div></div></div>
-      </div>
-    </div>
-  </div>
+  {% set summary = result.get('summary') or {} %}{% set settings = result.get('query_settings') or search_settings or {} %}{% set target = result.get('target') or {} %}{% set exact_rows = result.get('transactions') or result.get('exact_transactions') or [] %}{% set nearby_rows = result.get('nearby_transactions') or result.get('nearby_records') or result.get('nearby_rows') or result.get('records') or result.get('items') or [] %}
+  <div class="card dashboard-card mb-4"><div class="card-header bg-white fw-bold border-0 pt-3">地址行情結果</div><div class="card-body"><h5>{{ target.get('full_address') or result.get('query') or query or '地址查詢' }}</h5><div class="d-flex gap-2 flex-wrap mb-2"><span class="filter-chip">{{ settings.get('radius') or 500 }} 公尺</span><span class="filter-chip">最近 {{ settings.get('years') or 5 }} 年</span><span class="filter-chip">{{ settings.get('age_label') or search_settings.age_label or '全部屋齡' }}</span><span class="filter-chip">{{ settings.get('category') or '全部' }}</span></div><div class="row g-2 mt-1">{% for label,value,unit in [('附近成交',summary.get('count') or nearby_rows|length or 0,''),('單價中位數',summary.get('median_unit') or '—','萬／坪'),('平均單價',summary.get('average_unit') or '—','萬／坪'),('總價中位數',summary.get('median_total') or '—','萬元'),('最近成交',summary.get('latest') or '—','')] %}<div class="col-6 col-md"><div class="p-3 rounded bg-light h-100"><div class="small text-muted">{{ label }}</div><div class="fs-4 fw-bold">{{ value }}</div>{% if unit %}<div class="small text-muted">{{ unit }}</div>{% endif %}</div></div>{% endfor %}</div></div></div>
 
-  {% if exact_rows %}
-  <div class="card dashboard-card mb-4">
-    <div class="card-header bg-white border-0 pt-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
-      <span class="fw-bold">本戶歷史成交</span>
-      <span class="badge text-bg-light">{{ exact_rows|length }} 筆</span>
-    </div>
-    <div class="card-body pt-2 table-responsive">
-      <table class="table table-sm table-hover align-middle mb-0 property-detail-table">
-        <thead><tr><th>#</th><th>成交日期</th><th>交易位置</th><th>類型</th><th>樓層</th><th>地坪</th><th>建坪</th><th>總價（萬）</th><th>單價（萬／坪）</th><th>屋齡</th></tr></thead>
-        <tbody>
-          {% for row in exact_rows %}
-          <tr>
-            <td>{{ loop.index }}</td>
-            <td class="text-nowrap">{{ row.get('transaction_date') or row.get('date') or '-' }}</td>
-            <td style="min-width:220px">{{ row.get('address') or row.get('full_address') or '-' }}</td>
-            <td class="text-nowrap">{{ row.get('property_category') or row.get('category') or '-' }}</td>
-            <td class="text-nowrap">{{ row.get('floor_text') or row.get('transfer_floor') or row.get('floor') or '-' }}</td>
-            <td class="text-nowrap">{{ row.get('land_area_ping') if row.get('land_area_ping') not in (none, '') else '-' }}</td>
-            <td class="text-nowrap">{{ row.get('building_area_ping') if row.get('building_area_ping') not in (none, '') else row.get('area_ping') or '-' }}</td>
-            <td class="text-nowrap fw-semibold">{{ row.get('total_price_wan') if row.get('total_price_wan') not in (none, '') else row.get('total_price') or row.get('price') or '-' }}</td>
-            <td class="text-nowrap">{{ row.get('unit_price_wan') if row.get('unit_price_wan') not in (none, '') else row.get('unit_price') or '-' }}</td>
-            <td class="text-nowrap">{{ row.get('building_age') if row.get('building_age') not in (none, '') else row.get('age') or '-' }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
+  {% if exact_rows %}<div class="card dashboard-card mb-4"><div class="card-header bg-white border-0 pt-3 d-flex justify-content-between"><span class="fw-bold">本戶歷史成交</span><span class="badge text-bg-light">{{ exact_rows|length }} 筆</span></div><div class="card-body pt-2 table-responsive"><table class="table table-sm table-hover align-middle mb-0 property-detail-table" data-sortable><thead><tr><th class="no-sort">#</th><th data-sort-type="date">成交日期<span class="sort-indicator"></span></th><th data-sort-type="text">交易位置<span class="sort-indicator"></span></th><th data-sort-type="text">類型<span class="sort-indicator"></span></th><th data-sort-type="text">樓層<span class="sort-indicator"></span></th><th data-sort-type="number">地坪<span class="sort-indicator"></span></th><th data-sort-type="number">建坪<span class="sort-indicator"></span></th><th data-sort-type="number">總價（萬）<span class="sort-indicator"></span></th><th data-sort-type="number">單價<span class="sort-indicator"></span></th><th data-sort-type="number">屋齡<span class="sort-indicator"></span></th></tr></thead><tbody>{% for row in exact_rows %}<tr><td>{{ loop.index }}</td><td data-sort="{{ row.get('transaction_date') or '' }}">{{ row.get('transaction_date') or '-' }}</td><td data-sort="{{ row.get('address') or '' }}">{{ row.get('address') or '-' }}</td><td data-sort="{{ row.get('property_category') or '' }}">{{ row.get('property_category') or '-' }}</td><td data-sort="{{ row.get('floor_text') or '' }}">{{ row.get('floor_text') or row.get('transfer_floor') or '-' }}</td><td data-sort="{{ row.get('land_area_ping') or '' }}">{{ row.get('land_area_ping') if row.get('land_area_ping') not in (none,'') else '-' }}</td><td data-sort="{{ row.get('building_area_ping') or '' }}">{{ row.get('building_area_ping') if row.get('building_area_ping') not in (none,'') else '-' }}</td><td data-sort="{{ row.get('total_price_wan') or '' }}" class="fw-semibold">{{ row.get('total_price_wan') if row.get('total_price_wan') not in (none,'') else '-' }}</td><td data-sort="{{ row.get('unit_price_wan') or '' }}">{{ row.get('unit_price_wan') if row.get('unit_price_wan') not in (none,'') else '-' }}</td><td data-sort="{{ row.get('building_age') or '' }}">{{ row.get('building_age') if row.get('building_age') not in (none,'') else '-' }}</td></tr>{% endfor %}</tbody></table></div></div>{% endif %}
+
+  <div class="card dashboard-card mb-4"><div class="card-header bg-white border-0 pt-3 d-flex justify-content-between align-items-center flex-wrap gap-2"><div><div class="fw-bold">附近成交逐筆明細</div><div class="small text-muted">點擊欄位名稱可升冪／降冪排序。</div></div><div class="d-flex gap-2"><input id="transactionFilter" type="search" class="form-control form-control-sm" style="min-width:220px" placeholder="搜尋地址、類型、日期或價格"><button type="button" class="btn btn-sm btn-outline-secondary" id="clearTransactionFilter">清除</button></div></div><div class="card-body pt-2">{% if result.get('nearby_rows_error') %}<div class="alert alert-warning py-2">逐筆資料讀取失敗：{{ result.get('nearby_rows_error') }}</div>{% endif %}<div class="table-responsive property-table-wrap"><table class="table table-sm table-hover align-middle mb-0 property-detail-table" id="nearbyTransactionTable" data-sortable><thead class="sticky-top"><tr><th class="no-sort">#</th><th data-sort-type="number">距離<span class="sort-indicator"></span></th><th data-sort-type="date">成交日期<span class="sort-indicator"></span></th><th data-sort-type="text">類型<span class="sort-indicator"></span></th><th data-sort-type="text">交易位置<span class="sort-indicator"></span></th><th data-sort-type="text">樓層<span class="sort-indicator"></span></th><th data-sort-type="text">房／廳／衛<span class="sort-indicator"></span></th><th data-sort-type="number">地坪<span class="sort-indicator"></span></th><th data-sort-type="number">建坪<span class="sort-indicator"></span></th><th data-sort-type="number">總價（萬）<span class="sort-indicator"></span></th><th data-sort-type="number">單價<span class="sort-indicator"></span></th><th data-sort-type="number">屋齡<span class="sort-indicator"></span></th><th data-sort-type="text">資料來源<span class="sort-indicator"></span></th></tr></thead><tbody>{% for row in nearby_rows %}<tr class="nearby-transaction-row"><td>{{ loop.index }}</td><td data-sort="{{ row.get('distance_m') or '' }}">{% if row.get('distance_m') not in (none,'') %}{{ row.get('distance_m') }} m{% else %}-{% endif %}</td><td data-sort="{{ row.get('transaction_date') or '' }}">{{ row.get('transaction_date') or '-' }}</td><td data-sort="{{ row.get('property_category') or '' }}">{{ row.get('property_category') or row.get('category') or '-' }}</td><td data-sort="{{ row.get('address') or '' }}" style="min-width:240px">{{ row.get('address') or '-' }}</td><td data-sort="{{ row.get('floor_text') or '' }}">{{ row.get('floor_text') or row.get('transfer_floor') or '-' }}</td><td data-sort="{{ row.get('layout_text') or '' }}">{{ row.get('layout_text') or '-' }}</td><td data-sort="{{ row.get('land_area_ping') or '' }}">{{ row.get('land_area_ping') if row.get('land_area_ping') not in (none,'') else '-' }}</td><td data-sort="{{ row.get('building_area_ping') or '' }}">{{ row.get('building_area_ping') if row.get('building_area_ping') not in (none,'') else '-' }}</td><td data-sort="{{ row.get('total_price_wan') or '' }}" class="fw-semibold">{{ row.get('total_price_wan') if row.get('total_price_wan') not in (none,'') else '-' }}</td><td data-sort="{{ row.get('unit_price_wan') or '' }}">{{ row.get('unit_price_wan') if row.get('unit_price_wan') not in (none,'') else '-' }}</td><td data-sort="{{ row.get('building_age') or '' }}">{{ row.get('building_age') if row.get('building_age') not in (none,'') else '-' }}</td><td data-sort="{{ row.get('source_year') or '' }}">{% if row.get('source_year') %}{{ row.get('source_year') }}{% if row.get('source_quarter') %} Q{{ row.get('source_quarter') }}{% endif %}{% else %}-{% endif %}</td></tr>{% else %}<tr><td colspan="13" class="text-center text-muted py-4">沒有符合距離與屋齡條件的成交資料。</td></tr>{% endfor %}</tbody></table></div><div class="small text-muted mt-2" id="transactionFilterCount">顯示 {{ nearby_rows|length }} 筆</div></div></div>
   {% endif %}
-
-  <div class="card dashboard-card mb-4">
-    <div class="card-header bg-white border-0 pt-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
-      <div>
-        <div class="fw-bold">附近成交逐筆明細</div>
-        <div class="small text-muted">依成交日期由新到舊顯示；目前回傳 {{ nearby_rows|length }} 筆。</div>
-      </div>
-      <div class="d-flex gap-2 flex-wrap">
-        <input id="transactionFilter" type="search" class="form-control form-control-sm" style="min-width:220px" placeholder="搜尋地址、類型、日期或價格">
-        <button type="button" class="btn btn-sm btn-outline-secondary" id="clearTransactionFilter">清除</button>
-      </div>
-    </div>
-    <div class="card-body pt-2">
-      {% if result.get('nearby_rows_error') %}
-      <div class="alert alert-warning py-2">逐筆資料讀取失敗：{{ result.get('nearby_rows_error') }}</div>
-      {% endif %}
-      {% if result.get('nearby_rows_truncated') %}
-      <div class="alert alert-warning py-2">成交資料共 {{ result.get('nearby_rows_total') }} 筆，為避免結果過大，目前顯示前 {{ result.get('nearby_rows_returned') }} 筆。</div>
-      {% endif %}
-      <div class="table-responsive property-table-wrap">
-        <table class="table table-sm table-hover align-middle mb-0 property-detail-table" id="nearbyTransactionTable">
-          <thead class="sticky-top"><tr>
-            <th>#</th><th>距離</th><th>成交日期</th><th>類型</th><th>交易位置</th><th>樓層</th><th>房／廳／衛</th><th>地坪</th><th>建坪</th><th>總價（萬）</th><th>單價（萬／坪）</th><th>屋齡</th><th>資料來源</th>
-          </tr></thead>
-          <tbody>
-            {% for row in nearby_rows %}
-            <tr class="nearby-transaction-row">
-              <td>{{ loop.index }}</td>
-              <td class="text-nowrap">{% if row.get('distance_m') not in (none, '') %}{{ row.get('distance_m') }} m{% else %}-{% endif %}</td>
-              <td class="text-nowrap">{{ row.get('transaction_date') or row.get('date') or '-' }}</td>
-              <td class="text-nowrap">{{ row.get('property_category') or row.get('category') or row.get('property_type') or '-' }}</td>
-              <td style="min-width:240px">{{ row.get('address') or row.get('full_address') or row.get('location') or '-' }}</td>
-              <td class="text-nowrap">{{ row.get('floor_text') or row.get('transfer_floor') or row.get('floor') or '-' }}</td>
-              <td class="text-nowrap">{{ row.get('layout_text') or '-' }}</td>
-              <td class="text-nowrap">{{ row.get('land_area_ping') if row.get('land_area_ping') not in (none, '') else '-' }}</td>
-              <td class="text-nowrap">{{ row.get('building_area_ping') if row.get('building_area_ping') not in (none, '') else row.get('area_ping') or '-' }}</td>
-              <td class="text-nowrap fw-semibold">{{ row.get('total_price_wan') if row.get('total_price_wan') not in (none, '') else row.get('total_price') or row.get('price') or '-' }}</td>
-              <td class="text-nowrap">{{ row.get('unit_price_wan') if row.get('unit_price_wan') not in (none, '') else row.get('unit_price') or '-' }}</td>
-              <td class="text-nowrap">{{ row.get('building_age') if row.get('building_age') not in (none, '') else row.get('age') or '-' }}</td>
-              <td class="text-nowrap">{% if row.get('source_year') %}{{ row.get('source_year') }}{% if row.get('source_quarter') %} Q{{ row.get('source_quarter') }}{% endif %}{% else %}-{% endif %}</td>
-            </tr>
-            {% else %}
-            <tr><td colspan="13" class="text-center text-muted py-4">目前只有統計摘要，沒有收到逐筆成交資料。請更新 ELLEN-PC 的 local_agent.py 後重新查詢。</td></tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      <div class="small text-muted mt-2" id="transactionFilterCount">顯示 {{ nearby_rows|length }} 筆</div>
-    </div>
-  </div>
-  {% endif %}
-
-  <details class="card dashboard-card mb-4">
-    <summary class="card-header bg-white fw-bold border-0 py-3">查看完整 JSON</summary>
-    <div class="card-body"><pre class="small mb-0" style="white-space:pre-wrap;max-height:480px;overflow:auto">{{ raw_json }}</pre></div>
-  </details>
+  <details class="card dashboard-card mb-4"><summary class="card-header bg-white fw-bold border-0 py-3">查看完整 JSON</summary><div class="card-body"><pre class="small mb-0" style="white-space:pre-wrap;max-height:480px;overflow:auto">{{ raw_json }}</pre></div></details>
 {% endif %}
 {% endblock %}
 
 {% block scripts %}
-{% if task_id and not result %}
-<script>
+{% if task_id and not result %}<script>(function(){const taskId={{ task_id|tojson }},s=document.getElementById('taskStatus'),m=document.getElementById('taskMessage'),sp=document.getElementById('taskSpinner');let n=0;async function poll(){n++;try{const r=await fetch({{ url_for('property_search_status',task_id=task_id)|tojson }},{cache:'no-store'}),d=await r.json();s.textContent=d.status||'unknown';if(d.ready){m.textContent='查詢完成，正在載入結果…';location.reload();return}if(['error','failed'].includes(d.status)){sp?.classList.add('d-none');m.textContent=d.message||'查詢失敗';return}m.textContent='等待 ELLEN-PC 處理中，第 '+n+' 次檢查。'}catch(e){m.textContent='暫時無法取得狀態，稍後會再試。'}if(n<80)setTimeout(poll,3000)}setTimeout(poll,1200)})();</script>{% endif %}
+{% if result and (result.get('kind') or '') == 'address' %}<script>
 (function(){
-  const taskId = {{ task_id|tojson }};
-  const statusEl = document.getElementById('taskStatus');
-  const messageEl = document.getElementById('taskMessage');
-  const spinner = document.getElementById('taskSpinner');
-  let attempts = 0;
-  async function poll(){
-    attempts += 1;
-    try{
-      const response = await fetch({{ url_for('property_search_status', task_id=task_id)|tojson }}, {cache:'no-store'});
-      const data = await response.json();
-      statusEl.textContent = data.status || 'unknown';
-      if(data.ready){
-        messageEl.textContent = '查詢完成，正在載入結果…';
-        window.location.reload();
-        return;
-      }
-      if(data.status === 'error' || data.status === 'failed'){
-        spinner.classList.add('d-none');
-        messageEl.textContent = data.message || '查詢失敗，請查看 ELLEN-PC 任務紀錄。';
-        return;
-      }
-      messageEl.textContent = '等待 ELLEN-PC 處理中，第 ' + attempts + ' 次檢查。';
-    }catch(err){
-      messageEl.textContent = '暫時無法取得狀態，稍後會再試。';
-    }
-    if(attempts < 80) setTimeout(poll, 3000);
-  }
-  setTimeout(poll, 1200);
-})();
-</script>
-{% endif %}
-
-{% if result and (result.get('kind') or '') == 'address' %}
-<script>
-(function(){
-  const input = document.getElementById('transactionFilter');
-  const clearButton = document.getElementById('clearTransactionFilter');
-  const rows = Array.from(document.querySelectorAll('.nearby-transaction-row'));
-  const count = document.getElementById('transactionFilterCount');
-  if(!input || !rows.length) return;
-  function applyFilter(){
-    const keyword = (input.value || '').trim().toLowerCase();
-    let visible = 0;
-    rows.forEach(row => {
-      const matched = !keyword || (row.innerText || '').toLowerCase().includes(keyword);
-      row.classList.toggle('d-none', !matched);
-      if(matched) visible += 1;
+  function valueOf(cell,type){const raw=(cell?.dataset.sort??cell?.innerText??'').trim();if(!raw)return null;if(type==='number'){const n=parseFloat(raw.replace(/,/g,''));return Number.isFinite(n)?n:null}if(type==='date'){const t=Date.parse(raw.replace(/\//g,'-'));return Number.isFinite(t)?t:null}return raw.toLocaleLowerCase()}
+  document.querySelectorAll('table[data-sortable]').forEach(table=>{
+    table.querySelectorAll('thead th[data-sort-type]').forEach((th,indexInHeaders)=>{
+      th.addEventListener('click',()=>{
+        const headers=Array.from(th.parentElement.children),column=headers.indexOf(th),type=th.dataset.sortType||'text';
+        const nextDir=th.dataset.sortDir==='asc'?'desc':'asc';headers.forEach(h=>{h.dataset.sortDir='';const i=h.querySelector('.sort-indicator');if(i)i.textContent=''});th.dataset.sortDir=nextDir;const indicator=th.querySelector('.sort-indicator');if(indicator)indicator.textContent=nextDir==='asc'?'▲':'▼';
+        const body=table.tBodies[0],rows=Array.from(body.rows).filter(r=>r.cells.length>1);rows.sort((a,b)=>{const av=valueOf(a.cells[column],type),bv=valueOf(b.cells[column],type);if(av===null&&bv===null)return 0;if(av===null)return 1;if(bv===null)return -1;let cmp=type==='text'?String(av).localeCompare(String(bv),'zh-Hant'):(av-bv);return nextDir==='asc'?cmp:-cmp});rows.forEach((row,i)=>{body.appendChild(row);if(row.cells[0])row.cells[0].textContent=String(i+1)});
+      });
     });
-    if(count) count.textContent = '顯示 ' + visible + ' 筆／共 ' + rows.length + ' 筆';
-  }
-  input.addEventListener('input', applyFilter);
-  if(clearButton){
-    clearButton.addEventListener('click', function(){
-      input.value = '';
-      applyFilter();
-      input.focus();
-    });
-  }
+  });
+  const input=document.getElementById('transactionFilter'),clear=document.getElementById('clearTransactionFilter'),count=document.getElementById('transactionFilterCount');
+  function filter(){const rows=Array.from(document.querySelectorAll('.nearby-transaction-row')),q=(input?.value||'').trim().toLowerCase();let visible=0;rows.forEach(row=>{const ok=!q||(row.innerText||'').toLowerCase().includes(q);row.classList.toggle('d-none',!ok);if(ok)visible++});if(count)count.textContent='顯示 '+visible+' 筆／共 '+rows.length+' 筆'}
+  input?.addEventListener('input',filter);clear?.addEventListener('click',()=>{input.value='';filter();input.focus()});
 })();
-</script>
-{% endif %}
+</script>{% endif %}
 {% endblock %}

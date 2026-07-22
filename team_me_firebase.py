@@ -38513,3 +38513,780 @@ if __name__ == "__main__":
 # - 本戶成交與附近成交分開呈現
 # - ELLEN-PC local_agent 需回傳 nearby_transactions
 # =============================================================================
+
+
+# =============================================================================
+# Team M.E v28｜591 僅使用實際卡片 anchor href
+#
+# v27 問題：候選網址順序先讀 detail_url/source_url/url，這些欄位可能由
+# card data-id 重建，導致標題是 20527966，網址卻變成 24703208。
+#
+# v28 原則：
+# - 只採用 raw.title_href / raw.header_href / raw.detail_href /
+#   raw.anchor_hrefs / raw.href 等實際 DOM anchor。
+# - 不使用 source_listing_id、listing_key、card_data_id 猜測 591 網址。
+# - 保留實際 href 的 itm_source / itm_medium / itm_campaign 查詢參數。
+# - 舊資料沒有 actual anchor 證據時不顯示連結，避免再連錯。
+# =============================================================================
+
+
+def _v28_clean_actual_href(value):
+    import html as _html
+    from urllib.parse import urljoin
+
+    text = _html.unescape(str(value or '')).strip()
+    text = text.replace('\\u0026', '&').replace('&amp;', '&')
+    if text.startswith('//'):
+        text = 'https:' + text
+    elif text.startswith('/'):
+        text = urljoin('https://sale.591.com.tw', text)
+    return text
+
+
+def _v28_591_actual_href_candidates(data):
+    data = data or {}
+    raw = data.get('raw') or {}
+    weighted = []
+
+    if isinstance(raw, dict):
+        weighted.extend([
+            (80, 'raw.title_href', raw.get('title_href')),
+            (78, 'raw.header_href', raw.get('header_href')),
+            (76, 'raw.detail_href', raw.get('detail_href')),
+        ])
+        anchor_hrefs = raw.get('anchor_hrefs') or []
+        if isinstance(anchor_hrefs, (list, tuple)):
+            for index, href in enumerate(anchor_hrefs):
+                weighted.append((72 - min(index, 20), f'raw.anchor_hrefs[{index}]', href))
+        weighted.append((55, 'raw.href', raw.get('href')))
+
+    weighted.extend([
+        (70, 'data.title_href', data.get('title_href')),
+        (68, 'data.header_href', data.get('header_href')),
+        (66, 'data.detail_href', data.get('detail_href')),
+    ])
+
+    # property_alert_items 通常不保留 raw；只有 strict policy 寫入的
+    # captured_detail_url 才能視為實際 anchor 證據。
+    policy = str(data.get('url_policy') or '').strip().lower()
+    verified_source = str(data.get('url_verified_source') or '').strip().lower()
+    strict_verified = (
+        policy in {
+            'v45_strict_actual_anchor_href',
+            'v28_strict_actual_anchor_href',
+        }
+        or verified_source == 'actual_dom_anchor'
+    )
+    if strict_verified:
+        weighted.extend([
+            (90, 'data.captured_detail_url', data.get('captured_detail_url')),
+            (85, 'data.url', data.get('url')),
+            (84, 'data.listing_url', data.get('listing_url')),
+        ])
+
+    seen = set()
+    result = []
+    for base_score, field_name, value in weighted:
+        href = _v28_clean_actual_href(value)
+        if not href or href in seen:
+            continue
+        seen.add(href)
+        lower = href.lower()
+        if '591.com.tw' not in lower:
+            continue
+        if '/home/house/detail/' not in lower or '.html' not in lower:
+            continue
+
+        score = base_score
+        if 'itm_source=sale' in lower:
+            score += 60
+        if 'itm_medium=list' in lower:
+            score += 20
+        if 'itm_campaign=filter_results' in lower:
+            score += 40
+        if 'sale.591.com.tw' in lower:
+            score += 10
+        result.append((score, field_name, href))
+
+    result.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return result
+
+
+def _v28_actual_591_detail(data):
+    import re
+
+    for _score, field_name, href in _v28_591_actual_href_candidates(data):
+        matched = re.search(
+            r'/home/house/detail/(?:[^/?#]+/)*(\d+)\.html(?:[?#]|$)',
+            href,
+            flags=re.I,
+        )
+        if matched:
+            return matched.group(1), href, field_name
+    return '', '', ''
+
+
+_v28_previous_canonical_property_url = _v27_canonical_property_url
+
+
+def _v27_extract_591_id(data, candidates=None):
+    listing_id, _href, _field = _v28_actual_591_detail(data or {})
+    return listing_id
+
+
+def _v27_canonical_property_url(data):
+    data = data or {}
+    source = _v27_source_name(data, _v27_listing_url_candidates(data))
+    if source == '591':
+        _listing_id, href, _field = _v28_actual_591_detail(data)
+        return href
+    return _v28_previous_canonical_property_url(data)
+
+
+print('✅ Team M.E v28 已啟用：591 每日新物件只顯示實際卡片 anchor href。')
+
+# =============================================================================
+# Team M.E v28 End
+# =============================================================================
+
+# =============================================================================
+# Team M.E v29｜開發最佳路線排程＋實價距離屋齡篩選
+# =============================================================================
+
+
+def _v29_float(value, default=None):
+    try:
+        if value in (None, ""):
+            return default
+        return float(str(value).replace(",", "").strip())
+    except Exception:
+        return default
+
+
+def _v29_int(value, default=0, minimum=None, maximum=None):
+    try:
+        result = int(float(str(value).strip()))
+    except Exception:
+        result = default
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def _v29_parse_duration_seconds(value):
+    text = str(value or "").strip()
+    if text.endswith("s"):
+        text = text[:-1]
+    try:
+        return max(0, int(round(float(text))))
+    except Exception:
+        return 0
+
+
+def _v29_route_departure(route_date: str, start_time: str):
+    from datetime import datetime, timedelta
+
+    date_text = str(route_date or "").strip() or now_taipei().strftime("%Y-%m-%d")
+    time_text = str(start_time or "").strip() or "09:00"
+    try:
+        naive = datetime.strptime(f"{date_text} {time_text}", "%Y-%m-%d %H:%M")
+    except Exception:
+        naive = datetime.strptime(
+            f"{now_taipei().strftime('%Y-%m-%d')} 09:00",
+            "%Y-%m-%d %H:%M",
+        )
+    try:
+        aware = TAIPEI_TZ.localize(naive)
+    except Exception:
+        aware = naive.replace(tzinfo=TAIPEI_TZ)
+
+    # 過去時間無法準確取得即時交通；自動從現在後 2 分鐘開始。
+    current = now_taipei()
+    if aware < current - timedelta(minutes=5):
+        aware = current + timedelta(minutes=2)
+        aware = aware.replace(second=0, microsecond=0)
+    return aware
+
+
+def _v29_route_api_waypoint(address: str):
+    return {"address": str(address or "").strip()}
+
+
+def _v29_google_routes_optimize(seed_items, start_address, return_to_start, departure_dt):
+    """使用 Google Routes API 依道路時間最佳化，失敗時回傳 None。"""
+    import os
+    import requests
+
+    api_key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    usable = [dict(x) for x in (seed_items or []) if _development_route_address(x)]
+    if not usable:
+        return None
+
+    start_address = _development_route_safe(start_address)
+    first_is_origin = False
+
+    if start_address:
+        origin_address = start_address
+        if return_to_start:
+            destination_address = start_address
+            intermediates_items = usable
+            destination_item = None
+        else:
+            destination_item = usable[-1]
+            destination_address = _development_route_address(destination_item)
+            intermediates_items = usable[:-1]
+    else:
+        # 未輸入出發地時，第一站視為行程起點，當下即開始拜訪。
+        first_is_origin = True
+        origin_item = usable[0]
+        origin_address = _development_route_address(origin_item)
+        if len(usable) == 1:
+            return {
+                "ordered_items": usable,
+                "legs": [],
+                "distance_meters": 0,
+                "duration_seconds": 0,
+                "method": "單一開發點",
+                "first_is_origin": True,
+            }
+        destination_item = usable[-1]
+        destination_address = _development_route_address(destination_item)
+        intermediates_items = usable[1:-1]
+
+    payload = {
+        "origin": _v29_route_api_waypoint(origin_address),
+        "destination": _v29_route_api_waypoint(destination_address),
+        "intermediates": [
+            _v29_route_api_waypoint(_development_route_address(item))
+            for item in intermediates_items
+        ],
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE",
+        "departureTime": departure_dt.astimezone(__import__('datetime').timezone.utc).isoformat().replace("+00:00", "Z"),
+        "optimizeWaypointOrder": bool(intermediates_items),
+        "languageCode": "zh-TW",
+        "regionCode": "tw",
+        "units": "METRIC",
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": (
+            "routes.duration,routes.distanceMeters,"
+            "routes.optimizedIntermediateWaypointIndex,"
+            "routes.legs.duration,routes.legs.distanceMeters"
+        ),
+    }
+
+    try:
+        response = requests.post(
+            "https://routes.googleapis.com/directions/v2:computeRoutes",
+            json=payload,
+            headers=headers,
+            timeout=18,
+        )
+        if response.status_code >= 400:
+            print("⚠️ v29 Routes API 回傳錯誤：", response.status_code, response.text[:500])
+            return None
+        data = response.json() or {}
+        routes = data.get("routes") or []
+        if not routes:
+            return None
+        route = routes[0]
+        order_indexes = (
+            route.get("optimizedIntermediateWaypointIndex")
+            or route.get("optimizedIntermediateWaypointIndices")
+            or list(range(len(intermediates_items)))
+        )
+        ordered_intermediates = []
+        for index in order_indexes:
+            try:
+                ordered_intermediates.append(intermediates_items[int(index)])
+            except Exception:
+                pass
+        # API 未回傳完整順序時補回遺漏點。
+        used_ids = {id(x) for x in ordered_intermediates}
+        ordered_intermediates.extend(x for x in intermediates_items if id(x) not in used_ids)
+
+        if start_address:
+            ordered_items = ordered_intermediates + ([destination_item] if destination_item else [])
+        else:
+            ordered_items = [usable[0]] + ordered_intermediates + ([destination_item] if destination_item else [])
+
+        legs = []
+        for leg in route.get("legs") or []:
+            legs.append({
+                "duration_seconds": _v29_parse_duration_seconds(leg.get("duration")),
+                "distance_meters": _v29_int(leg.get("distanceMeters"), 0, 0),
+            })
+
+        return {
+            "ordered_items": ordered_items,
+            "legs": legs,
+            "distance_meters": _v29_int(route.get("distanceMeters"), 0, 0),
+            "duration_seconds": _v29_parse_duration_seconds(route.get("duration")),
+            "method": "Google Routes API 交通時間最佳化",
+            "first_is_origin": first_is_origin,
+        }
+    except Exception as exc:
+        print("⚠️ v29 Google Routes API 最佳化失敗：", type(exc).__name__, exc)
+        return None
+
+
+def _v29_fallback_route_legs(ordered_items, start_address):
+    """沒有 Routes API 時，用座標距離推估每段道路時間。"""
+    legs = []
+    start_point = _development_route_geocode(start_address) if start_address else None
+    current = start_point
+    first_is_origin = not bool(start_address)
+
+    for index, item in enumerate(ordered_items or []):
+        point = item.get("_route_point") or _development_route_latlng(item)
+        if not point:
+            point = _development_route_geocode(_development_route_address(item))
+        item["_route_point"] = point
+
+        if index == 0 and first_is_origin:
+            legs.append({"duration_seconds": 0, "distance_meters": 0})
+        elif current and point:
+            straight_km = _development_route_distance_km(current, point)
+            road_km = max(0.3, straight_km * 1.28)
+            minutes = max(5, int(round((road_km / 30.0) * 60)))
+            legs.append({
+                "duration_seconds": minutes * 60,
+                "distance_meters": int(round(road_km * 1000)),
+            })
+        else:
+            legs.append({"duration_seconds": 12 * 60, "distance_meters": 0})
+
+        if point:
+            current = point
+    return legs, first_is_origin
+
+
+def _v29_build_route_schedule(ordered_items, legs, departure_dt, visit_minutes, buffer_minutes, first_is_origin=False):
+    from datetime import timedelta
+
+    scheduled = []
+    current = departure_dt
+    for index, item in enumerate(ordered_items or []):
+        data = dict(item)
+        if index == 0 and first_is_origin:
+            leg = {"duration_seconds": 0, "distance_meters": 0}
+        else:
+            # Routes API 的 legs：有出發地時第 0 段就是到第 1 站；
+            # 沒出發地時，第 0 段是第一站到第二站，因此要位移一格。
+            leg_index = index if not first_is_origin else index - 1
+            leg = legs[leg_index] if 0 <= leg_index < len(legs) else {"duration_seconds": 0, "distance_meters": 0}
+
+        travel_seconds = _v29_int(leg.get("duration_seconds"), 0, 0)
+        arrival = current + timedelta(seconds=travel_seconds)
+        visit_start = arrival
+        visit_end = visit_start + timedelta(minutes=visit_minutes)
+        depart = visit_end + timedelta(minutes=buffer_minutes)
+
+        data.update({
+            "route_order": index + 1,
+            "travel_minutes_from_previous": int(round(travel_seconds / 60)),
+            "distance_km_from_previous": round(_v29_int(leg.get("distance_meters"), 0, 0) / 1000.0, 1),
+            "schedule_arrival": arrival.strftime("%H:%M"),
+            "schedule_visit_start": visit_start.strftime("%H:%M"),
+            "schedule_visit_end": visit_end.strftime("%H:%M"),
+            "schedule_departure": depart.strftime("%H:%M"),
+            "schedule_date": visit_start.strftime("%Y-%m-%d"),
+        })
+        scheduled.append(data)
+        current = depart
+
+    return scheduled, current
+
+
+def _v29_route_share_text(start_address, scheduled_items, method, google_url, route_date, start_time, finish_time):
+    lines = ["📍 開發拜訪行程"]
+    lines.append(f"日期：{route_date}")
+    lines.append(f"開始：{start_time}")
+    if start_address:
+        lines.append(f"出發地：{start_address}")
+    lines.append(f"排序方式：{method}")
+    lines.append(f"預計完成：{finish_time}")
+    lines.append("")
+    for item in scheduled_items:
+        lines.append(
+            f"{item.get('route_order')}. {item.get('schedule_arrival')} 到達｜"
+            f"{item.get('schedule_visit_start')}–{item.get('schedule_visit_end')} "
+            f"{item.get('name') or '未命名'}"
+        )
+        lines.append(f"地址：{item.get('route_address') or '-'}")
+        if item.get("phone"):
+            lines.append(f"電話：{item.get('phone')}")
+        lines.append(
+            f"前段車程：約 {item.get('travel_minutes_from_previous') or 0} 分鐘｜"
+            f"{item.get('distance_km_from_previous') or 0} 公里"
+        )
+        lines.append("")
+    if google_url:
+        lines.extend(["Google Maps 路線：", google_url])
+    return "\n".join(lines).strip()
+
+
+@login_required
+def development_route_planner_v29():
+    only_run = (request.values.get("only_run_development") or "").strip() == "1"
+    filter_args = request.values.copy()
+    if only_run:
+        filter_args["next_action"] = "跑開發"
+
+    filters = {
+        "q": (filter_args.get("q") or "").strip(),
+        "current_stage": (filter_args.get("current_stage") or "").strip(),
+        "next_action": (filter_args.get("next_action") or "").strip(),
+        "source": (filter_args.get("source") or "").strip(),
+        "area": (filter_args.get("area") or "").strip(),
+        "only_run_development": "1" if only_run else "",
+    }
+    items, source_options = _development_route_filter_items(filter_args)
+    route_result = None
+    start_address = (request.values.get("start_address") or "").strip()
+    route_date = (request.values.get("route_date") or now_taipei().strftime("%Y-%m-%d")).strip()
+    start_time = (request.values.get("start_time") or "09:00").strip()
+    visit_minutes = _v29_int(request.values.get("visit_minutes"), 20, 5, 180)
+    buffer_minutes = _v29_int(request.values.get("buffer_minutes"), 5, 0, 60)
+    return_mode = (request.values.get("return_mode") or "last").strip()
+
+    if request.method == "POST":
+        selected_ids = request.form.getlist("development_ids")
+        return_to_start = return_mode == "round_trip"
+        selected_items = []
+        if selected_ids:
+            id_set = set(selected_ids)
+            selected_items = [item for item in items if item.get("id") in id_set]
+            found_ids = {x.get("id") for x in selected_items}
+            for dev_id in [x for x in selected_ids if x not in found_ids]:
+                try:
+                    snap = db.collection("developments").document(dev_id).get()
+                    if snap.exists:
+                        selected_items.append(doc_to_dict(snap))
+                except Exception:
+                    pass
+
+        if not selected_items:
+            flash("請先勾選至少一筆開發資料。", "warning")
+        else:
+            seed_order, seed_method = _development_route_order_items(
+                selected_items,
+                start_address=start_address,
+                return_to_start=return_to_start,
+            )
+            usable_seed = [x for x in seed_order if _development_route_address(x)]
+            departure_dt = _v29_route_departure(route_date, start_time)
+            api_result = _v29_google_routes_optimize(
+                usable_seed,
+                start_address=start_address,
+                return_to_start=return_to_start,
+                departure_dt=departure_dt,
+            )
+
+            if api_result:
+                ordered = api_result["ordered_items"]
+                legs = api_result.get("legs") or []
+                method = api_result.get("method") or seed_method
+                first_is_origin = bool(api_result.get("first_is_origin"))
+                distance_meters = _v29_int(api_result.get("distance_meters"), 0, 0)
+                driving_seconds = _v29_int(api_result.get("duration_seconds"), 0, 0)
+            else:
+                ordered = usable_seed
+                legs, first_is_origin = _v29_fallback_route_legs(ordered, start_address)
+                method = seed_method + "＋道路距離時間推估"
+                distance_meters = sum(_v29_int(x.get("distance_meters"), 0, 0) for x in legs)
+                driving_seconds = sum(_v29_int(x.get("duration_seconds"), 0, 0) for x in legs)
+
+            # 沒地址的資料附在最後，但不放進 Google Maps。
+            no_address = [x for x in seed_order if not _development_route_address(x)]
+            scheduled, schedule_finish = _v29_build_route_schedule(
+                ordered,
+                legs,
+                departure_dt,
+                visit_minutes,
+                buffer_minutes,
+                first_is_origin=first_is_origin,
+            )
+
+            return_travel_minutes = 0
+            return_distance_km = 0.0
+            if return_to_start and start_address and ordered:
+                return_leg = None
+                if api_result and len(legs) > len(ordered):
+                    return_leg = legs[len(ordered)]
+                if return_leg is None:
+                    start_point = _development_route_geocode(start_address)
+                    last_point = ordered[-1].get("_route_point") or _development_route_latlng(ordered[-1])
+                    if not last_point:
+                        last_point = _development_route_geocode(_development_route_address(ordered[-1]))
+                    if start_point and last_point:
+                        road_km = max(0.3, _development_route_distance_km(last_point, start_point) * 1.28)
+                        return_leg = {
+                            "duration_seconds": max(5, int(round((road_km / 30.0) * 60))) * 60,
+                            "distance_meters": int(round(road_km * 1000)),
+                        }
+                    else:
+                        return_leg = {"duration_seconds": 12 * 60, "distance_meters": 0}
+                return_travel_minutes = int(round(_v29_int(return_leg.get("duration_seconds"), 0, 0) / 60))
+                return_distance_km = round(_v29_int(return_leg.get("distance_meters"), 0, 0) / 1000.0, 1)
+                from datetime import timedelta as _v29_timedelta
+                schedule_finish = schedule_finish + _v29_timedelta(minutes=return_travel_minutes)
+
+            for item in no_address:
+                data = dict(item)
+                data.update({
+                    "route_order": len(scheduled) + 1,
+                    "schedule_arrival": "待補地址",
+                    "schedule_visit_start": "-",
+                    "schedule_visit_end": "-",
+                    "schedule_departure": "-",
+                    "travel_minutes_from_previous": 0,
+                    "distance_km_from_previous": 0,
+                })
+                scheduled.append(data)
+
+            google_url = _development_route_google_url(start_address, ordered, return_to_start=return_to_start)
+            stop_count = len(ordered)
+            warning = ""
+            if stop_count > DEVELOPMENT_ROUTE_GOOGLE_MAX_STOPS:
+                warning = (
+                    f"你選了 {stop_count} 個有地址的點，Google Maps 單一路線中途點可能有限；"
+                    f"建議拆成每 {DEVELOPMENT_ROUTE_GOOGLE_MAX_STOPS} 個點一趟。"
+                )
+            if not api_result:
+                warning = (warning + " " if warning else "") + "Google Routes API 未啟用或暫時失敗，目前時間為距離推估。"
+
+            share_text = _v29_route_share_text(
+                start_address,
+                scheduled,
+                method,
+                google_url,
+                departure_dt.strftime("%Y-%m-%d"),
+                departure_dt.strftime("%H:%M"),
+                schedule_finish.strftime("%H:%M"),
+            )
+            route_result = {
+                "ordered_items": scheduled,
+                "method": method,
+                "google_url": google_url,
+                "share_text": share_text,
+                "warning": warning,
+                "route_date": departure_dt.strftime("%Y-%m-%d"),
+                "start_time": departure_dt.strftime("%H:%M"),
+                "finish_time": schedule_finish.strftime("%H:%M"),
+                "visit_minutes": visit_minutes,
+                "buffer_minutes": buffer_minutes,
+                "total_distance_km": round(distance_meters / 1000.0, 1),
+                "driving_minutes": int(round(driving_seconds / 60)),
+                "api_optimized": bool(api_result),
+                "return_travel_minutes": return_travel_minutes,
+                "return_distance_km": return_distance_km,
+                "return_to_start": return_to_start,
+            }
+            try:
+                db.collection("development_routes").add({
+                    "start_address": start_address,
+                    "route_date": route_result["route_date"],
+                    "start_time": route_result["start_time"],
+                    "finish_time": route_result["finish_time"],
+                    "visit_minutes": visit_minutes,
+                    "buffer_minutes": buffer_minutes,
+                    "return_to_start": return_to_start,
+                    "method": method,
+                    "target_ids": selected_ids,
+                    "ordered_target_ids": [x.get("id") for x in scheduled],
+                    "schedule": [
+                        {
+                            "id": x.get("id") or "",
+                            "name": x.get("name") or "",
+                            "address": x.get("route_address") or "",
+                            "arrival": x.get("schedule_arrival") or "",
+                            "visit_start": x.get("schedule_visit_start") or "",
+                            "visit_end": x.get("schedule_visit_end") or "",
+                        }
+                        for x in scheduled
+                    ],
+                    "total_distance_km": route_result["total_distance_km"],
+                    "driving_minutes": route_result["driving_minutes"],
+                    "return_travel_minutes": return_travel_minutes,
+                    "return_distance_km": return_distance_km,
+                    "google_url": google_url,
+                    "share_text": share_text,
+                    "created_at": now_taipei().isoformat(),
+                    "created_by_id": session.get("user_id") or "",
+                    "created_by_name": session.get("user_name") or "",
+                })
+            except Exception as exc:
+                print("⚠️ v29 儲存開發路線排程失敗：", exc)
+
+    action_options = list(globals().get("DEVELOPMENT_NEXT_ACTION_OPTIONS", []) or [])
+    if "跑開發" not in action_options:
+        action_options.insert(0, "跑開發")
+
+    return render_template(
+        "development_route_planner.html",
+        items=items,
+        filters=filters,
+        source_options=source_options,
+        stage_options=globals().get("DEVELOPMENT_STATUS_OPTIONS", []),
+        action_options=action_options,
+        route_result=route_result,
+        start_address=start_address,
+        route_date=route_date,
+        start_time=start_time,
+        visit_minutes=visit_minutes,
+        buffer_minutes=buffer_minutes,
+        return_mode=return_mode,
+    )
+
+
+app.view_functions["development_route_planner"] = development_route_planner_v29
+
+
+_V29_AGE_RANGES = {
+    "all": (None, None, "全部屋齡"),
+    "0-5": (0, 5, "5年內"),
+    "5-10": (5, 10, "5～10年"),
+    "10-20": (10, 20, "10～20年"),
+    "20-30": (20, 30, "20～30年"),
+    "30plus": (30, None, "30年以上"),
+}
+
+
+def _v29_property_search_settings(values):
+    radius = _v29_int(values.get("radius"), 500, 100, 5000)
+    if radius not in {250, 500, 1000, 2000, 3000, 5000}:
+        radius = 500
+    years = _v29_int(values.get("years"), 5, 1, 20)
+    if years not in {3, 5, 10}:
+        years = 5
+    category = str(values.get("category") or "全部").strip() or "全部"
+    age_range = str(values.get("age_range") or "all").strip()
+    if age_range not in _V29_AGE_RANGES:
+        age_range = "all"
+    age_min, age_max, age_label = _V29_AGE_RANGES[age_range]
+    include_special = str(values.get("include_special") or "") in {"1", "true", "True", "on"}
+    return {
+        "radius": radius,
+        "years": years,
+        "category": category,
+        "age_range": age_range,
+        "building_age_min": age_min,
+        "building_age_max": age_max,
+        "age_label": age_label,
+        "include_special": include_special,
+    }
+
+
+def _v29_property_web_task_create(query_text, settings):
+    query_text = str(query_text or "").strip()
+    if not query_text:
+        raise ValueError("請輸入地址或物件網址。")
+    url_match = re.search(r"https?://[^\s<>]+", query_text, re.I)
+    if url_match and any(domain in url_match.group(0).lower() for domain in ("rakuya.com.tw", "591.com.tw")):
+        command = "url_lookup"
+        payload = {"url": url_match.group(0).rstrip(".,，。")}
+    else:
+        command = "address_lookup"
+        payload = {"address": query_text}
+    payload.update({
+        "radius": settings["radius"],
+        "years": settings["years"],
+        "category": settings["category"],
+        "age_range": settings["age_range"],
+        "building_age_min": settings["building_age_min"],
+        "building_age_max": settings["building_age_max"],
+        "include_special": settings["include_special"],
+    })
+
+    task_id = "property_web_" + uuid4().hex
+    now_iso = now_taipei().isoformat()
+    data = {
+        "task_id": task_id,
+        "command": command,
+        "payload": payload,
+        "source": {
+            "type": "web",
+            "target_id": "",
+            "user_id": session.get("user_id") or "",
+            "group_id": "",
+            "room_id": "",
+        },
+        "web_only": True,
+        "web_query": query_text,
+        "web_settings": settings,
+        "target_worker": globals().get("TEAMME_PROPERTY_DEFAULT_WORKER", "ELLEN-PC"),
+        "status": "queued",
+        "event": {"type": "web", "timestamp": int(time.time() * 1000), "webhookEventId": ""},
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "created_by_id": session.get("user_id") or "",
+        "created_by_name": session.get("user_name") or "",
+    }
+    collection = globals().get("TEAMME_PROPERTY_TASK_COLLECTION", "team_me_line_tasks")
+    db.collection(collection).document(task_id).set(data)
+    return task_id
+
+
+@login_required
+def property_search_page_v29():
+    if request.method == "POST":
+        query_text = (request.form.get("query") or "").strip()
+        search_settings = _v29_property_search_settings(request.form)
+        try:
+            task_id = _v29_property_web_task_create(query_text, search_settings)
+            flash("已建立實價查詢任務，等待 ELLEN-PC 回傳。", "success")
+            return redirect(url_for("property_search_page", task_id=task_id))
+        except Exception as exc:
+            flash(f"建立查詢任務失敗：{exc}", "danger")
+            return render_template(
+                "property_search.html",
+                query=query_text,
+                task_id="",
+                result=None,
+                search_settings=search_settings,
+                age_range_options=_V29_AGE_RANGES,
+            )
+
+    task_id = (request.args.get("task_id") or "").strip()
+    task = {}
+    result = None
+    query_text = (request.args.get("query") or "").strip()
+    search_settings = _v29_property_search_settings(request.args)
+    if task_id:
+        task, result = _v25_property_task_result(task_id)
+        payload = task.get("payload") or {}
+        query_text = query_text or task.get("web_query") or payload.get("address") or payload.get("url") or ""
+        search_settings = _v29_property_search_settings(task.get("web_settings") or payload)
+        if result and isinstance(result, dict):
+            result_settings = result.get("query_settings") or {}
+            if result_settings:
+                search_settings = _v29_property_search_settings(result_settings)
+
+    return render_template(
+        "property_search.html",
+        query=query_text,
+        task_id=task_id,
+        task_status=task.get("status") or ("done" if result else "queued"),
+        result=result,
+        raw_json=json.dumps(result, ensure_ascii=False, indent=2, default=str) if result else "",
+        search_settings=search_settings,
+        age_range_options=_V29_AGE_RANGES,
+    )
+
+
+app.view_functions["property_search_page"] = property_search_page_v29
+
+print("✅ Team M.E v29 已啟用：開發交通最佳化排程／跑開發快速篩選／實價距離屋齡篩選與排序。")
+# =============================================================================
+# Team M.E v29 End
+# =============================================================================
