@@ -23349,6 +23349,7 @@ def _seller_apply_deed_and_cadastral_data(
             pass
         updates["cadastral_parsed_at"] = now_taipei().isoformat()
 
+    updates = _case_v21_safe_upload_updates(updates)
     if not updates:
         raise RuntimeError("沒有可儲存的解析資料。")
 
@@ -35421,52 +35422,106 @@ def _case_v19_classify_file(filename: str, raw_text: str):
     return "deed"
 
 
+def _case_v19_scalar_text(value, max_len=8000):
+    """把 AI / Firestore 欄位限制成可安全顯示與儲存的純文字。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        try:
+            if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+                return ""
+        except Exception:
+            pass
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        # AI 常會多回傳 owners 陣列或巢狀物件；案件表不直接保存這些物件。
+        return ""
+    text = text.replace("\x00", "").strip()
+    return text[:max_len] if max_len else text
+
+
 def _case_v19_nonempty(data: dict):
-    return {k: v for k, v in (data or {}).items() if str(v or "").strip()}
+    """只保留 Firestore/表單可安全處理的純量欄位，避免 AI 巢狀 JSON 造成 500。"""
+    out = {}
+    for k, v in (data or {}).items():
+        text = _case_v19_scalar_text(v)
+        if text:
+            out[str(k)] = text
+    return out
+
+
+def _case_v19_extract_date_number(value, max_digits=4):
+    text = _case_v19_scalar_text(value, 60)
+    if not text:
+        return ""
+    m = re.search(r"\d{1,%d}" % int(max_digits), text)
+    return str(int(m.group(0))) if m else ""
 
 
 def _case_v19_normalize_owner_ai_data(data: dict):
-    """統一 AI 的所有權人欄位，並把 owners 陣列第一筆完整資料映射到案件表欄位。"""
-    out = dict(data or {}) if isinstance(data, dict) else {}
-    owners = out.get("owners")
+    """統一 AI 所有權人欄位；只回傳案件表需要的純文字，不把 owners 陣列寫進 Firestore。"""
+    source = dict(data or {}) if isinstance(data, dict) else {}
+
+    owners = source.get("owners")
     if isinstance(owners, list):
         candidates = [x for x in owners if isinstance(x, dict)]
         if candidates:
             def score(item):
-                return sum(bool(str(item.get(k) or "").strip()) for k in (
-                    "owner_name", "owner_id", "owner_identity_no", "owner_birth_date", "owner_household_address", "registered_address"
+                return sum(bool(_case_v19_scalar_text(item.get(k))) for k in (
+                    "owner_name", "owner_id", "owner_identity_no", "owner_birth_date",
+                    "owner_household_address", "registered_address", "household_address",
                 ))
             primary = sorted(candidates, key=score, reverse=True)[0]
             for k, v in primary.items():
-                if str(v or "").strip() and not str(out.get(k) or "").strip():
-                    out[k] = v
+                if _case_v19_scalar_text(v) and not _case_v19_scalar_text(source.get(k)):
+                    source[k] = v
 
-    owner_name = str(out.get("owner_name") or out.get("deed_owner") or "").strip()
-    owner_id = str(out.get("owner_id") or out.get("owner_identity_no") or out.get("identity_no") or "").upper().replace(" ", "")
-    id_match = re.search(r"[A-Z][12][0-9]{8}", owner_id)
-    owner_id = id_match.group(0) if id_match else owner_id
-    address = str(
-        out.get("owner_household_address")
-        or out.get("registered_address")
-        or out.get("household_address")
-        or out.get("address")
-        or ""
-    ).strip()
-    birth = str(out.get("owner_birth_date") or out.get("birth_date") or "").strip()
-    by = str(out.get("owner_birth_year") or "").strip()
-    bm = str(out.get("owner_birth_month") or "").strip()
-    bd = str(out.get("owner_birth_day") or "").strip()
+    owner_name = _case_v19_scalar_text(source.get("owner_name") or source.get("deed_owner"), 100)
+    owner_id_raw = _case_v19_scalar_text(
+        source.get("owner_id") or source.get("owner_identity_no") or source.get("identity_no"), 100
+    ).upper().replace(" ", "")
+    id_match = re.search(r"[A-Z][12][0-9]{8}", owner_id_raw)
+    owner_id = id_match.group(0) if id_match else owner_id_raw
+    address = _case_v19_scalar_text(
+        source.get("owner_household_address")
+        or source.get("registered_address")
+        or source.get("household_address")
+        or source.get("address"),
+        500,
+    )
+    birth = _case_v19_scalar_text(source.get("owner_birth_date") or source.get("birth_date"), 100)
+
+    by = _case_v19_extract_date_number(source.get("owner_birth_year"), 4)
+    bm = _case_v19_extract_date_number(source.get("owner_birth_month"), 2)
+    bd = _case_v19_extract_date_number(source.get("owner_birth_day"), 2)
     try:
         from deed_case_form_tool import parse_minguo_date
         parsed_birth = parse_minguo_date(birth)
-        by = by or parsed_birth.get("year", "")
-        bm = bm or parsed_birth.get("month", "")
-        bd = bd or parsed_birth.get("day", "")
-        birth = birth or parsed_birth.get("display", "")
+        by = by or _case_v19_extract_date_number(parsed_birth.get("year"), 4)
+        bm = bm or _case_v19_extract_date_number(parsed_birth.get("month"), 2)
+        bd = bd or _case_v19_extract_date_number(parsed_birth.get("day"), 2)
+        birth = birth or _case_v19_scalar_text(parsed_birth.get("display"), 100)
     except Exception:
         pass
+
     if not birth and by and bm and bd:
-        birth = f"民國{int(by):03d}年{int(bm):02d}月{int(bd):02d}日"
+        try:
+            birth = f"民國{int(by):03d}年{int(bm):02d}月{int(bd):02d}日"
+        except Exception:
+            birth = ""
+
+    out = {}
+    passthrough_keys = {
+        "deed_ai_status", "deed_ai_note", "deed_rule_status",
+    }
+    for key in passthrough_keys:
+        value = _case_v19_scalar_text(source.get(key), 3000)
+        if value:
+            out[key] = value
 
     if owner_name:
         out["owner_name"] = owner_name
@@ -35474,16 +35529,19 @@ def _case_v19_normalize_owner_ai_data(data: dict):
     if owner_id:
         out["owner_id"] = owner_id
         out["owner_identity_no"] = owner_id
-        if not str(out.get("owner_gender") or "").strip() and len(owner_id) >= 2:
-            out["owner_gender"] = "男" if owner_id[1] == "1" else "女" if owner_id[1] == "2" else ""
+    gender = _case_v19_scalar_text(source.get("owner_gender") or source.get("gender"), 10)
+    if gender not in {"男", "女"} and len(owner_id) >= 2:
+        gender = "男" if owner_id[1] == "1" else "女" if owner_id[1] == "2" else ""
+    if gender:
+        out["owner_gender"] = gender
     if birth:
         out["owner_birth_date"] = birth
     if by:
-        out["owner_birth_year"] = str(int(by)) if str(by).isdigit() else by
+        out["owner_birth_year"] = by
     if bm:
-        out["owner_birth_month"] = str(int(bm)) if str(bm).isdigit() else bm
+        out["owner_birth_month"] = bm
     if bd:
-        out["owner_birth_day"] = str(int(bd)) if str(bd).isdigit() else bd
+        out["owner_birth_day"] = bd
     if address:
         out["owner_household_address"] = address
         out["registered_address"] = address
@@ -35673,10 +35731,14 @@ def _case_v19_parse_deed_item(item: dict):
         if k in owner_priority_keys or k.endswith("_status") or k.endswith("_note") or not str(case_data.get(k) or "").strip():
             case_data[k] = v
 
-    # AI 空白時仍保留規則結果；AI 成功時四項欄位以 AI PDF 判讀為主。
-    case_data = _case_v19_normalize_owner_ai_data(case_data)
+    # AI 空白時仍保留規則結果；只把標準化後的所有權人純文字欄位合併回案件資料。
+    normalized_owner = _case_v19_normalize_owner_ai_data(case_data)
+    for k, v in normalized_owner.items():
+        if k in owner_priority_keys or k.endswith("_status") or k.endswith("_note"):
+            case_data[k] = v
     parsed["case_data"] = case_data
-    parsed["ai_owner_result"] = ai_data
+    # 僅保存標準化純文字 AI 結果，避免 owners 陣列/巢狀 JSON 進入 Firestore。
+    parsed["ai_owner_result"] = _case_v19_nonempty(ai_data)
     return parsed
 
 def _case_v19_parse_cadastral_item(item: dict):
@@ -35784,6 +35846,31 @@ def _case_v19_merge_cadastral_parsed(items: list):
     return merged, "\n\n---地籍圖分隔---\n\n".join(raw_texts), "+".join(filenames)
 
 
+
+_CASE_V21_ALLOWED_UPLOAD_FIELDS = set(CASE_DETAIL_FIELD_KEYS) | {
+    "owner_name", "deed_owner", "owner_id", "owner_identity_no", "owner_gender",
+    "owner_birth_date", "owner_birth_year", "owner_birth_month", "owner_birth_day",
+    "owner_household_address", "registered_address", "household_address",
+    "deed_ai_status", "deed_ai_note", "deed_rule_status", "deed_analysis_source",
+    "deed_parsed_at", "cadastral_ai_status", "cadastral_ai_note",
+    "cadastral_direction_note", "cadastral_confidence", "road_width_confidence",
+    "road_width_source", "road_width", "building_facing", "cadastral_analysis_source",
+    "cadastral_parsed_at", "case_form_updated_at", "updated_at", "updated_by_id", "updated_by_name",
+}
+
+
+def _case_v21_safe_upload_updates(updates: dict):
+    """限制上傳解析結果為已知純文字欄位，避免 AI 回傳陣列/物件使案件頁 500。"""
+    safe = {}
+    for key, value in (updates or {}).items():
+        if key not in _CASE_V21_ALLOWED_UPLOAD_FIELDS:
+            continue
+        max_len = 60000 if key.endswith("_parsed_json") else 30000 if key.endswith("_raw_text") else 8000
+        text = _case_v19_scalar_text(value, max_len=max_len)
+        if text:
+            safe[key] = text
+    return safe
+
 def _case_v19_apply_upload_result(seller_id: str, deed_result=None, cadastral_result=None):
     updates = {}
 
@@ -35832,6 +35919,7 @@ def _case_v19_apply_upload_result(seller_id: str, deed_result=None, cadastral_re
         updates["cadastral_parsed_at"] = now_taipei().isoformat()
         updates["cadastral_analysis_source"] = "AI vision / file analysis"
 
+    updates = _case_v21_safe_upload_updates(updates)
     if not updates:
         raise RuntimeError("沒有可儲存的解析資料。")
 
@@ -35860,14 +35948,27 @@ def _case_v19_collect_upload_items():
     return items
 
 
+@login_required
 def seller_deed_case_form_v19(seller_id):
-    doc_ref = db.collection("sellers").document(seller_id)
-    snap = doc_ref.get()
-    if not snap.exists:
-        flash("找不到這筆委託", "danger")
-        return redirect(url_for("sellers"))
-
-    seller = doc_to_dict(snap)
+    """v21：AI 解析頁防呆。任何 AI 格式或單筆髒資料都不應讓整頁變成 500。"""
+    try:
+        doc_ref = db.collection("sellers").document(seller_id)
+        snap = doc_ref.get()
+        if not snap.exists:
+            flash("找不到這筆委託", "danger")
+            return redirect(url_for("sellers"))
+        seller = doc_to_dict(snap) or {"id": seller_id}
+    except Exception as exc:
+        import traceback
+        error_id = uuid4().hex[:8]
+        print(f"❌ CASE_FORM_V21 讀取委託失敗 [{error_id}] seller_id={seller_id}: {exc}")
+        traceback.print_exc()
+        return (
+            "<meta charset='utf-8'><div style='font-family:sans-serif;padding:28px'>"
+            f"<h3>案件資料讀取失敗</h3><p>錯誤編號：{error_id}</p>"
+            "<p>請回上一頁後重新整理；伺服器紀錄已保留詳細原因。</p></div>",
+            500,
+        )
 
     if request.method == "POST":
         action = request.form.get("action", "parse")
@@ -35887,37 +35988,86 @@ def seller_deed_case_form_v19(seller_id):
 
             deed_result = _case_v19_merge_deed_parsed(deed_items) if deed_items else None
             cadastral_result = _case_v19_merge_cadastral_parsed(cadastral_items) if cadastral_items else None
-
-            _case_v19_apply_upload_result(seller_id, deed_result=deed_result, cadastral_result=cadastral_result)
+            saved_updates = _case_v19_apply_upload_result(
+                seller_id,
+                deed_result=deed_result,
+                cadastral_result=cadastral_result,
+            )
 
             msg = []
             if deed_result:
-                msg.append("謄本")
+                msg.append("謄本 PDF AI / 規則解析")
             if cadastral_result:
                 msg.append("地籍圖 AI 判斷")
-            flash("已完成：" + " + ".join(msg), "success")
+            flash("已完成並儲存：" + " + ".join(msg), "success")
+            print(
+                "✅ CASE_FORM_V21 AI解析儲存完成",
+                seller_id,
+                sorted(saved_updates.keys()),
+            )
 
             if action == "parse_and_download":
                 return redirect(url_for("seller_case_form_filled_pdf", seller_id=seller_id))
-            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+            # 支援 /deed-case-form 與舊版 /case-form/edit，解析後留在原入口。
+            return redirect(request.path or url_for("seller_deed_case_form", seller_id=seller_id))
         except Exception as exc:
-            flash(f"解析失敗：{exc}", "danger")
-            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+            import traceback
+            error_id = uuid4().hex[:8]
+            print(f"❌ CASE_FORM_V21 AI解析失敗 [{error_id}] seller_id={seller_id}: {exc}")
+            traceback.print_exc()
+            flash(f"解析失敗（錯誤編號 {error_id}）：{exc}", "danger")
+            return redirect(request.path or url_for("seller_deed_case_form", seller_id=seller_id))
 
-    case_data = _case_merge_seller_and_case_data(seller)
-    return render_template_string(
-        CASE_FORM_V19_UPLOAD_HTML,
-        seller=seller,
-        case_data=case_data,
-        ai_enabled=_case_v19_ai_available(),
-    )
+    try:
+        case_data = _case_merge_seller_and_case_data(seller)
+        # 舊資料若曾把 owners / 巢狀 AI JSON 寫入欄位，頁面顯示時也一律轉成安全純文字。
+        for key, value in list(case_data.items()):
+            if isinstance(value, (dict, list, tuple, set, bytes, bytearray)) and key != "ai_selling_points":
+                case_data[key] = ""
+        return render_template_string(
+            CASE_FORM_V19_UPLOAD_HTML,
+            seller=seller,
+            case_data=case_data,
+            ai_enabled=_case_v19_ai_available(),
+        )
+    except Exception as exc:
+        import html
+        import traceback
+        error_id = uuid4().hex[:8]
+        print(f"❌ CASE_FORM_V21 顯示解析頁失敗 [{error_id}] seller_id={seller_id}: {exc}")
+        traceback.print_exc()
+        # 不再回傳 Flask 預設 Internal Server Error，至少保留可操作的錯誤資訊。
+        safe_error = html.escape(str(exc))
+        return (
+            "<meta charset='utf-8'><div style='font-family:Arial,sans-serif;padding:28px;max-width:760px;margin:auto'>"
+            "<h2>案件表頁面顯示失敗</h2>"
+            f"<p>錯誤編號：<b>{error_id}</b></p>"
+            f"<p style='white-space:pre-wrap'>{safe_error}</p>"
+            "<p>請將錯誤編號對照 Render Logs；AI 已解析成功的資料不會因此被清除。</p>"
+            f"<p><a href='/sellers/{seller_id}'>回委託詳細</a></p>"
+            "</div>",
+            200,
+        )
 
 
-# 覆蓋原本 endpoint，但不重複註冊 route，避免 Flask endpoint collision。
+# 覆蓋原本 endpoint，並兼容舊網址 /case-form/edit。
 try:
     app.view_functions["seller_deed_case_form"] = seller_deed_case_form_v19
+
+    legacy_rule = "/sellers/<seller_id>/case-form/edit"
+    legacy_endpoints = [rule.endpoint for rule in app.url_map.iter_rules() if rule.rule == legacy_rule]
+    if legacy_endpoints:
+        for endpoint in legacy_endpoints:
+            app.view_functions[endpoint] = seller_deed_case_form_v19
+    else:
+        app.add_url_rule(
+            legacy_rule,
+            endpoint="seller_case_form_edit_v21",
+            view_func=seller_deed_case_form_v19,
+            methods=["GET", "POST"],
+        )
 except Exception as exc:
-    print("⚠️ v19 覆蓋 seller_deed_case_form 失敗：", exc)
+    print("⚠️ v21 覆蓋/兼容案件表 AI 入口失敗：", exc)
 
 
 # 全站保險：統一把舊字樣換成單一入口，移除單獨地籍圖與 Word。
