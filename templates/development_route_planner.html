@@ -22,14 +22,14 @@
   </div>
 
   <div class="alert alert-info small">
-    有啟用 Google Routes API 時，系統會依出發時間、道路行車時間與轉彎等因素調整中途點順序；未啟用時則使用地址座標、最近鄰與 2-opt，再以道路距離推估時間。
+    系統先用 Google Route Matrix 取得各戶籍地址之間的道路時間，再以最近鄰建立初始路線並用 2-opt 改善；不再依賴 waypoint optimization。Route Matrix 暫時失敗時才使用座標備援。
   </div>
 
   {% if route_result %}
   <div class="card mb-4">
     <div class="card-header bg-white fw-bold border-0 pt-3 d-flex justify-content-between align-items-center flex-wrap gap-2">
       <span>{{ route_result.route_date }} 開發行程</span>
-      {% if route_result.api_optimized %}<span class="badge text-bg-success">Google 交通時間最佳化</span>{% else %}<span class="badge text-bg-warning">距離時間推估</span>{% endif %}
+      {% if route_result.matrix_optimized %}<span class="badge text-bg-success">Route Matrix＋最近鄰＋2-opt</span>{% else %}<span class="badge text-bg-warning">座標備援排序</span>{% endif %}
     </div>
     <div class="card-body">
       <div class="row g-2 mb-3">

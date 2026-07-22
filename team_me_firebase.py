@@ -39821,6 +39821,144 @@ print("✅ Team M.E v30 已啟用：網址→正確地址→實價查詢／Route
 # =============================================================================
 
 
+# =============================================================================
+# Team M.E v31｜網址失敗診斷 + 每日新物件雲端診斷
+# =============================================================================
+
+def _v31_failed_status(value):
+    return str(value or '').strip().lower() in {'failed','error','cancelled','canceled'}
+
+
+def _v31_result_mistook_url_as_address(result):
+    if not isinstance(result, dict) or str(result.get('kind') or '') != 'address':
+        return False
+    values = [result.get('query'), result.get('resolved_address')]
+    target = result.get('target') or {}
+    values.extend([target.get('full_address'), target.get('address')])
+    return any(str(value or '').strip().lower().startswith(('http://','https://')) for value in values)
+
+
+@login_required
+def property_search_page_v31():
+    if request.method == 'POST':
+        query_text = (request.form.get('query') or '').strip()
+        search_settings = _v29_property_search_settings(request.form)
+        try:
+            task_id = _v29_property_web_task_create(query_text, search_settings)
+            flash('已建立實價查詢任務；ELLEN-PC 會開啟物件頁讀取資料並判斷地址。', 'success')
+            return redirect(url_for('property_search_page', task_id=task_id))
+        except Exception as exc:
+            flash(f'建立查詢任務失敗：{exc}', 'danger')
+            return render_template('property_search.html', query=query_text, task_id='', result=None, task_error=str(exc), search_settings=search_settings, age_range_options=_V29_AGE_RANGES)
+
+    task_id = (request.args.get('task_id') or '').strip()
+    task, result = ({}, None)
+    query_text = (request.args.get('query') or '').strip()
+    search_settings = _v29_property_search_settings(request.args)
+    if task_id:
+        task, result = _v25_property_task_result(task_id)
+        payload = task.get('payload') or {}
+        query_text = query_text or task.get('web_query') or payload.get('address') or payload.get('url') or ''
+        search_settings = _v29_property_search_settings(task.get('web_settings') or payload)
+    status = str(task.get('status') or ('done' if result else 'queued'))
+    task_error = str(task.get('error') or task.get('message') or task.get('result_message') or '')
+    bad_result = _v31_result_mistook_url_as_address(result)
+    if bad_result:
+        task_error = task_error or '舊版 ELLEN-PC 把網址當成地址查詢；請安裝 v31 本機 local_agent。'
+    display_result = None if _v31_failed_status(status) or bad_result else result
+    if display_result and isinstance(display_result, dict):
+        rs = display_result.get('query_settings') or {}
+        if rs: search_settings = _v29_property_search_settings(rs)
+    return render_template(
+        'property_search.html', query=query_text, task_id=task_id, task_status=status,
+        task_error=task_error, result=display_result,
+        raw_json=json.dumps(display_result, ensure_ascii=False, indent=2, default=str) if display_result else '',
+        search_settings=search_settings, age_range_options=_V29_AGE_RANGES,
+    )
+
+
+def property_search_status_v31(task_id):
+    task, result = _v25_property_task_result(task_id)
+    status = str(task.get('status') or ('done' if result else 'queued'))
+    bad_result = _v31_result_mistook_url_as_address(result)
+    message = str(task.get('error') or task.get('message') or task.get('result_message') or '')
+    if bad_result: message = message or '舊版 ELLEN-PC 把網址當成地址，結果已阻止顯示。'
+    return _case_v23_json({'success':True,'task_id':task_id,'status':status,'ready':bool(result) and not _v31_failed_status(status) and not bad_result,'message':message})
+
+app.view_functions['property_search_page'] = property_search_page_v31
+app.view_functions['property_search_status'] = login_required(property_search_status_v31)
+
+
+def _v31_read_collection_docs(name, limit=3000):
+    try: return list(db.collection(name).limit(int(limit)).stream())
+    except Exception as exc:
+        print(f'⚠️ v31 讀取 {name} 診斷失敗：', exc); return []
+
+
+def _v31_radar_diagnostics(all_items, selected_items, selected_date):
+    listing_docs = _v31_read_collection_docs('property_radar_listings', 5000)
+    scope_docs = _v31_read_collection_docs('property_radar_source_scopes', 1000)
+    run_docs = _v31_read_collection_docs('property_radar_runs', 300)
+    listing_data = [doc.to_dict() or {} for doc in listing_docs]
+    baseline = sum(bool(item.get('baseline_only')) for item in listing_data)
+    nonbaseline = len(listing_data) - baseline
+    unsynced = sum((not item.get('baseline_only')) and item.get('public_alert_saved') is not True for item in listing_data)
+    runs = [doc.to_dict() or {} for doc in run_docs]
+    runs.sort(key=lambda item: str(item.get('started_at') or item.get('created_at') or ''), reverse=True)
+    latest = runs[0] if runs else {}
+    status = str(latest.get('status') or '')
+    diagnosis = ''
+    level = 'info'
+    if not runs:
+        diagnosis = '找不到 property_radar_runs：本機掃描排程可能尚未執行，或目前仍使用沒有 v43 執行紀錄的舊版 scan。'; level='danger'
+    elif status == 'failed':
+        diagnosis = '最近一次 Property Radar 掃描失敗：' + str(latest.get('message') or latest.get('scope_errors') or '請查看本機 logs。'); level='danger'
+    elif not listing_docs:
+        diagnosis = '掃描紀錄存在，但 property_radar_listings 為空：請檢查啟用規則、樂屋 Chrome CDP 與 collector 是否抓到卡片。'; level='warning'
+    elif nonbaseline == 0:
+        diagnosis = '目前市場資料全部屬於首次 baseline。baseline 只建立比較底稿，依設計不會列入「每日新上架」；下一次真正新增的物件才會出現。'; level='warning'
+    elif unsynced > 0:
+        diagnosis = f'已有 {unsynced} 筆非 baseline 新物件尚未同步到 property_alert_items；v31 會自動補同步，也可執行修復 BAT。'; level='warning'
+    elif not all_items:
+        diagnosis = '市場已有非 baseline 新物件，但公開 collection 仍為空；最常見是本機與 Render 使用不同 Firebase 憑證／專案。'; level='danger'
+    elif not selected_items:
+        diagnosis = f'property_alert_items 共有 {len(all_items)} 筆，但 {selected_date} 沒有資料；請改選有資料的日期。'; level='info'
+    else:
+        diagnosis = 'Property Radar 與公開 collection 均有資料。'; level='success'
+    return {
+        'public_total':len(all_items),'selected_total':len(selected_items),'listing_total':len(listing_docs),
+        'baseline_total':baseline,'nonbaseline_total':nonbaseline,'unsynced_total':unsynced,
+        'scope_total':len(scope_docs),'baseline_scope_total':sum(bool((doc.to_dict() or {}).get('baseline_initialized')) for doc in scope_docs),
+        'latest_run':latest,'diagnosis':diagnosis,'level':level,
+    }
+
+
+@login_required
+def daily_new_properties_v31():
+    filters={'date':(request.args.get('date') or now_taipei().strftime('%Y-%m-%d')).strip(),'source':(request.args.get('source') or '').strip(),'area':(request.args.get('area') or '').strip(),'q':(request.args.get('q') or '').strip()}
+    all_items=_v25_load_property_alert_items(limit=3000)
+    source_options=sorted({item.get('source_platform') for item in all_items if item.get('source_platform')})
+    items=[item for item in all_items if item.get('created_date')==filters['date']]
+    if filters['source']: items=[item for item in items if item.get('source_platform')==filters['source']]
+    if filters['area']:
+        area=filters['area']; items=[item for item in items if area in (item.get('area') or '') or area in (item.get('address') or '') or area in (item.get('title') or '')]
+    if filters['q']:
+        q=filters['q'].lower(); items=[item for item in items if q in f"{item.get('title','')} {item.get('address','')} {item.get('url','')}".lower()]
+    source_counts={}
+    for item in items:
+        key=item.get('source_platform') or '其他'; source_counts[key]=source_counts.get(key,0)+1
+    diagnostics=_v31_radar_diagnostics(all_items,items,filters['date'])
+    available_dates=sorted({item.get('created_date') for item in all_items if item.get('created_date')},reverse=True)[:30]
+    return render_template('new_properties_daily.html',filters=filters,items=items,source_options=source_options,source_counts=source_counts,diagnostics=diagnostics,available_dates=available_dates)
+
+app.view_functions['daily_new_properties'] = daily_new_properties_v31
+
+print('✅ Team M.E v31 已啟用：物件頁瀏覽器解析錯誤顯示／每日新物件雲端診斷。')
+# =============================================================================
+# Team M.E v31 End
+# =============================================================================
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
     print("Routes:", app.url_map)

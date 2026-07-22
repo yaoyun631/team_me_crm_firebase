@@ -4,10 +4,18 @@
 <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-3">
   <div>
     <h2 class="mb-1">每日新上架物件</h2>
-    <div class="text-muted">依本機監控寫入 Firebase 的時間，查看每天新增的樂屋／591物件。</div>
+    <div class="text-muted">依本機監控寫入 Firebase 的時間查看新物件；591只顯示實際卡片 anchor href，不再用物件ID重組網址。</div>
   </div>
   <a class="btn btn-outline-secondary" href="{{ url_for('index') }}">回首頁</a>
 </div>
+
+{% if diagnostics %}
+<div class="alert alert-{{ diagnostics.level }} mb-4">
+  <div class="fw-bold mb-1">系統判斷</div><div>{{ diagnostics.diagnosis }}</div>
+  <div class="small mt-2">市場資料 {{ diagnostics.listing_total }} 筆｜baseline {{ diagnostics.baseline_total }}｜非 baseline {{ diagnostics.nonbaseline_total }}｜未同步 {{ diagnostics.unsynced_total }}｜property_alert_items {{ diagnostics.public_total }} 筆</div>
+  {% set run=diagnostics.latest_run or {} %}{% if run %}<div class="small mt-1">最近掃描：{{ run.get('started_at') or '-' }}｜{{ run.get('status') or '-' }}｜公開頁成功 {{ run.get('public_items_saved') or 0 }}／失敗 {{ run.get('public_items_failed') or 0 }}</div>{% endif %}
+</div>
+{% endif %}
 
 <form method="get" class="card dashboard-card mb-4">
   <div class="card-body">
@@ -63,7 +71,7 @@
           {% if item.price %}<span class="badge bg-light text-dark border">{{ item.price }}</span>{% endif %}
           {% if item.building_area_ping %}<span class="badge bg-light text-dark border">{{ item.building_area_ping }} 坪</span>{% endif %}
           {% if item.created_display %}<span class="badge bg-light text-dark border">{{ item.created_display }}</span>{% endif %}
-          {% if item.url_repaired_for_display %}<span class="badge text-bg-warning">網址已自動修正</span>{% endif %}
+          {% if item.url_verified_source == "actual_dom_anchor" %}<span class="badge text-bg-success">實際物件連結</span>{% elif item.url_repaired_for_display %}<span class="badge text-bg-warning">網址已正規化</span>{% endif %}
         </div>
         <div class="small text-muted text-break mb-2">{{ item.url }}</div>
         <div class="d-flex gap-2 flex-wrap">
@@ -78,7 +86,8 @@
 {% else %}
 <div class="card dashboard-card"><div class="card-body text-center text-muted py-5">
   所選日期目前沒有新物件。<br>
-  請確認 ELLEN-PC 的新物件監控程式有執行，並已寫入 <code>property_alert_items</code>。
+  {% if available_dates %}目前有資料的日期：{% for d in available_dates[:8] %}<a class="ms-1" href="{{ url_for('daily_new_properties', date=d) }}">{{ d }}</a>{% endfor %}<br>{% endif %}
+  請依上方「系統判斷」處理，不再只顯示空白結果。
 </div></div>
 {% endif %}
 {% endblock %}
