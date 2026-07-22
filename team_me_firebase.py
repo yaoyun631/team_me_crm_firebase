@@ -36389,7 +36389,7 @@ print("✅ CASE_FORM_V19：單一上傳謄本/地籍圖 + AI分析已啟用")
 
 
 # =============================================================================
-# CASE_FORM_V23：原本解析 / Gemini補抓 / 人工確認套用 三段式 Patch
+# CASE_FORM_V24：三段式 + Gemini 503自動重試與備援模型 Patch
 # - 第一步解析與儲存完全不呼叫 Gemini，避免長請求拖垮案件表頁面。
 # - 第二步只把已保存的「所有權部」局部文字送 Gemini，單一 REST、短 timeout。
 # - 第三步先顯示 AI 暫存結果，由使用者確認後才套用正式欄位。
@@ -36411,9 +36411,9 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
 </div>
 
 <div class="alert alert-info small">
-  <strong>v23 三段式穩定版：</strong>
+  <strong>v24 三段式穩定版：</strong>
   第一步只使用原本 PDF 文字、OCR 與規則解析，完全不呼叫 Gemini；
-  第二步只有四項所有權人資料缺漏時，才獨立分析所有權部局部文字；
+  第二步只有四項所有權人資料缺漏時，才獨立分析所有權部局部文字；遇到 Gemini 503/429/5xx 會自動退避重試，最後切換備援模型；
   第三步會先顯示 AI 結果，確認後才寫入案件欄位。Gemini 失敗不會影響土地面積、案件表或原本解析結果。
 </div>
 
@@ -36464,7 +36464,7 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
           class="btn btn-warning"
           {% if not owner_missing_labels or not ai_enabled or not case_data.deed_raw_text %}disabled{% endif %}
         >AI 補抓缺少欄位</button>
-        <span class="small text-muted ms-2">最長等待約 20 秒；失敗只顯示訊息，不會跳到 Internal Server Error。</span>
+        <span class="small text-muted ms-2">遇到 503 忙碌會自動重試並切換備援模型；失敗只顯示訊息，不影響原本解析。</span>
         <div id="ownerAiMessage" class="mt-3"></div>
 
         {% if not case_data.deed_raw_text %}
@@ -36563,7 +36563,7 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
         <div><strong>方式：</strong>{{ case_data.cadastral_analysis_source or '原本解析，未呼叫 Gemini' }}</div>
         <div><strong>地號：</strong>{{ case_data.cadastral_lot or '-' }}</div>
         <div><strong>比例尺：</strong>{{ case_data.cadastral_scale or '-' }}</div>
-        <div class="text-muted mt-2">v23 的步驟①不執行地籍圖 Gemini vision，避免長時間請求影響案件表。</div>
+        <div class="text-muted mt-2">v24 的步驟①不執行地籍圖 Gemini vision，避免長時間請求影響案件表。</div>
       </div>
     </div>
   </div>
@@ -36587,7 +36587,7 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
     showMessage('info', '正在單獨分析所有權部，請稍候。');
 
     const controller = new AbortController();
-    const timer = setTimeout(function () { controller.abort(); }, 25000);
+    const timer = setTimeout(function () { controller.abort(); }, 50000);
     try {
       const response = await fetch({{ url_for('seller_deed_owner_ai_v23', seller_id=seller.id)|tojson }}, {
         method: 'POST',
@@ -36608,7 +36608,7 @@ CASE_FORM_V23_UPLOAD_HTML = r"""
       setTimeout(function () { window.location.reload(); }, 700);
     } catch (error) {
       if (error && error.name === 'AbortError') {
-        showMessage('danger', 'AI 等待超過 25 秒，已停止等待。原本解析資料不受影響。');
+        showMessage('danger', 'AI 等待超過 50 秒，已停止等待。原本解析資料不受影響，可稍後再按一次。');
       } else {
         showMessage('danger', 'AI 補抓失敗：' + (error && error.message ? error.message : String(error)));
       }
@@ -36902,20 +36902,35 @@ def _case_v23_owner_prompt(owner_section: str, missing_fields: list):
 
 
 def _case_v23_gemini_owner_once(owner_section: str, missing_fields: list):
-    """只使用一次 REST 請求；不呼叫共用 helper、不做第二次 fallback。"""
+    """Gemini 所有權部補抓：503/429/5xx 自動退避重試，最後可切換備援模型。"""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("尚未設定 GEMINI_API_KEY")
 
-    model = os.environ.get(
+    primary_model = os.environ.get(
         "GEMINI_CASE_OWNER_MODEL",
         os.environ.get("GEMINI_MODEL", globals().get("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash")),
     ).strip() or "gemini-2.5-flash"
+    fallback_model = os.environ.get(
+        "GEMINI_CASE_OWNER_FALLBACK_MODEL",
+        "gemini-3.1-flash-lite",
+    ).strip()
+
     try:
-        timeout_seconds = float(os.environ.get("CASE_OWNER_AI_TIMEOUT", "18"))
+        timeout_seconds = float(os.environ.get("CASE_OWNER_AI_TIMEOUT", "12"))
     except Exception:
-        timeout_seconds = 18.0
-    timeout_seconds = max(5.0, min(timeout_seconds, 22.0))
+        timeout_seconds = 12.0
+    timeout_seconds = max(5.0, min(timeout_seconds, 15.0))
+
+    try:
+        max_attempts = int(os.environ.get("CASE_OWNER_AI_MAX_ATTEMPTS", "3"))
+    except Exception:
+        max_attempts = 3
+    max_attempts = max(1, min(max_attempts, 4))
+
+    models = [primary_model]
+    if fallback_model and fallback_model not in models:
+        models.append(fallback_model)
 
     prompt = _case_v23_owner_prompt(owner_section, missing_fields)
     payload = {
@@ -36930,37 +36945,91 @@ def _case_v23_gemini_owner_once(owner_section: str, missing_fields: list):
         },
     }
 
+    import random
+    import time
     import urllib.request
     import urllib.error
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")[:1200]
-        except Exception:
-            detail = ""
-        raise RuntimeError(f"Gemini HTTP {exc.code}：{detail or exc.reason}")
-    except Exception as exc:
-        raise RuntimeError(f"Gemini 單次分析失敗：{exc}")
+    retryable_codes = {408, 429, 500, 502, 503, 504}
+    last_error = None
+    last_status = None
+    attempts = []
 
-    parts = (((body.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
-    text = "\n".join(str(part.get("text") or "") for part in parts)
-    data = _case_v19_ai_json_loads(text)
-    if not isinstance(data, dict) or not data:
-        raise RuntimeError("Gemini 回傳內容無法解析成 JSON")
-    return data
+    for attempt_index in range(max_attempts):
+        # 前兩次優先使用主模型；最後一次才切備援模型。
+        if len(models) > 1 and attempt_index == max_attempts - 1:
+            model = models[1]
+        else:
+            model = models[0]
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+
+        attempt_no = attempt_index + 1
+        try:
+            print(
+                f"ℹ️ CASE_FORM_V24 Gemini owner AI attempt={attempt_no}/{max_attempts} "
+                f"model={model} timeout={timeout_seconds}s"
+            )
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+                body = json.loads(response.read().decode("utf-8"))
+
+            parts = (((body.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+            text = "\n".join(str(part.get("text") or "") for part in parts)
+            data = _case_v19_ai_json_loads(text)
+            if not isinstance(data, dict) or not data:
+                raise RuntimeError("Gemini 回傳內容無法解析成 JSON")
+
+            data["_case_owner_ai_model"] = model
+            data["_case_owner_ai_attempts"] = attempt_no
+            return data
+
+        except urllib.error.HTTPError as exc:
+            last_status = int(getattr(exc, "code", 0) or 0)
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:1200]
+            except Exception:
+                detail = ""
+            last_error = f"Gemini HTTP {last_status}：{detail or exc.reason}"
+            attempts.append(f"第{attempt_no}次/{model}/HTTP {last_status}")
+            print(f"⚠️ CASE_FORM_V24 Gemini owner AI retryable check: {last_error}")
+
+            if last_status not in retryable_codes or attempt_no >= max_attempts:
+                break
+
+        except Exception as exc:
+            last_status = None
+            last_error = f"Gemini 請求失敗：{exc}"
+            attempts.append(f"第{attempt_no}次/{model}/連線錯誤")
+            print(f"⚠️ CASE_FORM_V24 Gemini owner AI exception: {last_error}")
+            if attempt_no >= max_attempts:
+                break
+
+        # 指數退避 + jitter；503 通常立即回覆，因此整體仍可控制在前端等待時間內。
+        delay = min(1.25 * (2 ** attempt_index), 5.0) + random.uniform(0.15, 0.65)
+        print(f"⏳ CASE_FORM_V24 Gemini owner AI wait {delay:.2f}s before retry")
+        time.sleep(delay)
+
+    attempt_text = "、".join(attempts) if attempts else f"共嘗試 {max_attempts} 次"
+    if last_status == 503:
+        raise RuntimeError(
+            "Gemini目前使用量過高，系統已自動重試並切換備援模型仍無法完成。"
+            f"請稍後再按一次AI補抓（{attempt_text}）。"
+        )
+    if last_status == 429:
+        raise RuntimeError(
+            "Gemini目前請求額度或速率已達上限，系統已自動重試。"
+            f"請稍後再試（{attempt_text}）。"
+        )
+    raise RuntimeError(f"{last_error or 'Gemini 分析失敗'}（{attempt_text}）")
 
 
 def _case_v23_pending_from_ai(ai_data: dict, missing_fields: list):
@@ -37061,9 +37130,21 @@ def seller_deed_owner_ai_v23(seller_id):
         import traceback
         print(f"❌ CASE_FORM_V23 owner AI failure [{error_id}] seller_id={seller_id}: {exc}")
         traceback.print_exc()
+        error_text = str(exc)
+        temporary_busy = (
+            "使用量過高" in error_text
+            or "HTTP 503" in error_text
+            or "HTTP 429" in error_text
+            or "速率已達上限" in error_text
+        )
+        status_text = (
+            f"AI服務暫時忙碌（錯誤編號 {error_id}），原本解析資料不受影響，請稍後重試。"
+            if temporary_busy
+            else f"AI 補抓失敗（錯誤編號 {error_id}）：{error_text}"
+        )
         try:
             db.collection("sellers").document(seller_id).set({
-                "deed_ai_status": f"AI 補抓失敗（錯誤編號 {error_id}）：{exc}",
+                "deed_ai_status": status_text,
                 "deed_ai_last_error_id": error_id,
                 "updated_at": now_taipei().isoformat(),
             }, merge=True)
@@ -37071,8 +37152,13 @@ def seller_deed_owner_ai_v23(seller_id):
             pass
         return _case_v23_json({
             "success": False,
-            "message": f"AI 補抓失敗（錯誤編號 {error_id}）：{exc}",
-        })
+            "temporary": temporary_busy,
+            "message": (
+                f"Gemini目前忙碌，系統已自動重試仍未成功。請稍後再按一次AI補抓（錯誤編號 {error_id}）。"
+                if temporary_busy
+                else f"AI 補抓失敗（錯誤編號 {error_id}）：{error_text}"
+            ),
+        }, 503 if temporary_busy else 500)
 
 
 @login_required
