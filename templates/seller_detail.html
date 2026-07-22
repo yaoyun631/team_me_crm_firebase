@@ -13,8 +13,7 @@
       <button type="submit" class="btn btn-outline-info">傳LINE</button>
     </form>
     <a href="{{ url_for('seller_case_tools', seller_id=seller.id) }}" class="btn btn-outline-primary me-2">案件表 / AI文案</a>
-    <a href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}" class="btn btn-outline-success me-2">上傳謄本填表</a>
-    <a href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}#cadastral-map-upload" class="btn btn-outline-success me-2">上傳地籍圖</a>
+    <a href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}" class="btn btn-outline-success me-2">上傳謄本/地籍圖</a>
     <a href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}" target="_blank" class="btn btn-outline-dark me-2">下載填好案件表</a>
     <a href="{{ url_for('seller_edit', seller_id=seller.id) }}" class="btn btn-warning me-2">編輯資料</a>
     <a href="{{ url_for('sellers') }}" class="btn btn-secondary">返回列表</a>

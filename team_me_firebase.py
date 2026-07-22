@@ -22698,6 +22698,15 @@ def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     data["cadastral_parsed_json"] = seller.get("cadastral_parsed_json") or ""
     data["cadastral_pdf_filename"] = seller.get("cadastral_pdf_filename") or ""
     data["cadastral_road_access"] = seller.get("cadastral_road_access") or ""
+    data["deed_ai_note"] = seller.get("deed_ai_note") or ""
+    data["deed_analysis_source"] = seller.get("deed_analysis_source") or ""
+    data["cadastral_ai_note"] = seller.get("cadastral_ai_note") or ""
+    data["cadastral_direction_note"] = seller.get("cadastral_direction_note") or ""
+    data["cadastral_confidence"] = seller.get("cadastral_confidence") or ""
+    data["road_width_confidence"] = seller.get("road_width_confidence") or ""
+    data["road_width_source"] = seller.get("road_width_source") or ""
+    data["road_width"] = seller.get("road_width") or ""
+    data["cadastral_analysis_source"] = seller.get("cadastral_analysis_source") or ""
     data["ai_sales_title"] = seller.get("ai_sales_title") or ""
     data["ai_selling_points"] = seller.get("ai_selling_points") or []
     data["ai_group_copy"] = seller.get("ai_group_copy") or ""
@@ -22883,7 +22892,7 @@ CASE_TOOLS_HTML = r'''
     <div class="text-muted small">委託：{{ seller.name or '-' }}｜{{ seller.phone or '-' }}</div>
   </div>
   <div>
-    <a class="btn btn-outline-success" href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}">上傳謄本填表</a>
+    <a class="btn btn-outline-success" href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}">上傳謄本/地籍圖</a>
     <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
     <a class="btn btn-outline-secondary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載原本案件表 PDF</a>
     <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
@@ -35154,3 +35163,577 @@ print("✅ 新上架物件後台已啟用：/assistant/new-properties（只顯�
 # =============================================================================
 # Team M.E 新上架物件後台 Patch End
 # =============================================================================
+
+
+
+
+# =============================================================================
+# CASE_FORM_V19：單一上傳謄本/地籍圖 + AI分析 Patch
+# =============================================================================
+
+CASE_FORM_V19_UPLOAD_HTML = r"""
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <div>
+    <h3 class="mb-1">上傳謄本/地籍圖 → AI 分析 → 自動填案件輸入表</h3>
+    <div class="text-muted small">委託：{{ seller.name or '-' }}｜{{ seller.phone or '-' }}</div>
+  </div>
+  <div class="d-flex gap-2 flex-wrap">
+    <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
+    <a class="btn btn-outline-secondary" href="{{ url_for('seller_case_tools', seller_id=seller.id) }}">案件表 / AI文案</a>
+    <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
+  </div>
+</div>
+
+<div class="alert alert-info small">
+  <strong>v19 單一上傳入口：</strong>
+  這裡只要一個上傳按鈕，可以一次選擇謄本 PDF、地籍圖 PDF。
+  系統會自動分類：謄本用來抓所有權人、統一編號、出生日期、住址與面積資料；
+  地籍圖會交給 AI 判斷物件方位、是否臨路與估算面臨路寬。
+</div>
+
+{% if not ai_enabled %}
+<div class="alert alert-warning small">
+  目前未設定 GEMINI_API_KEY。謄本會先用 PDF 文字規則解析；若 PDF 是掃描圖或抽不到身分證/出生日期，AI fallback 不會啟動。
+  地籍圖方位與路寬需要 AI 才能判斷。
+</div>
+{% endif %}
+
+<form method="post" enctype="multipart/form-data" class="card mb-4">
+  <div class="card-header fw-bold">上傳謄本/地籍圖</div>
+  <div class="card-body">
+    <label class="form-label">選擇檔案，可一次多選</label>
+    <input type="file" name="case_files" class="form-control" accept="application/pdf,.pdf,image/*" multiple>
+    <div class="form-text mb-3">
+      可同時選：土地/建物謄本 PDF、地籍圖 PDF。若是圖片地籍圖也可上傳，AI 會嘗試判斷方位與路寬。
+    </div>
+
+    <label class="form-label">謄本 OCR / 複製文字補充</label>
+    <textarea name="deed_text" class="form-control" rows="6" placeholder="若 PDF 抽不到文字，可把 OCR 文字貼在這裡。">{{ case_data.deed_raw_text or '' }}</textarea>
+  </div>
+  <div class="card-footer d-flex gap-2 flex-wrap">
+    <button class="btn btn-success" name="action" value="parse" type="submit">AI解析並儲存</button>
+    <button class="btn btn-primary" name="action" value="parse_and_download" type="submit">AI解析並下載案件表</button>
+  </div>
+</form>
+
+<div class="row g-4">
+  <div class="col-lg-6">
+    <div class="card mb-3">
+      <div class="card-header fw-bold">謄本 OCR / AI 解析結果</div>
+      <div class="card-body">
+        <table class="table table-sm align-middle">
+          <tbody>
+            <tr><th style="width:160px;">謄本檔名</th><td>{{ case_data.deed_pdf_filename or '-' }}</td></tr>
+            <tr><th>分析方式</th><td>{{ case_data.deed_analysis_source or '-' }}</td></tr>
+            <tr><th>所有權人</th><td>{{ case_data.deed_owner or case_data.owner_name or '-' }}</td></tr>
+            <tr><th>身分證字號</th><td>{{ case_data.owner_identity_no or case_data.owner_id or '-' }}</td></tr>
+            <tr><th>性別</th><td>{{ case_data.owner_gender or '-' }}</td></tr>
+            <tr><th>出生日期</th><td>{{ case_data.owner_birth_year or '-' }} 年 {{ case_data.owner_birth_month or '-' }} 月 {{ case_data.owner_birth_day or '-' }} 日</td></tr>
+            <tr><th>戶籍地址/住址</th><td>{{ case_data.owner_household_address or case_data.registered_address or case_data.household_address or '-' }}</td></tr>
+            <tr><th>物件地址</th><td>{{ case_data.case_address or seller.address or '-' }}</td></tr>
+            <tr><th>AI 狀態</th><td>{{ case_data.deed_ai_status or '-' }}</td></tr>
+          </tbody>
+        </table>
+        {% if case_data.deed_parsed_note %}
+          <pre class="small mb-0 bg-light p-2 rounded" style="white-space:pre-wrap;max-height:260px;overflow:auto;">{{ case_data.deed_parsed_note }}</pre>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card mb-3">
+      <div class="card-header fw-bold">地籍圖 AI 判斷結果</div>
+      <div class="card-body">
+        <table class="table table-sm align-middle">
+          <tbody>
+            <tr><th style="width:160px;">地籍圖檔名</th><td>{{ case_data.cadastral_pdf_filename or '-' }}</td></tr>
+            <tr><th>AI 分析狀態</th><td>{{ case_data.cadastral_ai_status or '-' }}</td></tr>
+            <tr><th>判斷方位</th><td>{{ case_data.facing or case_data.building_facing or '-' }}</td></tr>
+            <tr><th>面臨路寬</th><td>{{ case_data.road_width or case_data.estimated_road_width or case_data.cadastral_road_width or '-' }} 米</td></tr>
+            <tr><th>信心程度</th><td>{{ case_data.road_width_confidence or case_data.cadastral_confidence or '-' }}</td></tr>
+            <tr><th>臨路判斷</th><td>{{ case_data.cadastral_road_access or '-' }}</td></tr>
+            <tr><th>AI 說明</th><td style="white-space:pre-line;">{{ case_data.cadastral_ai_note or case_data.cadastral_direction_note or case_data.cadastral_note or '-' }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+"""
+
+
+def _case_v19_ai_available():
+    return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+
+
+def _case_v19_ai_json_loads(text):
+    if "_ai_json_loads" in globals():
+        return _ai_json_loads(text)
+    try:
+        return json.loads(str(text or "").strip())
+    except Exception:
+        m = re.search(r"\{.*\}", str(text or ""), re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+    return {}
+
+
+def _case_v19_gemini_json_from_text(prompt: str):
+    if "_gemini_generate_json" in globals():
+        return _gemini_generate_json(prompt)
+    raise RuntimeError("Gemini helper 不存在")
+
+
+def _case_v19_gemini_json_from_file(prompt: str, file_bytes: bytes, mime_type: str = "application/pdf"):
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("尚未設定 GEMINI_API_KEY")
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+        res = client.models.generate_content(
+            model=os.environ.get("GEMINI_MODEL", globals().get("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash")),
+            contents=[
+                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+                prompt,
+            ],
+        )
+        return _case_v19_ai_json_loads(getattr(res, "text", "") or "")
+    except Exception as exc:
+        raise RuntimeError(f"Gemini 檔案分析失敗：{exc}")
+
+
+def _case_v19_extract_upload(upload_file):
+    from deed_case_form_tool import extract_deed_pdf_text_from_bytes
+    filename = secure_filename(getattr(upload_file, "filename", "") or "")
+    data = upload_file.read()
+    if not data:
+        return {"filename": filename, "bytes": b"", "text": "", "mime_type": "application/pdf"}
+
+    lower = filename.lower()
+    if lower.endswith(".png"):
+        mime_type = "image/png"
+        raw_text = ""
+    elif lower.endswith(".jpg") or lower.endswith(".jpeg"):
+        mime_type = "image/jpeg"
+        raw_text = ""
+    elif lower.endswith(".webp"):
+        mime_type = "image/webp"
+        raw_text = ""
+    else:
+        mime_type = "application/pdf"
+        try:
+            raw_text = extract_deed_pdf_text_from_bytes(data)
+        except Exception:
+            raw_text = ""
+    return {"filename": filename, "bytes": data, "text": raw_text or "", "mime_type": mime_type}
+
+
+def _case_v19_classify_file(filename: str, raw_text: str):
+    name = str(filename or "")
+    text = str(raw_text or "")
+    hay = name + "\n" + text[:2000]
+    if any(k in hay for k in ["地籍圖", "比例尺", "土地坐落"]) and not any(k in hay for k in ["土地登記第一類謄本", "建物登記第一類謄本", "所有權部"]):
+        return "cadastral"
+    if any(k in hay for k in ["地籍圖", "地籍圖謄本"]):
+        return "cadastral"
+    return "deed"
+
+
+def _case_v19_nonempty(data: dict):
+    return {k: v for k, v in (data or {}).items() if str(v or "").strip()}
+
+
+def _case_v19_owner_missing(case_data: dict):
+    return not (
+        str(case_data.get("owner_id") or case_data.get("owner_identity_no") or "").strip()
+        and str(case_data.get("owner_birth_year") or "").strip()
+        and str(case_data.get("owner_birth_month") or "").strip()
+        and str(case_data.get("owner_birth_day") or "").strip()
+        and str(case_data.get("owner_household_address") or case_data.get("registered_address") or case_data.get("household_address") or "").strip()
+    )
+
+
+def _case_v19_ai_analyze_deed(raw_text: str = "", file_bytes: bytes = b"", mime_type: str = "application/pdf"):
+    prompt = f"""
+你是台灣不動產謄本資料擷取助手。
+請從上傳的土地/建物登記謄本或以下文字，擷取自然人所有權人的資料。
+若欄位沒有出現，請留空字串。只輸出 JSON，不要輸出其他文字。
+
+要抓的重點：
+- 統一編號 / 身分證字號，例如 C120801873
+- 出生日期，例如 民國066年01月04日，要拆成年月日
+- 住址，這就是案件輸入表上方客戶資料的戶籍地址
+- 性別，如果謄本沒有寫，但身分證字號第二碼是 1=男、2=女，請推論
+
+輸出 JSON 格式：
+{{
+  "owner_name": "",
+  "owner_id": "",
+  "owner_identity_no": "",
+  "owner_gender": "",
+  "owner_birth_date": "",
+  "owner_birth_year": "",
+  "owner_birth_month": "",
+  "owner_birth_day": "",
+  "owner_household_address": "",
+  "registered_address": "",
+  "household_address": "",
+  "deed_ai_note": ""
+}}
+
+謄本文字：
+{str(raw_text or "")[:12000]}
+""".strip()
+
+    if not _case_v19_ai_available():
+        return {"deed_ai_status": "未設定 GEMINI_API_KEY，僅使用規則/OCR文字解析"}
+
+    try:
+        if file_bytes:
+            data = _case_v19_gemini_json_from_file(prompt, file_bytes, mime_type=mime_type)
+        else:
+            data = _case_v19_gemini_json_from_text(prompt)
+        if not isinstance(data, dict):
+            raise RuntimeError("AI 回傳不是 JSON")
+        data["deed_ai_status"] = "AI 已分析謄本"
+        return data
+    except Exception as exc:
+        return {"deed_ai_status": f"AI 分析謄本失敗：{exc}"}
+
+
+def _case_v19_ai_analyze_cadastral(raw_text: str = "", file_bytes: bytes = b"", mime_type: str = "application/pdf"):
+    prompt = f"""
+你是台灣房仲的地籍圖判讀助手。請針對上傳的地籍圖或地籍圖文字，判斷：
+1. 物件/土地可能的方位或坐向，例如 朝東、朝西、朝南、朝北、朝東南。
+2. 是否臨路。
+3. 估算面臨路寬，單位公尺。若無法估算，請留空。
+4. 說明判斷依據與信心程度。
+
+重要規則：
+- 地籍圖判斷只能作輔助，不可當鑑界或正式路寬。
+- 如果沒有比例尺、道路邊界不清楚、或看不到道路，road_width 留空。
+- 如果可以估算，road_width 只填數字，例如 4、6、8。
+- facing 只填朝向文字，例如 朝東、朝南，不要長篇。
+- 只輸出 JSON，不要輸出其他文字。
+
+輸出 JSON：
+{{
+  "facing": "",
+  "building_facing": "",
+  "road_width": "",
+  "estimated_road_width": "",
+  "cadastral_road_width": "",
+  "road_width_confidence": "高/中/低",
+  "cadastral_road_access": "有臨路/沒有臨路/需人工確認",
+  "cadastral_direction_note": "",
+  "cadastral_ai_note": "",
+  "cadastral_confidence": "高/中/低"
+}}
+
+地籍圖文字：
+{str(raw_text or "")[:6000]}
+""".strip()
+
+    if not _case_v19_ai_available():
+        return {
+            "cadastral_ai_status": "未設定 GEMINI_API_KEY，地籍圖方位/路寬未使用 AI 判斷",
+            "cadastral_road_access": "需人工確認",
+        }
+
+    try:
+        if file_bytes:
+            data = _case_v19_gemini_json_from_file(prompt, file_bytes, mime_type=mime_type)
+        else:
+            data = _case_v19_gemini_json_from_text(prompt)
+        if not isinstance(data, dict):
+            raise RuntimeError("AI 回傳不是 JSON")
+        data["cadastral_ai_status"] = "AI 已判斷地籍圖"
+        return data
+    except Exception as exc:
+        return {
+            "cadastral_ai_status": f"AI 判斷地籍圖失敗：{exc}",
+            "cadastral_road_access": "需人工確認",
+        }
+
+
+def _case_v19_parse_deed_item(item: dict):
+    from deed_case_form_tool import parse_deed_text, parse_owner_personal_info
+
+    raw_text = item.get("text") or ""
+    file_bytes = item.get("bytes") or b""
+    mime_type = item.get("mime_type") or "application/pdf"
+
+    parsed = {}
+    try:
+        parsed = parse_deed_text(raw_text) if raw_text else {"case_data": {}}
+    except Exception as exc:
+        parsed = {"case_data": {}, "parse_error": str(exc)}
+
+    case_data = dict((parsed.get("case_data") or {}))
+
+    # 規則解析所有權人，即使 parse_deed_text 沒抓到也再跑一次。
+    try:
+        owner_info = parse_owner_personal_info(raw_text)
+        for k, v in owner_info.items():
+            if str(v or "").strip() and not str(case_data.get(k) or "").strip():
+                case_data[k] = v
+    except Exception as exc:
+        case_data["deed_ai_status"] = f"規則解析所有權人失敗：{exc}"
+
+    if _case_v19_owner_missing(case_data):
+        ai_data = _case_v19_ai_analyze_deed(raw_text, file_bytes, mime_type)
+        for k, v in _case_v19_nonempty(ai_data).items():
+            # AI 結果填空欄為主；status/note 直接寫入。
+            if k.endswith("_status") or k.endswith("_note") or not str(case_data.get(k) or "").strip():
+                case_data[k] = v
+    else:
+        case_data["deed_ai_status"] = case_data.get("deed_ai_status") or "規則/OCR 已抓到身分證、生日、戶籍地址"
+
+    parsed["case_data"] = case_data
+    return parsed
+
+
+def _case_v19_parse_cadastral_item(item: dict):
+    from deed_case_form_tool import parse_deed_text
+
+    raw_text = item.get("text") or ""
+    file_bytes = item.get("bytes") or b""
+    mime_type = item.get("mime_type") or "application/pdf"
+
+    parsed = {}
+    try:
+        parsed = parse_deed_text(raw_text) if raw_text else {"case_data": {}}
+    except Exception as exc:
+        parsed = {"case_data": {}, "parse_error": str(exc)}
+
+    cad_case = dict((parsed.get("case_data") or {}))
+    ai_data = _case_v19_ai_analyze_cadastral(raw_text, file_bytes, mime_type)
+    for k, v in _case_v19_nonempty(ai_data).items():
+        cad_case[k] = v
+    parsed["case_data"] = cad_case
+    return parsed
+
+
+def _case_v19_merge_deed_parsed(items: list):
+    merged = {"case_data": {}, "parts": []}
+    raw_texts = []
+    filenames = []
+    for item in items:
+        parsed = _case_v19_parse_deed_item(item)
+        merged["parts"].append(parsed)
+        for k, v in _case_v19_nonempty(parsed.get("case_data") or {}).items():
+            if not str(merged["case_data"].get(k) or "").strip() or k in {"deed_ai_status", "deed_ai_note"}:
+                merged["case_data"][k] = v
+        if item.get("text"):
+            raw_texts.append(item.get("text"))
+        if item.get("filename"):
+            filenames.append(item.get("filename"))
+    return merged, "\n\n---謄本分隔---\n\n".join(raw_texts), "+".join(filenames)
+
+
+def _case_v19_merge_cadastral_parsed(items: list):
+    merged = {"case_data": {}, "parts": []}
+    raw_texts = []
+    filenames = []
+    for item in items:
+        parsed = _case_v19_parse_cadastral_item(item)
+        merged["parts"].append(parsed)
+        # 地籍圖只允許更新地籍圖/路寬/方位相關欄位，避免覆蓋謄本。
+        allowed = {
+            "cadastral_lot", "cadastral_scale", "cadastral_road_access", "cadastral_note",
+            "cadastral_ai_status", "cadastral_ai_note", "cadastral_direction_note",
+            "cadastral_confidence", "road_width_confidence", "road_width_source",
+            "facing", "building_facing", "road_width", "estimated_road_width", "cadastral_road_width",
+        }
+        for k, v in _case_v19_nonempty(parsed.get("case_data") or {}).items():
+            if k in allowed:
+                merged["case_data"][k] = v
+        if item.get("text"):
+            raw_texts.append(item.get("text"))
+        if item.get("filename"):
+            filenames.append(item.get("filename"))
+    return merged, "\n\n---地籍圖分隔---\n\n".join(raw_texts), "+".join(filenames)
+
+
+def _case_v19_apply_upload_result(seller_id: str, deed_result=None, cadastral_result=None):
+    updates = {}
+
+    if deed_result:
+        deed_parsed, deed_raw_text, deed_filename = deed_result
+        deed_case = _case_v19_nonempty((deed_parsed or {}).get("case_data") or {})
+        updates.update(deed_case)
+        if deed_raw_text:
+            updates["deed_raw_text"] = deed_raw_text[:30000]
+        if deed_filename:
+            updates["deed_pdf_filename"] = deed_filename
+        try:
+            updates["deed_parsed_json"] = json.dumps(deed_parsed, ensure_ascii=False)[:60000]
+        except Exception:
+            pass
+        updates["deed_parsed_at"] = now_taipei().isoformat()
+        updates["deed_analysis_source"] = "OCR/文字 + AI fallback"
+
+    if cadastral_result:
+        cadastral_parsed, cadastral_raw_text, cadastral_filename = cadastral_result
+        cad_case = _case_v19_nonempty((cadastral_parsed or {}).get("case_data") or {})
+        # 僅更新地籍圖/方位/路寬相關欄位
+        allowed = {
+            "cadastral_lot", "cadastral_scale", "cadastral_road_access", "cadastral_note",
+            "cadastral_ai_status", "cadastral_ai_note", "cadastral_direction_note",
+            "cadastral_confidence", "road_width_confidence", "road_width_source",
+            "facing", "building_facing", "road_width", "estimated_road_width", "cadastral_road_width",
+        }
+        for k, v in cad_case.items():
+            if k in allowed and str(v or "").strip():
+                updates[k] = v
+        if cadastral_raw_text:
+            updates["cadastral_raw_text"] = cadastral_raw_text[:30000]
+        if cadastral_filename:
+            updates["cadastral_pdf_filename"] = cadastral_filename
+        try:
+            updates["cadastral_parsed_json"] = json.dumps(cadastral_parsed, ensure_ascii=False)[:60000]
+        except Exception:
+            pass
+        updates["cadastral_parsed_at"] = now_taipei().isoformat()
+        updates["cadastral_analysis_source"] = "AI vision / file analysis"
+
+    if not updates:
+        raise RuntimeError("沒有可儲存的解析資料。")
+
+    _case_apply_ai_to_seller(seller_id, updates, {})
+    return updates
+
+
+def _case_v19_collect_upload_items():
+    items = []
+
+    for upload in request.files.getlist("case_files"):
+        if upload and getattr(upload, "filename", ""):
+            items.append(_case_v19_extract_upload(upload))
+
+    # 兼容舊欄位
+    for name in ["deed_pdf", "cadastral_pdf"]:
+        upload = request.files.get(name)
+        if upload and getattr(upload, "filename", ""):
+            items.append(_case_v19_extract_upload(upload))
+
+    # 文字補充只當謄本
+    deed_text = (request.form.get("deed_text") or "").strip()
+    if deed_text:
+        items.append({"filename": "貼上謄本文字", "bytes": b"", "text": deed_text, "mime_type": "text/plain", "forced_type": "deed"})
+
+    return items
+
+
+def seller_deed_case_form_v19(seller_id):
+    doc_ref = db.collection("sellers").document(seller_id)
+    snap = doc_ref.get()
+    if not snap.exists:
+        flash("找不到這筆委託", "danger")
+        return redirect(url_for("sellers"))
+
+    seller = doc_to_dict(snap)
+
+    if request.method == "POST":
+        action = request.form.get("action", "parse")
+        try:
+            items = _case_v19_collect_upload_items()
+            if not items:
+                raise RuntimeError("請選擇謄本或地籍圖檔案，或貼上謄本 OCR 文字。")
+
+            deed_items = []
+            cadastral_items = []
+            for item in items:
+                ftype = item.get("forced_type") or _case_v19_classify_file(item.get("filename"), item.get("text"))
+                if ftype == "cadastral":
+                    cadastral_items.append(item)
+                else:
+                    deed_items.append(item)
+
+            deed_result = _case_v19_merge_deed_parsed(deed_items) if deed_items else None
+            cadastral_result = _case_v19_merge_cadastral_parsed(cadastral_items) if cadastral_items else None
+
+            _case_v19_apply_upload_result(seller_id, deed_result=deed_result, cadastral_result=cadastral_result)
+
+            msg = []
+            if deed_result:
+                msg.append("謄本")
+            if cadastral_result:
+                msg.append("地籍圖 AI 判斷")
+            flash("已完成：" + " + ".join(msg), "success")
+
+            if action == "parse_and_download":
+                return redirect(url_for("seller_case_form_filled_pdf", seller_id=seller_id))
+            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+        except Exception as exc:
+            flash(f"解析失敗：{exc}", "danger")
+            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+
+    case_data = _case_merge_seller_and_case_data(seller)
+    return render_template_string(
+        CASE_FORM_V19_UPLOAD_HTML,
+        seller=seller,
+        case_data=case_data,
+        ai_enabled=_case_v19_ai_available(),
+    )
+
+
+# 覆蓋原本 endpoint，但不重複註冊 route，避免 Flask endpoint collision。
+try:
+    app.view_functions["seller_deed_case_form"] = seller_deed_case_form_v19
+except Exception as exc:
+    print("⚠️ v19 覆蓋 seller_deed_case_form 失敗：", exc)
+
+
+# 全站保險：統一把舊字樣換成單一入口，移除單獨地籍圖與 Word。
+@app.after_request
+def _case_form_v19_unify_upload_button(response):
+    try:
+        ctype = (response.headers.get("Content-Type") or "").lower()
+        if "text/html" not in ctype:
+            return response
+        html = response.get_data(as_text=True)
+        if not html:
+            return response
+        new_html = re.sub(
+            r'\s*<a\b[^>]*#cadastral-map-upload[^>]*>.*?上傳地籍圖.*?</a>',
+            '',
+            html,
+            flags=re.I | re.S,
+        )
+        new_html = re.sub(
+            r'\s*<a\b[^>]*(?:case-form-filled\.docx|seller_case_form_filled_docx)[^>]*>.*?</a>',
+            '',
+            new_html,
+            flags=re.I | re.S,
+        )
+        new_html = re.sub(
+            r'\s*<a\b[^>]*>[^<]*(?:下載\s*)?Word\s*案件表[^<]*</a>',
+            '',
+            new_html,
+            flags=re.I | re.S,
+        )
+        new_html = new_html.replace("上傳謄本填表", "上傳謄本/地籍圖")
+        if new_html != html:
+            response.set_data(new_html)
+            response.headers["Content-Length"] = str(len(response.get_data()))
+    except Exception as exc:
+        print("⚠️ v19 統一上傳按鈕失敗：", exc)
+    return response
+
+
+print("✅ CASE_FORM_V19：單一上傳謄本/地籍圖 + AI分析已啟用")
+
+# =============================================================================
+# CASE_FORM_V19 Patch End
+# =============================================================================
+
