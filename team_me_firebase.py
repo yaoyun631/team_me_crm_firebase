@@ -35187,7 +35187,7 @@ CASE_FORM_V19_UPLOAD_HTML = r"""
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <div>
-    <h3 class="mb-1">上傳謄本/地籍圖 → AI 分析 → 自動填案件輸入表</h3>
+    <h3 class="mb-1">上傳謄本/地籍圖 → 原本解析 → 缺漏才由 AI 補資料 → 自動填案件輸入表</h3>
     <div class="text-muted small">委託：{{ seller.name or '-' }}｜{{ seller.phone or '-' }}</div>
   </div>
   <div class="d-flex gap-2 flex-wrap">
@@ -35198,15 +35198,16 @@ CASE_FORM_V19_UPLOAD_HTML = r"""
 </div>
 
 <div class="alert alert-info small">
-  <strong>v19 單一上傳入口：</strong>
+  <strong>v22 原本解析優先：</strong>
   這裡只要一個上傳按鈕，可以一次選擇謄本 PDF、地籍圖 PDF。
-  系統會自動分類：謄本用來抓所有權人、統一編號、出生日期、住址與面積資料；
-  地籍圖會交給 AI 判斷物件方位、是否臨路與估算面臨路寬。
+  謄本先沿用原本規則/OCR解析；只有所有權人、出生日期、統一編號、住址其中缺漏時，
+  才把「所有權部」局部文字單獨交給 Gemini 補漏，不再每次上傳完整 PDF 給 Gemini。
+  地籍圖仍可由 AI 輔助判斷方位、是否臨路與估算面臨路寬。
 </div>
 
 {% if not ai_enabled %}
 <div class="alert alert-warning small">
-  目前未設定 GEMINI_API_KEY。謄本會先用 PDF 文字規則解析；若 PDF 是掃描圖或抽不到身分證/出生日期，AI fallback 不會啟動。
+  目前未設定 GEMINI_API_KEY。謄本仍會使用原本 PDF 文字規則解析；只有缺漏欄位的 Gemini 所有權部補漏不會啟動。
   地籍圖方位與路寬需要 AI 才能判斷。
 </div>
 {% endif %}
@@ -35300,9 +35301,57 @@ def _case_v19_ai_json_loads(text):
 
 
 def _case_v19_gemini_json_from_text(prompt: str):
+    """小範圍文字 Gemini JSON；SDK/helper 失敗時自動改用 REST。"""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("尚未設定 GEMINI_API_KEY")
+
+    helper_error = None
     if "_gemini_generate_json" in globals():
-        return _gemini_generate_json(prompt)
-    raise RuntimeError("Gemini helper 不存在")
+        try:
+            data = _gemini_generate_json(prompt)
+            if isinstance(data, dict) and data:
+                return data
+            helper_error = RuntimeError("Gemini helper 回傳空白或非 JSON object")
+        except Exception as exc:
+            helper_error = exc
+
+    model = os.environ.get(
+        "GEMINI_MODEL",
+        globals().get("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash"),
+    ).strip() or "gemini-2.5-flash"
+    try:
+        import urllib.request
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": str(prompt or "")}],
+            }],
+            "generationConfig": {
+                "temperature": 0.0,
+                "responseMimeType": "application/json",
+            },
+        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as res:
+            body = json.loads(res.read().decode("utf-8"))
+        parts = (((body.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+        text = "\n".join(str(part.get("text") or "") for part in parts)
+        data = _case_v19_ai_json_loads(text)
+        if isinstance(data, dict) and data:
+            return data
+        raise RuntimeError("Gemini REST 回傳內容無法解析成 JSON object")
+    except Exception as rest_exc:
+        raise RuntimeError(f"Gemini 小範圍文字分析失敗；helper={helper_error}；REST={rest_exc}")
 
 
 def _case_v19_gemini_json_from_file(prompt: str, file_bytes: bytes, mime_type: str = "application/pdf"):
@@ -35516,7 +35565,7 @@ def _case_v19_normalize_owner_ai_data(data: dict):
 
     out = {}
     passthrough_keys = {
-        "deed_ai_status", "deed_ai_note", "deed_rule_status",
+        "deed_ai_status", "deed_ai_note", "deed_rule_status", "deed_analysis_source",
     }
     for key in passthrough_keys:
         value = _case_v19_scalar_text(source.get(key), 3000)
@@ -35550,13 +35599,213 @@ def _case_v19_normalize_owner_ai_data(data: dict):
 
 
 def _case_v19_owner_missing(case_data: dict):
-    return not (
-        str(case_data.get("owner_id") or case_data.get("owner_identity_no") or "").strip()
-        and str(case_data.get("owner_birth_year") or "").strip()
-        and str(case_data.get("owner_birth_month") or "").strip()
-        and str(case_data.get("owner_birth_day") or "").strip()
-        and str(case_data.get("owner_household_address") or case_data.get("registered_address") or case_data.get("household_address") or "").strip()
+    return bool(_case_v22_owner_missing_fields(case_data))
+
+
+def _case_v22_owner_missing_fields(case_data: dict):
+    """回傳規則解析後仍缺少的四項所有權人資料。
+
+    Gemini 只會補這些缺少欄位，不覆蓋原本規則已辨識成功的內容。
+    """
+    data = case_data or {}
+    missing = []
+    if not str(data.get("owner_name") or data.get("deed_owner") or "").strip():
+        missing.append("owner_name")
+    if not str(data.get("owner_id") or data.get("owner_identity_no") or "").strip():
+        missing.append("owner_id")
+
+    has_birth_date = bool(str(data.get("owner_birth_date") or "").strip())
+    has_birth_ymd = all(
+        str(data.get(key) or "").strip()
+        for key in ("owner_birth_year", "owner_birth_month", "owner_birth_day")
     )
+    if not (has_birth_date or has_birth_ymd):
+        missing.append("owner_birth_date")
+
+    if not str(
+        data.get("owner_household_address")
+        or data.get("registered_address")
+        or data.get("household_address")
+        or ""
+    ).strip():
+        missing.append("owner_household_address")
+    return missing
+
+
+def _case_v22_extract_owner_section_text(raw_text: str, max_chars: int = 14000):
+    """只截取謄本中的土地/建物所有權部，避免 Gemini 分析整份 PDF。
+
+    會保留所有找到的所有權部；找不到明確標題時，才從「所有權人」附近
+    擷取有限範圍文字。完全無法定位時回傳空字串，且不送整份 PDF。
+    """
+    text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        return ""
+
+    sections = []
+    pattern = re.compile(
+        r"((?:土地|建物)?所有權部.*?)(?=(?:土地|建物)?他項權利部|共同擔保|本謄本僅係|(?:土地|建物)登記第一類謄本|\Z)",
+        re.S,
+    )
+    for match in pattern.finditer(text):
+        section = str(match.group(1) or "").strip()
+        if section and any(k in section for k in ("所有權人", "統一編號", "出生日期", "住址")):
+            sections.append(section)
+
+    if not sections:
+        # 部分 OCR 會漏掉「所有權部」標題，改抓所有權人前後的局部文字。
+        anchors = [m.start() for m in re.finditer(r"所有權人|權利人|登記名義人", text)]
+        for pos in anchors[:6]:
+            start = max(0, pos - 500)
+            end = min(len(text), pos + 3500)
+            section = text[start:end].strip()
+            if section:
+                sections.append(section)
+
+    if not sections:
+        return ""
+
+    unique = []
+    seen = set()
+    for section in sections:
+        compact_key = re.sub(r"\s+", "", section)[:500]
+        if compact_key in seen:
+            continue
+        seen.add(compact_key)
+        unique.append(section)
+
+    joined = "\n\n---下一個所有權部---\n\n".join(unique)
+    return joined[:max_chars]
+
+
+def _case_v22_ai_analyze_missing_owner_fields(
+    raw_text: str,
+    missing_fields: list[str],
+):
+    """只將所有權部文字交給 Gemini，補規則解析缺少的欄位。"""
+    missing_fields = [str(x) for x in (missing_fields or []) if str(x).strip()]
+    if not missing_fields:
+        return {
+            "deed_ai_status": "規則解析已完整，未呼叫 Gemini",
+            "deed_analysis_source": "原本規則/OCR解析",
+        }
+    if not _case_v19_ai_available():
+        return {
+            "deed_ai_status": "規則解析仍有缺漏，但未設定 GEMINI_API_KEY，未呼叫 Gemini",
+            "deed_analysis_source": "原本規則/OCR解析",
+        }
+
+    owner_section = _case_v22_extract_owner_section_text(raw_text)
+    if not owner_section:
+        return {
+            "deed_ai_status": "規則解析仍有缺漏，但無法定位所有權部文字；為避免錯誤，未將完整 PDF 送至 Gemini",
+            "deed_analysis_source": "原本規則/OCR解析",
+        }
+
+    labels = {
+        "owner_name": "所有權人姓名",
+        "owner_id": "統一編號／自然人身分證字號",
+        "owner_birth_date": "出生日期",
+        "owner_household_address": "住址",
+    }
+    requested = [labels.get(key, key) for key in missing_fields]
+
+    schema_lines = []
+    if "owner_name" in missing_fields:
+        schema_lines.append('  "owner_name": ""')
+    if "owner_id" in missing_fields:
+        schema_lines.extend([
+            '  "owner_id": ""',
+            '  "owner_identity_no": ""',
+        ])
+    if "owner_birth_date" in missing_fields:
+        schema_lines.extend([
+            '  "owner_birth_date": ""',
+            '  "owner_birth_year": ""',
+            '  "owner_birth_month": ""',
+            '  "owner_birth_day": ""',
+        ])
+    if "owner_household_address" in missing_fields:
+        schema_lines.extend([
+            '  "owner_household_address": ""',
+            '  "registered_address": ""',
+            '  "household_address": ""',
+        ])
+    schema_lines.append('  "deed_ai_note": ""')
+    schema = "{\n" + ",\n".join(schema_lines) + "\n}"
+
+    prompt = f"""
+你是台灣不動產登記謄本的欄位補漏助手。
+系統已經先用原本規則解析完整謄本，現在只缺少：{'、'.join(requested)}。
+
+你只能分析下方提供的「土地／建物所有權部」局部文字，只補缺少欄位：
+- 不可改寫或猜測其他已解析欄位。
+- 不可把物件門牌、土地坐落、建物門牌當成所有權人的住址。
+- 不可把抵押權人、債權人、銀行、代理人當成所有權人。
+- 統一編號只接受台灣自然人身分證格式：英文字母 + 9 位數字。
+- 出生日期以民國年月日輸出，並拆成年、月、日。
+- 文件沒有或看不清楚就留空，禁止猜測。
+- 只輸出 JSON，不要輸出 markdown 或其他說明。
+
+只允許輸出以下 JSON 欄位：
+{schema}
+
+【所有權部局部文字】
+{owner_section}
+""".strip()
+
+    try:
+        data = _case_v19_gemini_json_from_text(prompt)
+        if not isinstance(data, dict):
+            raise RuntimeError("Gemini 回傳不是 JSON object")
+        normalized = _case_v19_normalize_owner_ai_data(data)
+
+        allowed = {"deed_ai_note"}
+        if "owner_name" in missing_fields:
+            allowed.update({"owner_name", "deed_owner"})
+        if "owner_id" in missing_fields:
+            allowed.update({"owner_id", "owner_identity_no", "owner_gender"})
+        if "owner_birth_date" in missing_fields:
+            allowed.update({
+                "owner_birth_date", "owner_birth_year", "owner_birth_month", "owner_birth_day",
+            })
+        if "owner_household_address" in missing_fields:
+            allowed.update({
+                "owner_household_address", "registered_address", "household_address",
+            })
+        result = {k: v for k, v in normalized.items() if k in allowed and str(v or "").strip()}
+
+        found_after = []
+        for key in missing_fields:
+            if key == "owner_name" and result.get("owner_name"):
+                found_after.append(labels[key])
+            elif key == "owner_id" and (result.get("owner_id") or result.get("owner_identity_no")):
+                found_after.append(labels[key])
+            elif key == "owner_birth_date" and (
+                result.get("owner_birth_date")
+                or all(result.get(x) for x in ("owner_birth_year", "owner_birth_month", "owner_birth_day"))
+            ):
+                found_after.append(labels[key])
+            elif key == "owner_household_address" and (
+                result.get("owner_household_address")
+                or result.get("registered_address")
+                or result.get("household_address")
+            ):
+                found_after.append(labels[key])
+
+        still_missing = [name for name in requested if name not in found_after]
+        result["deed_ai_status"] = "Gemini 僅分析所有權部補漏"
+        if found_after:
+            result["deed_ai_status"] += "：已補 " + "、".join(found_after)
+        if still_missing:
+            result["deed_ai_status"] += "；仍缺 " + "、".join(still_missing)
+        result["deed_analysis_source"] = "原本規則/OCR解析 + Gemini所有權部補漏"
+        return result
+    except Exception as exc:
+        return {
+            "deed_ai_status": f"Gemini 所有權部補漏失敗：{exc}",
+            "deed_analysis_source": "原本規則/OCR解析（Gemini補漏失敗）",
+        }
 
 
 def _case_v19_ai_analyze_deed(raw_text: str = "", file_bytes: bytes = b"", mime_type: str = "application/pdf"):
@@ -35718,27 +35967,46 @@ def _case_v19_parse_deed_item(item: dict):
     except Exception as exc:
         case_data["deed_rule_status"] = f"規則解析所有權人失敗：{exc}"
 
-    # v20：只要有 GEMINI_API_KEY，每一份謄本 PDF/圖片都必定交給 AI，
-    # 不再等規則解析缺資料才 fallback。
-    ai_data = _case_v19_ai_analyze_deed(raw_text, file_bytes, mime_type)
+    # v22：恢復原本規則解析優先。
+    # 只有四項資料仍缺漏時，才將「所有權部局部文字」單獨送給 Gemini 補漏。
+    missing_before_ai = _case_v22_owner_missing_fields(case_data)
+    ai_data = _case_v22_ai_analyze_missing_owner_fields(raw_text, missing_before_ai)
     ai_data = _case_v19_normalize_owner_ai_data(ai_data)
+
     owner_priority_keys = {
         "owner_name", "deed_owner", "owner_id", "owner_identity_no", "owner_gender",
         "owner_birth_date", "owner_birth_year", "owner_birth_month", "owner_birth_day",
         "owner_household_address", "registered_address", "household_address",
     }
+    # Gemini 只能補原本缺少的欄位，不能覆蓋規則已成功解析的內容。
+    allowed_ai_owner_keys = set()
+    if "owner_name" in missing_before_ai:
+        allowed_ai_owner_keys.update({"owner_name", "deed_owner"})
+    if "owner_id" in missing_before_ai:
+        allowed_ai_owner_keys.update({"owner_id", "owner_identity_no", "owner_gender"})
+    if "owner_birth_date" in missing_before_ai:
+        allowed_ai_owner_keys.update({
+            "owner_birth_date", "owner_birth_year", "owner_birth_month", "owner_birth_day",
+        })
+    if "owner_household_address" in missing_before_ai:
+        allowed_ai_owner_keys.update({
+            "owner_household_address", "registered_address", "household_address",
+        })
+
     for k, v in _case_v19_nonempty(ai_data).items():
-        if k in owner_priority_keys or k.endswith("_status") or k.endswith("_note") or not str(case_data.get(k) or "").strip():
+        if k in allowed_ai_owner_keys and not str(case_data.get(k) or "").strip():
+            case_data[k] = v
+        elif k.endswith("_status") or k.endswith("_note") or k == "deed_analysis_source":
             case_data[k] = v
 
-    # AI 空白時仍保留規則結果；只把標準化後的所有權人純文字欄位合併回案件資料。
     normalized_owner = _case_v19_normalize_owner_ai_data(case_data)
     for k, v in normalized_owner.items():
         if k in owner_priority_keys or k.endswith("_status") or k.endswith("_note"):
             case_data[k] = v
     parsed["case_data"] = case_data
-    # 僅保存標準化純文字 AI 結果，避免 owners 陣列/巢狀 JSON 進入 Firestore。
     parsed["ai_owner_result"] = _case_v19_nonempty(ai_data)
+    parsed["owner_missing_before_ai"] = missing_before_ai
+    parsed["owner_missing_after_ai"] = _case_v22_owner_missing_fields(case_data)
     return parsed
 
 def _case_v19_parse_cadastral_item(item: dict):
@@ -35888,12 +36156,18 @@ def _case_v19_apply_upload_result(seller_id: str, deed_result=None, cadastral_re
             pass
         updates["deed_parsed_at"] = now_taipei().isoformat()
         ai_status_text = str(deed_case.get("deed_ai_status") or "")
-        if "PDF AI 已分析" in ai_status_text:
-            updates["deed_analysis_source"] = "PDF AI + 規則/OCR解析"
-        elif _case_v19_ai_available():
-            updates["deed_analysis_source"] = "PDF AI 嘗試失敗 + 規則/OCR解析"
+        if "Gemini 僅分析所有權部補漏" in ai_status_text:
+            updates["deed_analysis_source"] = "原本規則/OCR解析 + Gemini所有權部補漏"
+        elif "規則解析已完整" in ai_status_text:
+            updates["deed_analysis_source"] = "原本規則/OCR解析（未呼叫Gemini）"
+        elif "Gemini 所有權部補漏失敗" in ai_status_text:
+            updates["deed_analysis_source"] = "原本規則/OCR解析（Gemini補漏失敗）"
+        elif not _case_v19_ai_available():
+            updates["deed_analysis_source"] = "原本規則/OCR解析（未設定 GEMINI_API_KEY）"
         else:
-            updates["deed_analysis_source"] = "規則/OCR解析（未設定 GEMINI_API_KEY）"
+            updates["deed_analysis_source"] = str(
+                deed_case.get("deed_analysis_source") or "原本規則/OCR解析"
+            )
 
     if cadastral_result:
         cadastral_parsed, cadastral_raw_text, cadastral_filename = cadastral_result
@@ -35961,7 +36235,7 @@ def seller_deed_case_form_v19(seller_id):
     except Exception as exc:
         import traceback
         error_id = uuid4().hex[:8]
-        print(f"❌ CASE_FORM_V21 讀取委託失敗 [{error_id}] seller_id={seller_id}: {exc}")
+        print(f"❌ CASE_FORM_V22 讀取委託失敗 [{error_id}] seller_id={seller_id}: {exc}")
         traceback.print_exc()
         return (
             "<meta charset='utf-8'><div style='font-family:sans-serif;padding:28px'>"
@@ -35996,12 +36270,12 @@ def seller_deed_case_form_v19(seller_id):
 
             msg = []
             if deed_result:
-                msg.append("謄本 PDF AI / 規則解析")
+                msg.append("謄本規則解析 / Gemini所有權部補漏")
             if cadastral_result:
                 msg.append("地籍圖 AI 判斷")
             flash("已完成並儲存：" + " + ".join(msg), "success")
             print(
-                "✅ CASE_FORM_V21 AI解析儲存完成",
+                "✅ CASE_FORM_V22 解析儲存完成",
                 seller_id,
                 sorted(saved_updates.keys()),
             )
@@ -36013,7 +36287,7 @@ def seller_deed_case_form_v19(seller_id):
         except Exception as exc:
             import traceback
             error_id = uuid4().hex[:8]
-            print(f"❌ CASE_FORM_V21 AI解析失敗 [{error_id}] seller_id={seller_id}: {exc}")
+            print(f"❌ CASE_FORM_V22 解析失敗 [{error_id}] seller_id={seller_id}: {exc}")
             traceback.print_exc()
             flash(f"解析失敗（錯誤編號 {error_id}）：{exc}", "danger")
             return redirect(request.path or url_for("seller_deed_case_form", seller_id=seller_id))
@@ -36034,7 +36308,7 @@ def seller_deed_case_form_v19(seller_id):
         import html
         import traceback
         error_id = uuid4().hex[:8]
-        print(f"❌ CASE_FORM_V21 顯示解析頁失敗 [{error_id}] seller_id={seller_id}: {exc}")
+        print(f"❌ CASE_FORM_V22 顯示解析頁失敗 [{error_id}] seller_id={seller_id}: {exc}")
         traceback.print_exc()
         # 不再回傳 Flask 預設 Internal Server Error，至少保留可操作的錯誤資訊。
         safe_error = html.escape(str(exc))
