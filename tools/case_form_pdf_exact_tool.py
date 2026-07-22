@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Team M.E｜案件輸入表 PDF 同版型精準填寫工具 v13 - 對齊勾選身份生日版
+Team M.E｜案件輸入表 PDF 同版型精準填寫工具 v16 - 性別戶籍身份完整填入版
 
 核心目標：
 - 保留原本「案件輸入表-使用中.pdf」作為背景，不重新畫表格。
-- 用標楷體、置中、同表格字級把資料填進空格中，不壓到格線、不壓到原本欄位文字。
+- 用標楷體、置中、接近原表格字級把資料填進空格中，並修正朝向、身份字號、性別、生日與勾選位置。
 - 產生 PDF，因此版型會跟原始 PDF 一模一樣。
 
 安裝：
@@ -55,9 +55,9 @@ def fmt_num(value: Any, digits: int = 2) -> str:
         return text
 
 
-CASE_FORM_NORMAL_SIZE = float(os.environ.get("CASE_FORM_NORMAL_SIZE", "10.2") or 10.2)
-CASE_FORM_NUM_SIZE = float(os.environ.get("CASE_FORM_NUM_SIZE", "10.2") or 10.2)
-CASE_FORM_NOTE_SIZE = float(os.environ.get("CASE_FORM_NOTE_SIZE", "9.0") or 9.0)
+CASE_FORM_NORMAL_SIZE = float(os.environ.get("CASE_FORM_NORMAL_SIZE", "10.8") or 10.8)
+CASE_FORM_NUM_SIZE = float(os.environ.get("CASE_FORM_NUM_SIZE", "10.8") or 10.8)
+CASE_FORM_NOTE_SIZE = float(os.environ.get("CASE_FORM_NOTE_SIZE", "9.8") or 9.8)
 
 
 def parse_tw_address(value: Any) -> dict[str, str]:
@@ -179,7 +179,15 @@ def normalize_price_text(value: Any) -> str:
 
 def normalize_id_text(value: Any) -> str:
     text = clean(value).upper().replace(" ", "")
+    text = re.sub(r"[^A-Z0-9*]", "", text)
     return text[:12]
+
+
+def infer_gender_from_id(owner_id: Any) -> str:
+    text = normalize_id_text(owner_id)
+    if len(text) >= 2 and text[1] in {"1", "2"}:
+        return "男" if text[1] == "1" else "女"
+    return ""
 
 
 def parse_owner_birth_parts(value: Any) -> tuple[str, str, str]:
@@ -206,6 +214,44 @@ def parse_owner_birth_parts(value: Any) -> tuple[str, str, str]:
             y -= 1911
         return str(y), m.group(2), m.group(3)
     return "", "", ""
+
+
+def extract_owner_info_from_case_data(case_data: dict[str, Any]) -> dict[str, str]:
+    """下載 PDF 時最後補抓：從 deed_parsed_json / deed_raw_text 補身份、性別、生日、戶籍地址。"""
+    info: dict[str, str] = {}
+
+    raw_json = clean(case_data.get("deed_parsed_json"))
+    if raw_json:
+        try:
+            import json
+            obj = json.loads(raw_json)
+            if isinstance(obj, dict):
+                for src in [obj.get("owner_info"), obj.get("case_data")]:
+                    if isinstance(src, dict):
+                        for k in [
+                            "owner_name", "owner_id", "owner_identity_no", "identity_no",
+                            "owner_gender", "gender", "owner_birth_date", "birth_date",
+                            "owner_birth_year", "owner_birth_month", "owner_birth_day",
+                            "owner_household_address", "registered_address", "戶籍地址",
+                        ]:
+                            if clean(src.get(k)) and not info.get(k):
+                                info[k] = clean(src.get(k))
+        except Exception:
+            pass
+
+    raw_text = clean(case_data.get("deed_raw_text"))
+    if raw_text:
+        try:
+            from deed_case_form_tool import parse_owner_personal_info
+            parsed = parse_owner_personal_info(raw_text)
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    if clean(v) and not info.get(k):
+                        info[k] = clean(v)
+        except Exception:
+            pass
+
+    return info
 
 
 def parse_layout_counts(value: Any) -> dict[str, str]:
@@ -284,166 +330,172 @@ def register_case_font():
 # 用原 PDF 當背景，所以只需要填資料位置。
 # x, y_top, font_size, width, max_lines
 TEXT_POS = {
-    "owner_name": (57, 124, CASE_FORM_NORMAL_SIZE, 68, 1),
-    "owner_id": (189, 124, CASE_FORM_NORMAL_SIZE, 76, 1),
-    "owner_birth_year": (438, 124, CASE_FORM_NORMAL_SIZE, 22, 1),
-    "owner_birth_month": (474, 124, CASE_FORM_NORMAL_SIZE, 22, 1),
-    "owner_birth_day": (510, 124, CASE_FORM_NORMAL_SIZE, 18, 1),
-    "owner_home_phone": (80, 151, CASE_FORM_NORMAL_SIZE, 88, 1),
-    "owner_company_phone": (245, 151, CASE_FORM_NORMAL_SIZE, 105, 1),
-    "owner_mobile": (425, 151, CASE_FORM_NORMAL_SIZE, 95, 1),
+    "owner_name": (56, 124.0, CASE_FORM_NORMAL_SIZE, 68, 1),
+    "owner_id": (188, 124.0, CASE_FORM_NORMAL_SIZE, 76, 1),
+    "owner_birth_year": (438, 124.0, CASE_FORM_NORMAL_SIZE, 22, 1),
+    "owner_birth_month": (474, 124.0, CASE_FORM_NORMAL_SIZE, 22, 1),
+    "owner_birth_day": (510, 124.0, CASE_FORM_NORMAL_SIZE, 18, 1),
+    "owner_home_phone": (80, 151.0, CASE_FORM_NORMAL_SIZE, 88, 1),
+    "owner_company_phone": (245, 151.0, CASE_FORM_NORMAL_SIZE, 105, 1),
+    "owner_mobile": (423, 151.0, CASE_FORM_NORMAL_SIZE, 110, 1),
 
-    "owner_city": (58, 176, CASE_FORM_NORMAL_SIZE, 44, 1),
-    "owner_district": (119, 176, CASE_FORM_NORMAL_SIZE, 48, 1),
-    "owner_road": (183, 176, CASE_FORM_NORMAL_SIZE, 40, 1),
-    "owner_section": (262, 176, CASE_FORM_NORMAL_SIZE, 42, 1),
-    "owner_lane": (322, 176, CASE_FORM_NORMAL_SIZE, 32, 1),
-    "owner_alley": (370, 176, CASE_FORM_NORMAL_SIZE, 32, 1),
-    "owner_no": (418, 176, CASE_FORM_NORMAL_SIZE, 28, 1),
-    "owner_floor": (459, 176, CASE_FORM_NORMAL_SIZE, 26, 1),
-    "owner_floor_extra": (512, 176, CASE_FORM_NORMAL_SIZE, 25, 1),
-    "owner_full": (58, 176, CASE_FORM_NORMAL_SIZE, 450, 1),
+    "owner_city": (58, 176.0, CASE_FORM_NORMAL_SIZE, 44, 1),
+    "owner_district": (119, 176.0, CASE_FORM_NORMAL_SIZE, 48, 1),
+    "owner_road": (183, 176.0, CASE_FORM_NORMAL_SIZE, 40, 1),
+    "owner_section": (262, 176.0, CASE_FORM_NORMAL_SIZE, 42, 1),
+    "owner_lane": (322, 176.0, CASE_FORM_NORMAL_SIZE, 32, 1),
+    "owner_alley": (370, 176.0, CASE_FORM_NORMAL_SIZE, 32, 1),
+    "owner_no": (418, 176.0, CASE_FORM_NORMAL_SIZE, 28, 1),
+    "owner_floor": (459, 176.0, CASE_FORM_NORMAL_SIZE, 26, 1),
+    "owner_floor_extra": (512, 176.0, CASE_FORM_NORMAL_SIZE, 25, 1),
+    "owner_full": (58, 176.0, CASE_FORM_NORMAL_SIZE, 450, 1),
 
-    "property_title": (87, 216, CASE_FORM_NORMAL_SIZE, 200, 1),
-    "community_name": (490, 216, CASE_FORM_NORMAL_SIZE, 68, 1),
+    "property_title": (87, 216.0, CASE_FORM_NORMAL_SIZE, 200, 1),
+    "community_name": (490, 216.0, CASE_FORM_NORMAL_SIZE, 68, 1),
+    "sunlight": (501, 247.0, CASE_FORM_NORMAL_SIZE, 28, 1),
+    "front_width": (399, 263.0, CASE_FORM_NUM_SIZE, 28, 1),
+    "depth": (506, 263.0, CASE_FORM_NUM_SIZE, 28, 1),
+    "land_location_note": (459, 279.0, 9.4, 110, 1),
 
-    "case_city": (84, 298, CASE_FORM_NORMAL_SIZE, 42, 1),
-    "case_district": (142, 298, CASE_FORM_NORMAL_SIZE, 48, 1),
-    "case_road": (208, 298, CASE_FORM_NORMAL_SIZE, 48, 1),
-    "case_section": (297, 298, CASE_FORM_NORMAL_SIZE, 43, 1),
-    "case_lane": (358, 298, CASE_FORM_NORMAL_SIZE, 37, 1),
-    "case_alley": (412, 298, CASE_FORM_NORMAL_SIZE, 31, 1),
-    "case_no": (460, 298, CASE_FORM_NORMAL_SIZE, 31, 1),
-    "case_floor": (508, 298, CASE_FORM_NORMAL_SIZE, 25, 1),
-    "case_floor_extra": (562, 298, CASE_FORM_NORMAL_SIZE, 20, 1),
-    "case_full": (84, 298, CASE_FORM_NORMAL_SIZE, 475, 1),
+    "case_city": (84, 298.0, CASE_FORM_NORMAL_SIZE, 42, 1),
+    "case_district": (142, 298.0, CASE_FORM_NORMAL_SIZE, 48, 1),
+    "case_road": (208, 298.0, CASE_FORM_NORMAL_SIZE, 48, 1),
+    "case_section": (297, 298.0, CASE_FORM_NORMAL_SIZE, 43, 1),
+    "case_lane": (358, 298.0, CASE_FORM_NORMAL_SIZE, 37, 1),
+    "case_alley": (412, 298.0, CASE_FORM_NORMAL_SIZE, 31, 1),
+    "case_no": (460, 298.0, CASE_FORM_NORMAL_SIZE, 31, 1),
+    "case_floor": (508, 298.0, CASE_FORM_NORMAL_SIZE, 25, 1),
+    "case_floor_extra": (562, 298.0, CASE_FORM_NORMAL_SIZE, 20, 1),
+    "case_full": (84, 298.0, CASE_FORM_NORMAL_SIZE, 475, 1),
 
-    "floor_total": (88, 314, CASE_FORM_NUM_SIZE, 15, 1),
-    "basement_total": (185, 314, CASE_FORM_NUM_SIZE, 14, 1),
-    "floor": (86, 329, CASE_FORM_NUM_SIZE, 18, 1),
-    "floor_end": (104, 329, CASE_FORM_NUM_SIZE, 18, 1),
-    "layout_rooms": (236, 329, CASE_FORM_NUM_SIZE, 12, 1),
-    "layout_halls": (284, 329, CASE_FORM_NUM_SIZE, 12, 1),
-    "layout_baths": (332, 329, CASE_FORM_NUM_SIZE, 12, 1),
-    "layout_balconies": (387, 329, CASE_FORM_NUM_SIZE, 12, 1),
-    "layout_kitchens": (447, 329, CASE_FORM_NUM_SIZE, 12, 1),
-    "completed_year": (116, 343, CASE_FORM_NUM_SIZE, 12, 1),
-    "completed_month": (164, 343, CASE_FORM_NUM_SIZE, 12, 1),
-    "completed_day": (212, 343, CASE_FORM_NUM_SIZE, 12, 1),
-    "building_age": (296, 343, CASE_FORM_NUM_SIZE, 12, 1),
-    "facing": (512, 290, CASE_FORM_NORMAL_SIZE, 26, 1),
+    "floor_total": (88, 314.0, CASE_FORM_NUM_SIZE, 16, 1),
+    "basement_total": (186, 314.0, CASE_FORM_NUM_SIZE, 14, 1),
+    "facing": (309, 314.0, CASE_FORM_NORMAL_SIZE, 16, 1),
+    "building_facing": (309, 314.0, CASE_FORM_NORMAL_SIZE, 16, 1),
+    "tower_facing": (405, 314.0, CASE_FORM_NORMAL_SIZE, 16, 1),
+    "balcony_facing": (495, 314.0, CASE_FORM_NORMAL_SIZE, 16, 1),
 
-    "road_width": (86, 405, CASE_FORM_NUM_SIZE, 28, 1),
-    "management_fee": (86, 435, CASE_FORM_NUM_SIZE, 36, 1),
-    "clean_fee": (298, 435, CASE_FORM_NUM_SIZE, 36, 1),
-    "elevator_count": (424, 435, CASE_FORM_NUM_SIZE, 12, 1),
-    "households_per_floor": (526, 435, CASE_FORM_NUM_SIZE, 18, 1),
-    "parking_no": (81, 511, CASE_FORM_NORMAL_SIZE, 42, 1),
-    "motorcycle_no": (191, 511, CASE_FORM_NORMAL_SIZE, 48, 1),
-    "parking_fee": (308, 511, CASE_FORM_NUM_SIZE, 35, 1),
-    "parking_note": (454, 511, CASE_FORM_NORMAL_SIZE, 110, 1),
+    "floor": (86, 329.0, CASE_FORM_NUM_SIZE, 18, 1),
+    "floor_end": (104, 329.0, CASE_FORM_NUM_SIZE, 18, 1),
+    "layout_rooms": (236, 329.0, CASE_FORM_NUM_SIZE, 12, 1),
+    "layout_halls": (284, 329.0, CASE_FORM_NUM_SIZE, 12, 1),
+    "layout_baths": (332, 329.0, CASE_FORM_NUM_SIZE, 12, 1),
+    "layout_balconies": (387, 329.0, CASE_FORM_NUM_SIZE, 12, 1),
+    "layout_kitchens": (447, 329.0, CASE_FORM_NUM_SIZE, 12, 1),
+    "completed_year": (116, 343.0, CASE_FORM_NUM_SIZE, 12, 1),
+    "completed_month": (164, 343.0, CASE_FORM_NUM_SIZE, 12, 1),
+    "completed_day": (212, 343.0, CASE_FORM_NUM_SIZE, 12, 1),
+    "building_age": (296, 343.0, CASE_FORM_NUM_SIZE, 12, 1),
 
-    "total_ping": (98, 583, CASE_FORM_NUM_SIZE, 36, 1),
-    "main_ping": (212, 583, CASE_FORM_NUM_SIZE, 30, 1),
-    "attached_ping": (314, 583, CASE_FORM_NUM_SIZE, 24, 1),
-    "public_ping": (410, 583, CASE_FORM_NUM_SIZE, 24, 1),
-    "parking_ping": (506, 583, CASE_FORM_NUM_SIZE, 24, 1),
+    "road_width": (86, 405.0, CASE_FORM_NUM_SIZE, 28, 1),
+    "management_fee": (86, 435.0, CASE_FORM_NUM_SIZE, 36, 1),
+    "clean_fee": (298, 435.0, CASE_FORM_NUM_SIZE, 36, 1),
+    "elevator_count": (424, 435.0, CASE_FORM_NUM_SIZE, 12, 1),
+    "households_per_floor": (526, 435.0, CASE_FORM_NUM_SIZE, 18, 1),
+    "parking_no": (81, 511.0, CASE_FORM_NORMAL_SIZE, 42, 1),
+    "motorcycle_no": (191, 511.0, CASE_FORM_NORMAL_SIZE, 48, 1),
+    "parking_fee": (308, 511.0, CASE_FORM_NUM_SIZE, 35, 1),
+    "parking_note": (454, 511.0, CASE_FORM_NORMAL_SIZE, 110, 1),
 
-    "land_ping": (98, 601, CASE_FORM_NUM_SIZE, 36, 1),
-    "base_land_ping": (242, 601, CASE_FORM_NUM_SIZE, 36, 1),
-    "land_share_ping": (380, 601, CASE_FORM_NUM_SIZE, 36, 1),
+    "total_ping": (98, 583.0, CASE_FORM_NUM_SIZE, 36, 1),
+    "main_ping": (212, 583.0, CASE_FORM_NUM_SIZE, 30, 1),
+    "attached_ping": (314, 583.0, CASE_FORM_NUM_SIZE, 24, 1),
+    "public_ping": (410, 583.0, CASE_FORM_NUM_SIZE, 24, 1),
+    "parking_ping": (506, 583.0, CASE_FORM_NUM_SIZE, 24, 1),
+    "land_ping": (98, 601.0, CASE_FORM_NUM_SIZE, 36, 1),
+    "base_land_ping": (242, 601.0, CASE_FORM_NUM_SIZE, 36, 1),
+    "land_share_ping": (380, 601.0, CASE_FORM_NUM_SIZE, 36, 1),
+    "case_price": (62, 619.0, CASE_FORM_NUM_SIZE, 36, 1),
+    "rent_price": (206, 619.0, CASE_FORM_NUM_SIZE, 36, 1),
+    "deposit": (350, 619.0, CASE_FORM_NUM_SIZE, 36, 1),
+    "deposit_months": (500, 619.0, CASE_FORM_NUM_SIZE, 36, 1),
 
-    "case_price": (62, 619, CASE_FORM_NUM_SIZE, 36, 1),
-    "rent_price": (206, 619, CASE_FORM_NUM_SIZE, 36, 1),
-    "deposit": (350, 619, CASE_FORM_NUM_SIZE, 36, 1),
-    "deposit_months": (500, 619, CASE_FORM_NUM_SIZE, 36, 1),
-
-    "elementary_school": (81, 652, CASE_FORM_NORMAL_SIZE, 88, 1),
-    "junior_high_school": (252, 652, CASE_FORM_NORMAL_SIZE, 88, 1),
-    "market": (422, 652, CASE_FORM_NORMAL_SIZE, 88, 1),
-    "park": (81, 669, CASE_FORM_NORMAL_SIZE, 88, 1),
-    "medical": (252, 669, CASE_FORM_NORMAL_SIZE, 88, 1),
-    "station": (422, 669, CASE_FORM_NORMAL_SIZE, 88, 1),
-    "builder": (81, 686, CASE_FORM_NORMAL_SIZE, 88, 1),
-    "business_area": (252, 686, CASE_FORM_NORMAL_SIZE, 88, 1),
-
-    "feature_note": (130, 730, CASE_FORM_NOTE_SIZE, 440, 2),
-    "special_note": (130, 784, CASE_FORM_NOTE_SIZE, 440, 2),
-}# 勾選框中心位置：x, y_top, size
+    "elementary_school": (81, 652.0, CASE_FORM_NORMAL_SIZE, 88, 1),
+    "junior_high_school": (252, 652.0, CASE_FORM_NORMAL_SIZE, 88, 1),
+    "market": (422, 652.0, CASE_FORM_NORMAL_SIZE, 88, 1),
+    "park": (81, 669.0, CASE_FORM_NORMAL_SIZE, 88, 1),
+    "medical": (252, 669.0, CASE_FORM_NORMAL_SIZE, 88, 1),
+    "station": (422, 669.0, CASE_FORM_NORMAL_SIZE, 88, 1),
+    "builder": (81, 686.0, CASE_FORM_NORMAL_SIZE, 88, 1),
+    "business_area": (252, 686.0, CASE_FORM_NORMAL_SIZE, 88, 1),
+    "feature_note": (130, 729.0, CASE_FORM_NOTE_SIZE, 440, 2),
+    "special_note": (130, 782.0, CASE_FORM_NOTE_SIZE, 440, 2),
+}
+# 勾選框中心位置：x, y_top, size
 CHECK_POS = {
-    "deal_sale": (86.4, 51.9, 5.6),
-    "deal_rent": (122.4, 51.9, 5.6),
-    "mandate_exclusive": (236.4, 51.9, 5.6),
-    "mandate_general": (272.4, 51.9, 5.6),
+    "deal_sale": (86.4, 51.9, 4.7),
+    "deal_rent": (122.4, 51.9, 4.7),
+    "mandate_exclusive": (236.4, 51.9, 4.7),
+    "mandate_general": (272.4, 51.9, 4.7),
 
-    "show_agent": (86.4, 69.6, 5.6),
-    "show_store_1": (170.4, 69.6, 5.6),
-    "show_store_2": (203.4, 69.6, 5.6),
-    "show_store_3": (236.4, 69.6, 5.6),
-    "show_store_4": (269.4, 69.6, 5.6),
-    "show_store_5": (302.4, 69.6, 5.6),
-    "show_store_6": (335.5, 69.6, 5.6),
-    "show_store_7": (368.5, 69.6, 5.6),
-    "show_management": (401.5, 69.6, 5.6),
-    "show_other": (455.5, 69.6, 5.6),
+    "show_agent": (86.4, 69.6, 4.7),
+    "show_store_1": (170.4, 69.6, 4.7),
+    "show_store_2": (203.4, 69.6, 4.7),
+    "show_store_3": (236.4, 69.6, 4.7),
+    "show_store_4": (269.4, 69.6, 4.7),
+    "show_store_5": (302.4, 69.6, 4.7),
+    "show_store_6": (335.5, 69.6, 4.7),
+    "show_store_7": (368.5, 69.6, 4.7),
+    "show_management": (401.5, 69.6, 4.7),
+    "show_other": (455.5, 69.6, 4.7),
 
-    "source_line": (86.4, 101.9, 5.6),
-    "source_store": (134.4, 101.9, 5.6),
-    "source_call": (182.4, 101.9, 5.6),
-    "source_deed": (230.4, 101.9, 5.6),
-    "source_friend": (296.4, 101.9, 5.6),
-    "source_other": (344.5, 101.9, 5.6),
+    "source_line": (86.4, 101.9, 4.7),
+    "source_store": (134.4, 101.9, 4.7),
+    "source_call": (182.4, 101.9, 4.7),
+    "source_deed": (230.4, 101.9, 4.7),
+    "source_friend": (296.4, 101.9, 4.7),
+    "source_other": (344.5, 101.9, 4.7),
 
-    "gender_male": (310.8, 120.1, 5.2),
-    "gender_female": (335.4, 120.1, 5.2),
+    "gender_male": (310.8, 120.1, 4.5),
+    "gender_female": (335.4, 120.1, 4.5),
 
-    "type_apartment": (86.4, 229.8, 5.6),
-    "type_huaxia": (122.4, 229.8, 5.6),
-    "type_toutian": (158.4, 229.8, 5.6),
-    "type_villa": (194.4, 229.8, 5.6),
-    "type_farmhouse": (230.4, 229.8, 5.6),
-    "type_store": (266.4, 229.8, 5.6),
-    "type_suite": (302.4, 229.8, 5.6),
-    "type_factory": (338.4, 229.8, 5.6),
+    "type_apartment": (86.4, 229.8, 4.7),
+    "type_huaxia": (122.4, 229.8, 4.7),
+    "type_toutian": (158.4, 229.8, 4.7),
+    "type_villa": (194.4, 229.8, 4.7),
+    "type_farmhouse": (230.4, 229.8, 4.7),
+    "type_store": (266.4, 229.8, 4.7),
+    "type_suite": (302.4, 229.8, 4.7),
+    "type_factory": (338.4, 229.8, 4.7),
 
-    "land_building": (86.4, 245.4, 5.6),
-    "land_commercial": (122.4, 245.4, 5.6),
-    "land_industrial": (182.4, 245.4, 5.6),
-    "land_agricultural": (242.4, 245.4, 5.6),
-    "land_protected": (302.4, 245.4, 5.6),
-    "land_other": (350.5, 245.4, 5.6),
+    "land_building": (86.4, 245.4, 4.7),
+    "land_commercial": (122.4, 245.4, 4.7),
+    "land_industrial": (182.4, 245.4, 4.7),
+    "land_agricultural": (242.4, 245.4, 4.7),
+    "land_protected": (302.4, 245.4, 4.7),
+    "land_other": (350.5, 245.4, 4.7),
 
-    "status_empty": (86.4, 261.0, 5.6),
-    "status_self_use": (122.4, 261.0, 5.6),
-    "status_rented": (158.4, 261.0, 5.6),
-    "status_structure": (194.4, 261.0, 5.6),
-    "status_land": (242.4, 261.0, 5.6),
-    "status_other": (278.4, 261.0, 5.6),
+    "status_empty": (86.4, 261.0, 4.7),
+    "status_self_use": (122.4, 261.0, 4.7),
+    "status_rented": (158.4, 261.0, 4.7),
+    "status_structure": (194.4, 261.0, 4.7),
+    "status_land": (242.4, 261.0, 4.7),
+    "status_other": (278.4, 261.0, 4.7),
 
-    "reason_change_house": (86.4, 276.6, 5.6),
-    "reason_work": (122.4, 276.6, 5.6),
-    "reason_school": (158.4, 276.6, 5.6),
-    "reason_immigrate": (194.4, 276.6, 5.6),
-    "reason_cash": (230.4, 276.6, 5.6),
-    "reason_other": (290.4, 276.6, 5.6),
+    "reason_change_house": (86.4, 276.6, 4.7),
+    "reason_work": (122.4, 276.6, 4.7),
+    "reason_school": (158.4, 276.6, 4.7),
+    "reason_immigrate": (194.4, 276.6, 4.7),
+    "reason_cash": (230.4, 276.6, 4.7),
+    "reason_other": (290.4, 276.6, 4.7),
 
-    "structure_brick": (86.4, 387.0, 5.6),
-    "structure_reinforced_brick": (134.4, 387.0, 5.6),
-    "structure_rc": (206.4, 387.0, 5.6),
-    "structure_src": (305.4, 387.0, 5.6),
-    "structure_stone": (434.5, 387.0, 5.6),
-    "structure_other": (482.5, 387.0, 5.6),
+    "structure_brick": (86.4, 387.0, 4.7),
+    "structure_reinforced_brick": (134.4, 387.0, 4.7),
+    "structure_rc": (206.4, 387.0, 4.7),
+    "structure_src": (305.4, 387.0, 4.7),
+    "structure_stone": (434.5, 387.0, 4.7),
+    "structure_other": (482.5, 387.0, 4.7),
 
-    "use_residential": (134.4, 544.3, 5.6),
-    "use_store": (188.4, 544.3, 5.6),
-    "use_public_housing": (230.4, 544.3, 5.6),
-    "use_parking": (296.4, 544.3, 5.6),
-    "use_factory": (362.5, 544.3, 5.6),
-    "use_commercial": (452.5, 544.3, 5.6),
-    "use_office": (506.5, 544.3, 5.6),
-    "use_res_mix": (134.4, 562.3, 5.6),
-    "use_res_industry": (188.4, 562.3, 5.6),
-    "use_other": (242.4, 562.3, 5.6),
+    "use_residential": (134.4, 544.3, 4.7),
+    "use_store": (188.4, 544.3, 4.7),
+    "use_public_housing": (230.4, 544.3, 4.7),
+    "use_parking": (296.4, 544.3, 4.7),
+    "use_factory": (362.5, 544.3, 4.7),
+    "use_commercial": (452.5, 544.3, 4.7),
+    "use_office": (506.5, 544.3, 4.7),
+    "use_res_mix": (134.4, 562.3, 4.7),
+    "use_res_industry": (188.4, 562.3, 4.7),
+    "use_other": (242.4, 562.3, 4.7),
 }
 
 def pdf_text_width(text: str, font_name: str, font_size: float) -> float:
@@ -535,11 +587,11 @@ def draw_text(c, key: str, value: Any, page_h: float):
         return
 
     if key in {"owner_full", "case_full"}:
-        min_size = 8.2
+        min_size = 9.2
     elif key in {"owner_id", "property_title"}:
-        min_size = 8.8
+        min_size = 9.2
     else:
-        min_size = 8.5
+        min_size = 9.0
 
     draw_centered_fit_text(c, line, px, py, width, font_name, float(size), min_size)
 
@@ -548,7 +600,7 @@ def draw_check(c, key: str, page_h: float):
         return
     x, y_top, size = CHECK_POS[key]
     px, py = pt_from_top(x, y_top, page_h)
-    c.setLineWidth(0.75)
+    c.setLineWidth(0.62)
     c.setStrokeColorRGB(0, 0, 0)
     c.line(px - size * 0.42, py - size * 0.02, px - size * 0.10, py - size * 0.32)
     c.line(px - size * 0.10, py - size * 0.32, px + size * 0.44, py + size * 0.38)
@@ -570,6 +622,7 @@ def parse_minguo_parts(date_text: str) -> tuple[str, str, str]:
 
 def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None = None) -> dict[str, str]:
     seller = seller or {}
+    deed_owner_info = extract_owner_info_from_case_data(case_data)
     fields: dict[str, str] = {}
 
     def put(key: str, *values: Any):
@@ -579,11 +632,26 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
                 fields[key] = value
                 return
 
-    put("owner_name", seller.get("name"), case_data.get("owner_name"), case_data.get("deed_owner"))
-    put(
-        "owner_id",
-        normalize_id_text(seller.get("id_no") or seller.get("identity_no") or seller.get("id_number") or case_data.get("owner_id") or case_data.get("owner_identity_no") or case_data.get("identity_no") or case_data.get("deed_owner_id"))
+    put("owner_name", seller.get("name"), case_data.get("owner_name"), deed_owner_info.get("owner_name"), case_data.get("deed_owner"))
+    owner_id_value = normalize_id_text(
+        seller.get("id_no")
+        or seller.get("identity_no")
+        or seller.get("id_number")
+        or seller.get("owner_id")
+        or seller.get("owner_identity_no")
+        or seller.get("身分證字號")
+        or seller.get("身份字號")
+        or case_data.get("owner_id")
+        or case_data.get("owner_identity_no")
+        or case_data.get("identity_no")
+        or case_data.get("deed_owner_id")
+        or case_data.get("身分證字號")
+        or case_data.get("身份字號")
+        or deed_owner_info.get("owner_id")
+        or deed_owner_info.get("owner_identity_no")
+        or deed_owner_info.get("identity_no")
     )
+    put("owner_id", owner_id_value)
     put("owner_home_phone", seller.get("home_phone"), case_data.get("owner_home_phone"))
     put("owner_company_phone", seller.get("company_phone"), case_data.get("owner_company_phone"))
     put("owner_mobile", seller.get("phone"), seller.get("mobile"), case_data.get("owner_phone"))
@@ -591,13 +659,19 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
     by, bm, bd = parse_owner_birth_parts(
         seller.get("birth_date")
         or seller.get("owner_birth_date")
+        or seller.get("出生日期")
+        or seller.get("出生年月日")
         or case_data.get("owner_birth_date")
         or case_data.get("birth_date")
         or case_data.get("deed_owner_birth_date")
+        or case_data.get("出生日期")
+        or case_data.get("出生年月日")
+        or deed_owner_info.get("owner_birth_date")
+        or deed_owner_info.get("birth_date")
     )
-    put("owner_birth_year", case_data.get("owner_birth_year"), by)
-    put("owner_birth_month", case_data.get("owner_birth_month"), bm)
-    put("owner_birth_day", case_data.get("owner_birth_day"), bd)
+    put("owner_birth_year", case_data.get("owner_birth_year"), deed_owner_info.get("owner_birth_year"), by)
+    put("owner_birth_month", case_data.get("owner_birth_month"), deed_owner_info.get("owner_birth_month"), bm)
+    put("owner_birth_day", case_data.get("owner_birth_day"), deed_owner_info.get("owner_birth_day"), bd)
     owner_household_address = (
         seller.get("household_address")
         or seller.get("registered_address")
@@ -607,8 +681,10 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
         or seller.get("residence_address")
         or seller.get("戶籍地址")
         or seller.get("戶籍地址_完整")
-        or seller.get("contact_address")
         or case_data.get("owner_household_address")
+        or deed_owner_info.get("owner_household_address")
+        or deed_owner_info.get("registered_address")
+        or deed_owner_info.get("戶籍地址")
         or case_data.get("registered_address")
         or case_data.get("戶籍地址")
     )
@@ -638,9 +714,12 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
     put("completed_month", m)
     put("completed_day", d)
     put("building_age", case_data.get("building_age"))
-    put("facing", case_data.get("facing"))
+    put("facing", case_data.get("building_facing"), case_data.get("facing"), case_data.get("朝向"), case_data.get("座向"))
+    put("tower_facing", case_data.get("tower_facing"), case_data.get("大樓朝向"))
+    put("balcony_facing", case_data.get("balcony_facing"), case_data.get("陽台朝向"))
+    put("sunlight", case_data.get("sunlight"), case_data.get("採光"))
 
-    put("road_width", case_data.get("road_width"))
+    put("road_width", case_data.get("road_width"), case_data.get("estimated_road_width"), case_data.get("cadastral_road_width"), case_data.get("地籍圖路寬"))
     put("management_fee", case_data.get("management_fee"))
     put("elevator_count", case_data.get("elevator_count"))
     put("households_per_floor", case_data.get("households_per_floor"))
@@ -685,6 +764,7 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
 
 def infer_checks(case_data: dict[str, Any], seller: dict[str, Any] | None = None) -> dict[str, bool]:
     seller = seller or {}
+    deed_owner_info = extract_owner_info_from_case_data(case_data)
     checks: dict[str, bool] = {}
     deal = clean(seller.get("deal_type") or case_data.get("deal_type") or "sale").lower()
     checks["deal_rent"] = deal in {"rent", "出租", "租"}
@@ -708,10 +788,31 @@ def infer_checks(case_data: dict[str, Any], seller: dict[str, Any] | None = None
         or case_data.get("owner_gender")
         or case_data.get("gender")
         or case_data.get("deed_owner_gender")
+        or case_data.get("性別")
+        or deed_owner_info.get("owner_gender")
+        or deed_owner_info.get("gender")
     )
-    if gender in {"男", "M", "male", "Male", "MALE"}:
+    if not gender:
+        owner_id_for_gender = (
+            seller.get("id_no")
+            or seller.get("identity_no")
+            or seller.get("id_number")
+            or seller.get("owner_id")
+            or seller.get("owner_identity_no")
+            or seller.get("身分證字號")
+            or seller.get("身份字號")
+            or case_data.get("owner_id")
+            or case_data.get("owner_identity_no")
+            or case_data.get("identity_no")
+            or case_data.get("deed_owner_id")
+            or case_data.get("身分證字號")
+            or case_data.get("身份字號")
+            or deed_owner_info.get("owner_id")
+        )
+        gender = infer_gender_from_id(owner_id_for_gender)
+    if gender in {"男", "M", "male", "Male", "MALE", "1"}:
         checks["gender_male"] = True
-    elif gender in {"女", "F", "female", "Female", "FEMALE"}:
+    elif gender in {"女", "F", "female", "Female", "FEMALE", "2"}:
         checks["gender_female"] = True
 
     ptype = clean(seller.get("property_type") or case_data.get("property_type"))

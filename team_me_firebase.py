@@ -22499,10 +22499,14 @@ CASE_DETAIL_FIELD_KEYS = [
     "floor", "floor_total", "building_age", "facing", "showing_method", "case_note",
     "life_note", "property_highlight_note", "target_customer_note", "raw_group_text", "source_url",
     # 謄本 PDF / 案件輸入表自動填寫欄位
-    "deed_raw_text", "deed_parsed_note", "deed_owner", "land_lot_no", "building_no",
+    "deed_raw_text", "deed_parsed_note", "deed_owner",
+    "owner_id", "owner_identity_no", "owner_gender", "owner_birth_date",
+    "owner_birth_year", "owner_birth_month", "owner_birth_day", "owner_household_address",
+    "land_lot_no", "building_no",
     "deed_completed_date", "completed_minguo_year", "completed_month", "completed_day",
     "deed_main_use", "deed_main_material", "deed_right_scope", "deed_mortgage_note",
     "deed_pdf_filename", "deed_parsed_json",
+    "cadastral_lot", "cadastral_scale", "cadastral_note", "estimated_road_width", "cadastral_road_width",
     "ai_sales_title", "ai_selling_points", "ai_group_copy", "ai_listing_description", "ai_feature_note",
 ]
 
@@ -22531,6 +22535,14 @@ CASE_BASIC_LABELS = {
     "deed_raw_text": "謄本文字",
     "deed_parsed_note": "謄本解析摘要",
     "deed_owner": "所有權人",
+    "owner_id": "身分證字號",
+    "owner_identity_no": "身分證字號",
+    "owner_gender": "性別",
+    "owner_birth_date": "出生日期",
+    "owner_birth_year": "出生年",
+    "owner_birth_month": "出生月",
+    "owner_birth_day": "出生日",
+    "owner_household_address": "戶籍地址",
     "land_lot_no": "地號",
     "building_no": "建號",
     "deed_completed_date": "建物完成日期",
@@ -22543,6 +22555,11 @@ CASE_BASIC_LABELS = {
     "deed_mortgage_note": "產權/抵押權注意事項",
     "deed_pdf_filename": "謄本PDF檔名",
     "deed_parsed_json": "謄本解析JSON",
+    "cadastral_lot": "地籍圖地號",
+    "cadastral_scale": "地籍圖比例尺",
+    "cadastral_note": "地籍圖判斷備註",
+    "estimated_road_width": "估算面臨路寬",
+    "cadastral_road_width": "地籍圖估算路寬",
 }
 
 
@@ -22645,7 +22662,15 @@ def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     data["source_url"] = seller.get("source_url") or ""
     data["deed_raw_text"] = seller.get("deed_raw_text") or ""
     data["deed_parsed_note"] = seller.get("deed_parsed_note") or ""
-    data["deed_owner"] = seller.get("deed_owner") or ""
+    data["deed_owner"] = seller.get("deed_owner") or seller.get("owner_name") or ""
+    data["owner_id"] = seller.get("owner_id") or seller.get("owner_identity_no") or seller.get("identity_no") or ""
+    data["owner_identity_no"] = seller.get("owner_identity_no") or seller.get("owner_id") or seller.get("identity_no") or ""
+    data["owner_gender"] = seller.get("owner_gender") or seller.get("gender") or ""
+    data["owner_birth_date"] = seller.get("owner_birth_date") or seller.get("birth_date") or ""
+    data["owner_birth_year"] = seller.get("owner_birth_year") or ""
+    data["owner_birth_month"] = seller.get("owner_birth_month") or ""
+    data["owner_birth_day"] = seller.get("owner_birth_day") or ""
+    data["owner_household_address"] = seller.get("owner_household_address") or seller.get("household_address") or seller.get("registered_address") or seller.get("contact_address") or ""
     data["land_lot_no"] = seller.get("land_lot_no") or ""
     data["building_no"] = seller.get("building_no") or ""
     data["deed_completed_date"] = seller.get("deed_completed_date") or ""
@@ -22658,6 +22683,11 @@ def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     data["deed_mortgage_note"] = seller.get("deed_mortgage_note") or ""
     data["deed_pdf_filename"] = seller.get("deed_pdf_filename") or ""
     data["deed_parsed_json"] = seller.get("deed_parsed_json") or ""
+    data["cadastral_lot"] = seller.get("cadastral_lot") or ""
+    data["cadastral_scale"] = seller.get("cadastral_scale") or ""
+    data["cadastral_note"] = seller.get("cadastral_note") or ""
+    data["estimated_road_width"] = seller.get("estimated_road_width") or seller.get("road_width") or ""
+    data["cadastral_road_width"] = seller.get("cadastral_road_width") or ""
     data["ai_sales_title"] = seller.get("ai_sales_title") or ""
     data["ai_selling_points"] = seller.get("ai_selling_points") or []
     data["ai_group_copy"] = seller.get("ai_group_copy") or ""

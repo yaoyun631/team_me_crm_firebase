@@ -367,8 +367,71 @@ def parse_building_block(block_text: str) -> dict[str, Any]:
     }
 
 
+
+def parse_owner_personal_info(text: str) -> dict[str, str]:
+    """從謄本全文盡量抓所有權人個資；找不到就留白，避免亂填。"""
+    text = normalize_text(text)
+    info = {
+        "owner_name": "", "owner_id": "", "owner_gender": "", "owner_birth_date": "",
+        "owner_birth_year": "", "owner_birth_month": "", "owner_birth_day": "", "owner_household_address": "",
+    }
+    owner_block = first_match(text, [
+        r"(?:土地所有權部|建物所有權部)(.*?)(?:土地他項權利部|建物他項權利部|標示部|本謄本僅係|$)",
+    ]) or text
+    info["owner_name"] = first_match(owner_block, [
+        r"(?:所有權人|權利人|登記名義人|納稅義務人)\s*[:：]?\s*([\u4e00-\u9fff]{2,6})(?=\s|\n|,|，|\*)",
+        r"(?:所有權人|權利人|登記名義人|納稅義務人)\s*[:：]?\s*([^\n\s，,：:]{2,12})",
+    ])
+    raw_id = first_match(owner_block, [
+        r"(?:國民身分證統一編號|身分證統一編號|身分證明文件字號|身分證字號|身份字號|統一編號)\s*[:：]?\s*([A-Z][12\*][0-9\*]{7,9})",
+        r"\b([A-Z][12][0-9]{8})\b",
+        r"\b([A-Z][12\*][0-9\*]{7,9})\b",
+    ])
+    info["owner_id"] = raw_id.upper().replace(" ", "")
+    gender = first_match(owner_block, [r"性\s*別\s*[:：]?\s*([男女])"])
+    if gender not in {"男", "女"} and len(info["owner_id"]) >= 2:
+        if info["owner_id"][1] == "1": gender = "男"
+        elif info["owner_id"][1] == "2": gender = "女"
+    info["owner_gender"] = gender if gender in {"男", "女"} else ""
+    birth = first_match(owner_block, [
+        r"(?:出生日期|出生年月日|出生)\s*[:：]?\s*(民國\s*\d{2,3}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)",
+        r"(?:出生日期|出生年月日|出生)\s*[:：]?\s*(\d{2,4}\s*[年/-]\s*\d{1,2}\s*[月/-]\s*\d{1,2}\s*日?)",
+        r"(民國\s*\d{2,3}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s*(?:出生|生)",
+    ])
+    info["owner_birth_date"] = birth
+    if birth:
+        b = birth.translate(str.maketrans({"０":"0","１":"1","２":"2","３":"3","４":"4","５":"5","６":"6","７":"7","８":"8","９":"9"}))
+        m = re.search(r"民國\s*(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})", b) or re.search(r"(\d{2,4})\s*[年/-]\s*(\d{1,2})\s*[月/-]\s*(\d{1,2})", b)
+        if m:
+            y = int(m.group(1))
+            if y > 1911: y -= 1911
+            info["owner_birth_year"] = str(y)
+            info["owner_birth_month"] = str(int(m.group(2)))
+            info["owner_birth_day"] = str(int(m.group(3)))
+    address = first_match(owner_block, [r"(?:戶籍地址|戶籍住址|住\s*址|住\s*所|通訊地址)\s*[:：]?\s*([^\n]+)"])
+    address = re.split(r"\s{2,}|出生|統一編號|身分證|身份字號|性別", address)[0].strip() if address else ""
+    if address and not any(k in address for k in ["銀行", "股份有限公司", "有限公司", "抵押權"]):
+        info["owner_household_address"] = address
+    return {k: v for k, v in info.items() if clean(v)}
+
+
+def parse_cadastral_map_text(text: str) -> dict[str, str]:
+    text = normalize_text(text)
+    if "地籍圖謄本" not in text and "比例尺" not in text:
+        return {}
+    out = {}
+    lot = first_match(text, [r"土地坐落[:：]\s*([^\n]+)"])
+    scale = first_match(text, [r"比例尺[:：]\s*1\s*/\s*(\d+)"])
+    if lot: out["cadastral_lot"] = lot
+    if scale: out["cadastral_scale"] = f"1/{scale}"
+    out["cadastral_note"] = "地籍圖可輔助判斷是否臨路與估算路寬；實際界址與可通行寬度仍需現場確認/複丈鑑界。"
+    return out
+
+
 def parse_deed_text(text: str) -> dict[str, Any]:
     text = normalize_text(text)
+    owner_info = parse_owner_personal_info(text)
+    cadastral_info = parse_cadastral_map_text(text)
     blocks = split_deed_blocks(text)
 
     land_records = []
@@ -420,6 +483,8 @@ def parse_deed_text(text: str) -> dict[str, Any]:
         "total_land_ping": total_land_ping,
         "building_record": building,
         "warnings": warning_parts,
+        "owner_info": owner_info,
+        "cadastral_info": cadastral_info,
     }
 
     case_data = to_case_data(parsed)
@@ -431,6 +496,8 @@ def to_case_data(parsed: dict[str, Any]) -> dict[str, Any]:
     lands = parsed.get("land_records") or []
     building = parsed.get("building_record") or {}
     warnings = parsed.get("warnings") or []
+    owner_info = parsed.get("owner_info") or {}
+    cadastral_info = parsed.get("cadastral_info") or {}
 
     land_lot_no = "、".join([r.get("full_lot_no") or r.get("lot_no") for r in lands if r.get("full_lot_no") or r.get("lot_no")])
     building_no = building.get("full_building_no") or building.get("building_no") or ""
@@ -441,6 +508,14 @@ def to_case_data(parsed: dict[str, Any]) -> dict[str, Any]:
         land_right_scope = "、".join(dict.fromkeys(scopes))
 
     deed_parsed_lines = []
+    if owner_info.get("owner_name"):
+        deed_parsed_lines.append(f"所有權人：{owner_info.get('owner_name')}")
+    if owner_info.get("owner_id"):
+        deed_parsed_lines.append("身分證字號：已解析")
+    if owner_info.get("owner_gender"):
+        deed_parsed_lines.append(f"性別：{owner_info.get('owner_gender')}")
+    if owner_info.get("owner_birth_date"):
+        deed_parsed_lines.append(f"出生日期：{owner_info.get('owner_birth_date')}")
     if land_lot_no:
         deed_parsed_lines.append(f"地號：{land_lot_no}")
     if building_no:
@@ -457,6 +532,10 @@ def to_case_data(parsed: dict[str, Any]) -> dict[str, Any]:
         deed_parsed_lines.append(f"土地總面積：約 {fmt_num(parsed.get('total_land_ping'))} 坪（{fmt_num(parsed.get('total_land_m2'))} 平方公尺）")
     if building.get("total_registered_ping"):
         deed_parsed_lines.append(f"建物登記總面積：約 {fmt_num(building.get('total_registered_ping'))} 坪")
+    if cadastral_info.get("cadastral_lot"):
+        deed_parsed_lines.append(f"地籍圖：{cadastral_info.get('cadastral_lot')}")
+    if cadastral_info.get("cadastral_scale"):
+        deed_parsed_lines.append(f"地籍圖比例尺：{cadastral_info.get('cadastral_scale')}")
     if warnings:
         deed_parsed_lines.append("注意事項：" + "；".join(warnings))
 
@@ -465,6 +544,17 @@ def to_case_data(parsed: dict[str, Any]) -> dict[str, Any]:
         case_note = (case_note + "\n" if case_note else "") + f"使用執照字號：{building.get('use_license')}"
 
     return {
+        "owner_name": owner_info.get("owner_name", ""),
+        "owner_id": owner_info.get("owner_id", ""),
+        "owner_gender": owner_info.get("owner_gender", ""),
+        "owner_birth_date": owner_info.get("owner_birth_date", ""),
+        "owner_birth_year": owner_info.get("owner_birth_year", ""),
+        "owner_birth_month": owner_info.get("owner_birth_month", ""),
+        "owner_birth_day": owner_info.get("owner_birth_day", ""),
+        "owner_household_address": owner_info.get("owner_household_address", ""),
+        "cadastral_lot": cadastral_info.get("cadastral_lot", ""),
+        "cadastral_scale": cadastral_info.get("cadastral_scale", ""),
+        "cadastral_note": cadastral_info.get("cadastral_note", ""),
         "case_address": building.get("address", ""),
         "land_lot_no": land_lot_no,
         "building_no": building_no,
