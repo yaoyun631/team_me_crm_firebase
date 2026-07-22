@@ -40204,6 +40204,260 @@ print('✅ Team M.E v33 已啟用：每日新物件日期範圍快速查詢＋�
 # Team M.E v33 End
 # =============================================================================
 
+
+# =============================================================================
+# Team M.E v34｜網址只判斷地址 + 每日新物件分平台查詢
+# =============================================================================
+
+def _v34_is_listing_url(text):
+    match = re.search(r"https?://[^\s<>]+", str(text or ""), re.I)
+    if not match:
+        return ""
+    value = match.group(0).rstrip(".,，。)]】")
+    return value if any(domain in value.lower() for domain in ("rakuya.com.tw", "591.com.tw")) else ""
+
+
+def _v29_property_web_task_create(query_text, settings):
+    query_text = str(query_text or "").strip()
+    if not query_text:
+        raise ValueError("請輸入地址或物件網址。")
+    supported_url = _v34_is_listing_url(query_text)
+    if supported_url:
+        command = "url_lookup"
+        payload = {
+            "url": supported_url,
+            "resolve_address": False,
+            "lookup_mode": "url_address_match_only",
+            "display_mode": "address_candidate_only",
+        }
+        source_type = "web_url_match"
+        web_only = False
+    else:
+        command = "address_lookup"
+        payload = {"address": query_text}
+        source_type = "web"
+        web_only = True
+    payload.update({
+        "radius": settings["radius"], "years": settings["years"],
+        "category": settings["category"], "age_range": settings["age_range"],
+        "building_age_min": settings["building_age_min"],
+        "building_age_max": settings["building_age_max"],
+        "include_special": settings["include_special"],
+    })
+    task_id = "property_web_" + uuid4().hex
+    now_iso = now_taipei().isoformat()
+    data = {
+        "task_id": task_id, "command": command, "payload": payload,
+        "source": {
+            "type": source_type, "target_id": "",
+            "user_id": session.get("user_id") or "", "group_id": "", "room_id": "",
+        },
+        "web_only": web_only,
+        "web_query": query_text, "web_settings": settings,
+        "target_worker": globals().get("TEAMME_PROPERTY_DEFAULT_WORKER", "ELLEN-PC"),
+        "status": "queued",
+        "event": {"type": source_type, "timestamp": int(time.time() * 1000), "webhookEventId": ""},
+        "created_at": now_iso, "updated_at": now_iso,
+        "created_by_id": session.get("user_id") or "",
+        "created_by_name": session.get("user_name") or "",
+    }
+    collection = globals().get("TEAMME_PROPERTY_TASK_COLLECTION", "team_me_line_tasks")
+    db.collection(collection).document(task_id).set(data)
+    return task_id
+
+
+@login_required
+def property_search_page_v34():
+    if request.method == "POST":
+        query_text = (request.form.get("query") or "").strip()
+        search_settings = _v29_property_search_settings(request.form)
+        try:
+            task_id = _v29_property_web_task_create(query_text, search_settings)
+            if _v34_is_listing_url(query_text):
+                flash("已建立物件網址地址判斷任務；ELLEN-PC 只讀取一次物件頁，再用本機實價資料比對最符合門牌。", "success")
+            else:
+                flash("已建立地址實價查詢任務。", "success")
+            return redirect(url_for("property_search_page", task_id=task_id))
+        except Exception as exc:
+            flash(f"建立查詢任務失敗：{exc}", "danger")
+            return render_template("property_search.html", query=query_text, task_id="", result=None, task_error=str(exc), search_settings=search_settings, age_range_options=_V29_AGE_RANGES)
+    task_id = (request.args.get("task_id") or "").strip()
+    task, result = ({}, None)
+    query_text = (request.args.get("query") or "").strip()
+    search_settings = _v29_property_search_settings(request.args)
+    if task_id:
+        task, result = _v25_property_task_result(task_id)
+        payload = task.get("payload") or {}
+        query_text = query_text or task.get("web_query") or payload.get("address") or payload.get("url") or ""
+        search_settings = _v29_property_search_settings(task.get("web_settings") or payload)
+    status = str(task.get("status") or ("done" if result else "queued"))
+    task_error = str(task.get("error") or task.get("message") or task.get("result_message") or "")
+    bad_result = _v31_result_mistook_url_as_address(result)
+    if bad_result:
+        task_error = task_error or "ELLEN-PC 仍把網址轉成實價行情結果；請覆蓋 v34 local_agent.py 並關閉所有舊 Agent 視窗。"
+    display_result = None if _v31_failed_status(status) or bad_result else result
+    if display_result and isinstance(display_result, dict):
+        rs = display_result.get("query_settings") or {}
+        if rs:
+            search_settings = _v29_property_search_settings(rs)
+    return render_template(
+        "property_search.html", query=query_text, task_id=task_id,
+        task_status=status, task_error=task_error, result=display_result,
+        raw_json=json.dumps(display_result, ensure_ascii=False, indent=2, default=str) if display_result else "",
+        search_settings=search_settings, age_range_options=_V29_AGE_RANGES,
+    )
+
+app.view_functions["property_search_page"] = property_search_page_v34
+
+
+def _v34_doc_date(data, field):
+    dt = _v25_iso_datetime((data or {}).get(field) or (data or {}).get("created_at"))
+    return dt.strftime("%Y-%m-%d") if dt else str((data or {}).get(field) or (data or {}).get("created_at") or "")[:10]
+
+
+def _v34_query_source_date_docs(collection_name, date_text, source_field, source_value, *, limit=1000):
+    from google.cloud.firestore_v1.base_query import FieldFilter
+    start, end = _v33_day_bounds(date_text)
+    try:
+        return list(
+            db.collection(collection_name)
+            .where(filter=FieldFilter(source_field, "==", source_value))
+            .where(filter=FieldFilter("first_seen_at", ">=", start))
+            .where(filter=FieldFilter("first_seen_at", "<", end))
+            .order_by("first_seen_at", direction=firestore.Query.DESCENDING)
+            .limit(int(limit)).stream()
+        )
+    except Exception as exc:
+        print(f"⚠️ v34 {collection_name}/{source_value} 日期索引查詢失敗：", exc)
+        try:
+            docs = list(
+                db.collection(collection_name)
+                .where(filter=FieldFilter(source_field, "==", source_value))
+                .limit(int(limit)).stream()
+            )
+        except Exception:
+            return []
+        return [doc for doc in docs if _v34_doc_date(doc.to_dict() or {}, "first_seen_at") == date_text]
+
+
+def _v34_items_for_date(date_text):
+    source_specs = {
+        "591": [(PROPERTY_ALERT_ITEM_COLLECTION, "source_platform", "591", "property_alert_items"),
+                ("property_radar_listings", "market_scope_source", "591", "property_radar_listings 即時備援"),
+                ("property_radar_listings", "market_scope_source", "591_owner", "property_radar_listings 即時備援")],
+        "rakuya": [(PROPERTY_ALERT_ITEM_COLLECTION, "source_platform", "rakuya", "property_alert_items"),
+                   ("property_radar_listings", "market_scope_source", "rakuya", "property_radar_listings 即時備援"),
+                   ("property_radar_listings", "market_scope_source", "rakuya_owner", "property_radar_listings 即時備援")],
+    }
+    items = []
+    seen = set()
+    origin_counts = {"public": 0, "fallback": 0}
+    source_counts = {"591": 0, "rakuya": 0}
+    for platform, specs in source_specs.items():
+        for collection_name, source_field, source_value, origin in specs:
+            docs = _v34_query_source_date_docs(collection_name, date_text, source_field, source_value, limit=1000)
+            for doc in docs:
+                data = doc.to_dict() or {}
+                if collection_name == "property_radar_listings" and bool(data.get("baseline_only")):
+                    continue
+                item = _v33_doc_item(doc, origin)
+                if not item or item.get("created_date") != date_text:
+                    continue
+                item["source_platform"] = platform
+                key = f"{platform}:{item.get('listing_key') or item.get('source_listing_id') or item.get('url') or doc.id}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(item)
+                source_counts[platform] += 1
+                if origin == "property_alert_items": origin_counts["public"] += 1
+                else: origin_counts["fallback"] += 1
+    items.sort(key=lambda item: item.get("created_dt") or datetime.min.replace(tzinfo=TAIPEI_TZ), reverse=True)
+    return items, origin_counts, source_counts
+
+
+def _v34_latest_source_scan_status():
+    output = {"591": {"collected": 0, "new": 0, "scopes": 0}, "rakuya": {"collected": 0, "new": 0, "scopes": 0}}
+    latest = {}
+    try:
+        docs = list(db.collection("property_radar_runs").order_by("started_at", direction=firestore.Query.DESCENDING).limit(1).stream())
+        latest = docs[0].to_dict() or {} if docs else {}
+    except Exception:
+        latest = {}
+    for row in latest.get("summaries") or []:
+        if not isinstance(row, dict):
+            continue
+        raw_source = str(row.get("source") or "")
+        platform = "591" if raw_source.startswith("591") else "rakuya" if raw_source.startswith("rakuya") else ""
+        if not platform:
+            continue
+        output[platform]["collected"] += int(row.get("collected") or 0)
+        output[platform]["new"] += int(row.get("new_market_listings") or 0)
+        output[platform]["scopes"] += 1
+    return output, latest
+
+
+@login_required
+def daily_new_properties_v34():
+    filters = {
+        "date": (request.args.get("date") or now_taipei().strftime("%Y-%m-%d")).strip(),
+        "source": (request.args.get("source") or "").strip(),
+        "area": (request.args.get("area") or "").strip(),
+        "q": (request.args.get("q") or "").strip(),
+    }
+    all_items, origin_counts, all_source_counts = _v34_items_for_date(filters["date"])
+    items = list(all_items)
+    if filters["source"]:
+        items = [item for item in items if item.get("source_platform") == filters["source"]]
+    if filters["area"]:
+        area = filters["area"]
+        items = [item for item in items if area in (item.get("area") or "") or area in (item.get("address") or "") or area in (item.get("title") or "")]
+    if filters["q"]:
+        q = filters["q"].lower()
+        items = [item for item in items if q in f"{item.get('title','')} {item.get('address','')} {item.get('url','')}".lower()]
+    filtered_counts = {"591": 0, "rakuya": 0}
+    for item in items:
+        platform = item.get("source_platform")
+        if platform in filtered_counts:
+            filtered_counts[platform] += 1
+    scan_sources, latest = _v34_latest_source_scan_status()
+    if all_source_counts["rakuya"] == 0:
+        if scan_sources["rakuya"]["scopes"] == 0:
+            diagnosis = "所選日期沒有樂屋資料；最近掃描紀錄也沒有 rakuya scope。v34 修復 BAT 會把一般規則補成 rakuya＋591 並立即重掃。"
+            level = "warning"
+        elif scan_sources["rakuya"]["collected"] > 0:
+            diagnosis = "最近一輪有抓到樂屋市場資料，但所選日期沒有非 baseline 的新樂屋物件，或近期樂屋資料尚未完成公開同步。v34 已分來源補同步，不會再被 591 的筆數上限擠掉。"
+            level = "info"
+        else:
+            diagnosis = "最近一輪有執行樂屋 scope，但 collector 沒抓到資料；請檢查樂屋登入 Chrome/CDP。"
+            level = "warning"
+    else:
+        diagnosis = f"已分平台載入：591 {all_source_counts['591']} 筆、樂屋 {all_source_counts['rakuya']} 筆。"
+        level = "success"
+    diagnostics = {
+        "diagnosis": diagnosis, "level": level,
+        "public_total": origin_counts["public"], "fallback_total": origin_counts["fallback"],
+        "selected_total": len(all_items), "version": "v34",
+        "source_status": scan_sources,
+        "latest_run": {
+            "status": latest.get("status") or "", "started_at": latest.get("started_at") or "",
+            "scanned_count": latest.get("scanned_count") or 0,
+            "public_items_saved": latest.get("public_items_saved") or 0,
+            "public_items_failed": latest.get("public_items_failed") or 0,
+        },
+    }
+    return render_template(
+        "new_properties_daily.html", filters=filters, items=items,
+        source_options=["591", "rakuya"], source_counts=filtered_counts,
+        all_source_counts=all_source_counts, diagnostics=diagnostics, available_dates=[],
+    )
+
+app.view_functions["daily_new_properties"] = daily_new_properties_v34
+print("✅ Team M.E v34 已啟用：網址一次抓取只判斷地址／每日新物件 591 與樂屋分來源查詢。")
+# =============================================================================
+# Team M.E v34 End
+# =============================================================================
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
     print("Routes:", app.url_map)
