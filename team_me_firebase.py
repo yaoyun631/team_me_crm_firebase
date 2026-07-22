@@ -22508,6 +22508,9 @@ CASE_DETAIL_FIELD_KEYS = [
     "deed_pdf_filename", "deed_parsed_json",
     "cadastral_lot", "cadastral_scale", "cadastral_note", "estimated_road_width", "cadastral_road_width",
     "cadastral_road_access",
+    "cadastral_raw_text",
+    "cadastral_parsed_json",
+    "cadastral_pdf_filename",
     "ai_sales_title", "ai_selling_points", "ai_group_copy", "ai_listing_description", "ai_feature_note",
 ]
 
@@ -22689,6 +22692,12 @@ def _case_merge_seller_and_case_data(seller: dict, incoming=None):
     data["cadastral_note"] = seller.get("cadastral_note") or ""
     data["estimated_road_width"] = seller.get("estimated_road_width") or seller.get("road_width") or ""
     data["cadastral_road_width"] = seller.get("cadastral_road_width") or ""
+    data["registered_address"] = seller.get("registered_address") or ""
+    data["household_address"] = seller.get("household_address") or ""
+    data["cadastral_raw_text"] = seller.get("cadastral_raw_text") or ""
+    data["cadastral_parsed_json"] = seller.get("cadastral_parsed_json") or ""
+    data["cadastral_pdf_filename"] = seller.get("cadastral_pdf_filename") or ""
+    data["cadastral_road_access"] = seller.get("cadastral_road_access") or ""
     data["ai_sales_title"] = seller.get("ai_sales_title") or ""
     data["ai_selling_points"] = seller.get("ai_selling_points") or []
     data["ai_group_copy"] = seller.get("ai_group_copy") or ""
@@ -23063,6 +23072,43 @@ def _case_generate_pdf_bytes(seller: dict, case_data: dict):
     return buffer
 
 
+
+
+# =============================================================================
+# CASE_FORM_V18：全站移除「下載 Word 案件表」安全保險
+# =============================================================================
+@app.after_request
+def _case_form_v18_strip_word_case_button(response):
+    try:
+        ctype = (response.headers.get("Content-Type") or "").lower()
+        if "text/html" not in ctype:
+            return response
+        html = response.get_data(as_text=True)
+        if not html:
+            return response
+        new_html = re.sub(
+            r'\s*<a\b[^>]*(?:case-form-filled\.docx|seller_case_form_filled_docx)[^>]*>.*?</a>',
+            '',
+            html,
+            flags=re.I | re.S,
+        )
+        new_html = re.sub(
+            r'\s*<a\b[^>]*>[^<]*(?:下載\s*)?Word\s*案件表[^<]*</a>',
+            '',
+            new_html,
+            flags=re.I | re.S,
+        )
+        if new_html != html:
+            response.set_data(new_html)
+            response.headers["Content-Length"] = str(len(response.get_data()))
+    except Exception as exc:
+        print("⚠️ v18 移除 Word 案件表按鈕失敗：", exc)
+    return response
+
+# =============================================================================
+# CASE_FORM_V18 remove Word button End
+# =============================================================================
+
 # =============================================================================
 # DEED_PDF_CASE_FORM V2：謄本 PDF 上傳解析 + 固定案件輸入表 PDF 自動填寫
 # =============================================================================
@@ -23072,7 +23118,7 @@ DEED_CASE_FORM_HTML = r"""
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <div>
-    <h3 class="mb-1">上傳謄本 PDF → 自動填案件輸入表</h3>
+    <h3 class="mb-1">上傳謄本 / 地籍圖 → 自動填案件輸入表</h3>
     <div class="text-muted small">委託：{{ seller.name or '-' }}｜{{ seller.phone or '-' }}</div>
   </div>
   <div class="d-flex gap-2 flex-wrap">
@@ -23083,69 +23129,91 @@ DEED_CASE_FORM_HTML = r"""
 </div>
 
 <div class="alert alert-info small">
-  <strong>流程：</strong>上傳電子謄本 PDF → 系統抽文字 → 解析土地/建物資料 → 回寫委託案件 → 產生填好的案件輸入表 PDF。
-  若是掃描圖 PDF，請先 OCR 成文字，或把 OCR 文字貼到下方。
+  <strong>新版 v18：</strong>
+  謄本 PDF 與地籍圖 PDF 會分開讀取、分開保存、分開顯示。
+  謄本負責所有權人、身分證字號、性別、出生年月日、戶籍地址、建物/土地資料；
+  地籍圖負責土地坐落、比例尺、臨路輔助判斷。
 </div>
 
 <form method="post" enctype="multipart/form-data" class="card mb-4">
-  <div class="card-header fw-bold">謄本 PDF / OCR 文字</div>
+  <div class="card-header fw-bold">上傳資料</div>
   <div class="card-body">
-    <div class="mb-3">
-      <label class="form-label">上傳謄本 PDF</label>
-      <input type="file" name="deed_pdf" class="form-control" accept="application/pdf,.pdf">
-      <div class="form-text">電子謄本 PDF 通常可以直接抽文字；掃描圖 PDF 可能需要 OCR。</div>
-    </div>
+    <div class="row g-3">
+      <div class="col-lg-6">
+        <div class="border rounded-3 p-3 h-100">
+          <h5 class="mb-2">1. 謄本 PDF / 謄本 OCR 文字</h5>
+          <label class="form-label">上傳謄本 PDF</label>
+          <input type="file" name="deed_pdf" class="form-control" accept="application/pdf,.pdf">
+          <div class="form-text mb-3">解析：身分證字號、性別、出生日期、住址、所有權人、建物/土地面積等。</div>
 
-    <div class="mb-3" id="cadastral-map-upload">
-      <label class="form-label">上傳地籍圖 PDF</label>
-      <input type="file" name="cadastral_pdf" class="form-control" accept="application/pdf,.pdf">
-      <div class="form-text">地籍圖會解析土地坐落、比例尺與備註；面臨路寬先不自動填，避免誤判。</div>
-    </div>
-    <div class="mb-3">
-      <label class="form-label">或貼上謄本 OCR 文字</label>
-      <textarea name="deed_text" class="form-control" rows="8" placeholder="可貼上 PDF 複製出的文字或 OCR 文字">{{ case_data.deed_raw_text or '' }}</textarea>
+          <label class="form-label">或貼上謄本 OCR 文字</label>
+          <textarea name="deed_text" class="form-control" rows="8" placeholder="可貼上 PDF 複製出的文字或 OCR 文字">{{ case_data.deed_raw_text or '' }}</textarea>
+        </div>
+      </div>
+
+      <div class="col-lg-6">
+        <div class="border rounded-3 p-3 h-100" id="cadastral-map-upload">
+          <h5 class="mb-2">2. 地籍圖 PDF</h5>
+          <label class="form-label">上傳地籍圖 PDF</label>
+          <input type="file" name="cadastral_pdf" class="form-control" accept="application/pdf,.pdf">
+          <div class="form-text">解析：土地坐落、比例尺、地籍圖備註。面臨路寬先不自動填，避免誤判。</div>
+
+          <label class="form-label mt-3">地籍圖 OCR 文字</label>
+          <textarea name="cadastral_text" class="form-control" rows="8" placeholder="可選，若地籍圖 PDF 抽不到文字，可貼 OCR 文字">{{ case_data.cadastral_raw_text or '' }}</textarea>
+        </div>
+      </div>
     </div>
   </div>
   <div class="card-footer d-flex gap-2 flex-wrap">
-    <button class="btn btn-success" name="action" value="parse" type="submit">解析謄本並儲存</button>
+    <button class="btn btn-success" name="action" value="parse" type="submit">解析並儲存</button>
     <button class="btn btn-primary" name="action" value="parse_and_download" type="submit">解析並下載填好的案件表</button>
   </div>
 </form>
 
 <div class="row g-4">
   <div class="col-lg-6">
-    <div class="card">
-      <div class="card-header fw-bold">目前案件欄位預覽</div>
+    <div class="card mb-3">
+      <div class="card-header fw-bold">謄本解析結果</div>
       <div class="card-body">
         <table class="table table-sm align-middle">
           <tbody>
-            <tr><th style="width:140px;">物件地址</th><td>{{ case_data.case_address or seller.address or '-' }}</td></tr>
-            <tr><th>地號</th><td>{{ case_data.land_lot_no or '-' }}</td></tr>
-            <tr><th>建號</th><td>{{ case_data.building_no or '-' }}</td></tr>
-            <tr><th>主要用途</th><td>{{ case_data.deed_main_use or '-' }}</td></tr>
-            <tr><th>主要建材</th><td>{{ case_data.deed_main_material or '-' }}</td></tr>
-            <tr><th>樓層 / 樓高</th><td>{{ case_data.floor or '-' }} / {{ case_data.floor_total or '-' }}</td></tr>
-            <tr><th>竣工日期</th><td>{{ case_data.deed_completed_date or '-' }}</td></tr>
-            <tr><th>屋齡</th><td>{{ case_data.building_age or '-' }}</td></tr>
-            <tr><th>總建坪</th><td>{{ case_data.total_ping or '-' }}</td></tr>
-            <tr><th>主建坪</th><td>{{ case_data.main_ping or '-' }}</td></tr>
-            <tr><th>附屬坪</th><td>{{ case_data.attached_ping or '-' }}</td></tr>
-            <tr><th>公設坪</th><td>{{ case_data.public_ping or '-' }}</td></tr>
-            <tr><th>土地坪</th><td>{{ case_data.land_ping or '-' }}</td></tr>
-            <tr><th>產權注意</th><td style="white-space:pre-line;">{{ case_data.deed_mortgage_note or case_data.case_note or '-' }}</td></tr>
+            <tr><th style="width:150px;">謄本檔名</th><td>{{ case_data.deed_pdf_filename or '-' }}</td></tr>
+            <tr><th>所有權人</th><td>{{ case_data.deed_owner or case_data.owner_name or '-' }}</td></tr>
+            <tr><th>身分證字號</th><td>{{ case_data.owner_identity_no or case_data.owner_id or '-' }}</td></tr>
+            <tr><th>性別</th><td>{{ case_data.owner_gender or '-' }}</td></tr>
+            <tr><th>出生日期</th><td>{{ case_data.owner_birth_year or '-' }} 年 {{ case_data.owner_birth_month or '-' }} 月 {{ case_data.owner_birth_day or '-' }} 日</td></tr>
+            <tr><th>戶籍地址</th><td>{{ case_data.owner_household_address or case_data.registered_address or case_data.household_address or '-' }}</td></tr>
+            <tr><th>物件地址</th><td>{{ case_data.case_address or seller.address or '-' }}</td></tr>
+            <tr><th>建號 / 地號</th><td>{{ case_data.building_no or '-' }} / {{ case_data.land_lot_no or '-' }}</td></tr>
+            <tr><th>建物用途 / 建材</th><td>{{ case_data.deed_main_use or '-' }} / {{ case_data.deed_main_material or '-' }}</td></tr>
+            <tr><th>坪數</th><td>總 {{ case_data.total_ping or '-' }}｜主 {{ case_data.main_ping or '-' }}｜附 {{ case_data.attached_ping or '-' }}｜土地 {{ case_data.land_ping or '-' }}</td></tr>
           </tbody>
         </table>
+        {% if case_data.deed_parsed_note %}
+          <pre class="small mb-0 bg-light p-2 rounded" style="white-space:pre-wrap;">{{ case_data.deed_parsed_note }}</pre>
+        {% endif %}
       </div>
     </div>
   </div>
+
   <div class="col-lg-6">
-    <div class="card">
-      <div class="card-header fw-bold">謄本解析摘要</div>
+    <div class="card mb-3">
+      <div class="card-header fw-bold">地籍圖解析結果</div>
       <div class="card-body">
-        {% if case_data.deed_parsed_note %}
-          <pre class="small mb-0" style="white-space:pre-wrap;">{{ case_data.deed_parsed_note }}</pre>
-        {% else %}
-          <p class="text-muted mb-0">尚未解析謄本。</p>
+        <table class="table table-sm align-middle">
+          <tbody>
+            <tr><th style="width:150px;">地籍圖檔名</th><td>{{ case_data.cadastral_pdf_filename or '-' }}</td></tr>
+            <tr><th>土地坐落</th><td>{{ case_data.cadastral_lot or '-' }}</td></tr>
+            <tr><th>比例尺</th><td>{{ case_data.cadastral_scale or '-' }}</td></tr>
+            <tr><th>臨路判斷</th><td>{{ case_data.cadastral_road_access or '需人工確認' }}</td></tr>
+            <tr><th>備註</th><td style="white-space:pre-line;">{{ case_data.cadastral_note or '-' }}</td></tr>
+          </tbody>
+        </table>
+        {% if case_data.cadastral_raw_text %}
+          <details class="small">
+            <summary>查看地籍圖抽取文字</summary>
+            <pre class="small mb-0 bg-light p-2 rounded" style="white-space:pre-wrap;max-height:240px;overflow:auto;">{{ case_data.cadastral_raw_text }}</pre>
+          </details>
         {% endif %}
       </div>
     </div>
@@ -23153,6 +23221,7 @@ DEED_CASE_FORM_HTML = r"""
 </div>
 {% endblock %}
 """
+
 
 
 def _seller_case_form_template_pdf_path():
@@ -23171,34 +23240,101 @@ def _seller_case_form_template_pdf_path():
     raise FileNotFoundError("找不到案件輸入表範本 PDF，請放在 assets/案件輸入表-使用中.pdf 或設定 CASE_FORM_TEMPLATE_PDF")
 
 
-def _seller_deed_parse_pdf_or_text(upload_file=None, deed_text=""):
-    from deed_case_form_tool import extract_deed_pdf_text_from_bytes, parse_deed_text
-    raw_text = (deed_text or "").strip()
+def _seller_upload_to_text(upload_file=None, pasted_text=""):
+    """讀取一份 PDF 或貼上的 OCR 文字，回傳 raw_text, filename。"""
+    from deed_case_form_tool import extract_deed_pdf_text_from_bytes
+    raw_text = (pasted_text or "").strip()
     filename = ""
     if upload_file and getattr(upload_file, "filename", ""):
         filename = secure_filename(upload_file.filename)
         pdf_bytes = upload_file.read()
         if pdf_bytes:
             raw_text = extract_deed_pdf_text_from_bytes(pdf_bytes)
+    return raw_text, filename
+
+
+def _seller_parse_deed_source(upload_file=None, deed_text=""):
+    from deed_case_form_tool import parse_deed_text
+    raw_text, filename = _seller_upload_to_text(upload_file, deed_text)
     if not raw_text or len(raw_text.strip()) < 50:
-        raise RuntimeError("無法從 PDF 取得足夠文字。若這份是掃描 PDF，請先 OCR 後把文字貼上。")
+        raise RuntimeError("謄本 PDF / OCR 文字不足，無法解析。若是掃描 PDF，請先 OCR 後貼上文字。")
     parsed = parse_deed_text(raw_text)
     return parsed, raw_text, filename
 
 
-def _seller_apply_deed_case_data(seller_id, parsed, raw_text="", filename=""):
-    case_data = dict((parsed or {}).get("case_data") or {})
-    if raw_text:
-        case_data["deed_raw_text"] = raw_text[:20000]
-    if filename:
-        case_data["deed_pdf_filename"] = filename
-    try:
-        case_data["deed_parsed_json"] = json.dumps(parsed, ensure_ascii=False)[:30000]
-    except Exception:
-        pass
-    case_data["deed_parsed_at"] = now_taipei().isoformat()
-    _case_apply_ai_to_seller(seller_id, case_data, {})
-    return case_data
+def _seller_parse_cadastral_source(upload_file=None, cadastral_text=""):
+    from deed_case_form_tool import parse_deed_text
+    raw_text, filename = _seller_upload_to_text(upload_file, cadastral_text)
+    if not raw_text or len(raw_text.strip()) < 20:
+        raise RuntimeError("地籍圖 PDF / OCR 文字不足，無法解析。")
+    parsed = parse_deed_text(raw_text)
+    return parsed, raw_text, filename
+
+
+def _seller_case_non_empty(data: dict) -> dict:
+    return {k: v for k, v in (data or {}).items() if str(v or "").strip()}
+
+
+def _seller_apply_deed_and_cadastral_data(
+    seller_id,
+    *,
+    deed_parsed=None,
+    deed_raw_text="",
+    deed_filename="",
+    cadastral_parsed=None,
+    cadastral_raw_text="",
+    cadastral_filename="",
+):
+    """謄本與地籍圖分開保存，但 case_data 合併供案件輸入表使用。
+
+    原則：
+    - 謄本資料：寫 deed_raw_text / deed_parsed_json
+    - 地籍圖資料：寫 cadastral_raw_text / cadastral_parsed_json
+    - 地籍圖不得用空白欄位覆蓋謄本欄位
+    """
+    updates = {}
+
+    if deed_parsed:
+        deed_case = _seller_case_non_empty((deed_parsed or {}).get("case_data") or {})
+        updates.update(deed_case)
+        if deed_raw_text:
+            updates["deed_raw_text"] = deed_raw_text[:24000]
+        if deed_filename:
+            updates["deed_pdf_filename"] = deed_filename
+        try:
+            updates["deed_parsed_json"] = json.dumps(deed_parsed, ensure_ascii=False)[:50000]
+        except Exception:
+            pass
+        updates["deed_parsed_at"] = now_taipei().isoformat()
+
+    if cadastral_parsed:
+        cad_case = _seller_case_non_empty((cadastral_parsed or {}).get("case_data") or {})
+        # 只保留地籍圖相關欄位，避免空物件地址、空坪數覆蓋謄本資料。
+        for key in [
+            "cadastral_lot", "cadastral_scale", "cadastral_road_access", "cadastral_note",
+            "estimated_road_width", "cadastral_road_width",
+        ]:
+            if cad_case.get(key):
+                updates[key] = cad_case.get(key)
+        cad_info = (cadastral_parsed or {}).get("cadastral_info") or {}
+        for key in ["cadastral_lot", "cadastral_scale", "cadastral_road_access", "cadastral_note"]:
+            if cad_info.get(key):
+                updates[key] = cad_info.get(key)
+        if cadastral_raw_text:
+            updates["cadastral_raw_text"] = cadastral_raw_text[:24000]
+        if cadastral_filename:
+            updates["cadastral_pdf_filename"] = cadastral_filename
+        try:
+            updates["cadastral_parsed_json"] = json.dumps(cadastral_parsed, ensure_ascii=False)[:50000]
+        except Exception:
+            pass
+        updates["cadastral_parsed_at"] = now_taipei().isoformat()
+
+    if not updates:
+        raise RuntimeError("沒有可儲存的解析資料。")
+
+    _case_apply_ai_to_seller(seller_id, updates, {})
+    return updates
 
 
 @app.route("/sellers/<seller_id>/deed-case-form", methods=["GET", "POST"])
@@ -23211,109 +23347,63 @@ def seller_deed_case_form(seller_id):
         return redirect(url_for("sellers"))
 
     seller = doc_to_dict(snap)
+
     if request.method == "POST":
         action = request.form.get("action", "parse")
-        upload = request.files.get("deed_pdf")
+        deed_upload = request.files.get("deed_pdf")
         cadastral_upload = request.files.get("cadastral_pdf")
         deed_text = request.form.get("deed_text", "")
+        cadastral_text = request.form.get("cadastral_text", "")
+
+        deed_parsed = None
+        deed_raw_text = ""
+        deed_filename = ""
+        cadastral_parsed = None
+        cadastral_raw_text = ""
+        cadastral_filename = ""
 
         try:
-            parsed = {}
-            raw_text = ""
-            filename = ""
-
-            if upload and getattr(upload, "filename", ""):
-                parsed, raw_text, filename = _seller_deed_parse_pdf_or_text(upload, deed_text)
+            if deed_upload and getattr(deed_upload, "filename", ""):
+                deed_parsed, deed_raw_text, deed_filename = _seller_parse_deed_source(deed_upload, deed_text)
             elif deed_text and deed_text.strip():
-                parsed, raw_text, filename = _seller_deed_parse_pdf_or_text(None, deed_text)
+                deed_parsed, deed_raw_text, deed_filename = _seller_parse_deed_source(None, deed_text)
 
             if cadastral_upload and getattr(cadastral_upload, "filename", ""):
-                from deed_case_form_tool import extract_deed_pdf_text_from_bytes, parse_deed_text
-                cadastral_bytes = cadastral_upload.read()
-                cadastral_text = extract_deed_pdf_text_from_bytes(cadastral_bytes)
-                cadastral_parsed = parse_deed_text(cadastral_text)
-                if not parsed:
-                    parsed = cadastral_parsed
-                    raw_text = cadastral_text
-                else:
-                    parsed["cadastral_info"] = cadastral_parsed.get("cadastral_info") or {}
-                    parsed.setdefault("case_data", {}).update(cadastral_parsed.get("case_data") or {})
-                    if cadastral_text:
-                        raw_text = (raw_text + "\n\n---地籍圖---\n" + cadastral_text).strip()
-                filename = (filename + "+" if filename else "") + secure_filename(cadastral_upload.filename)
+                cadastral_parsed, cadastral_raw_text, cadastral_filename = _seller_parse_cadastral_source(cadastral_upload, cadastral_text)
+            elif cadastral_text and cadastral_text.strip():
+                cadastral_parsed, cadastral_raw_text, cadastral_filename = _seller_parse_cadastral_source(None, cadastral_text)
 
-            if not parsed:
-                raise RuntimeError("請上傳謄本 PDF、地籍圖 PDF，或貼上謄本 OCR 文字。")
+            if not deed_parsed and not cadastral_parsed:
+                raise RuntimeError("請至少上傳謄本 PDF、地籍圖 PDF，或貼上 OCR 文字。")
 
-            _seller_apply_deed_case_data(seller_id, parsed, raw_text=raw_text, filename=filename)
+            _seller_apply_deed_and_cadastral_data(
+                seller_id,
+                deed_parsed=deed_parsed,
+                deed_raw_text=deed_raw_text,
+                deed_filename=deed_filename,
+                cadastral_parsed=cadastral_parsed,
+                cadastral_raw_text=cadastral_raw_text,
+                cadastral_filename=cadastral_filename,
+            )
+
+            if deed_parsed and cadastral_parsed:
+                flash("已分開解析並儲存：謄本資料 + 地籍圖資料。", "success")
+            elif deed_parsed:
+                flash("已解析並儲存謄本資料。", "success")
+            else:
+                flash("已解析並儲存地籍圖資料。", "success")
 
             if action == "parse_and_download":
                 return redirect(url_for("seller_case_form_filled_pdf", seller_id=seller_id))
-
-            flash("已解析謄本 PDF，並回寫到委託案件資料。", "success")
             return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
+
         except Exception as e:
-            flash(f"解析謄本失敗：{e}", "danger")
+            flash(f"解析失敗：{e}", "danger")
             return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
 
     case_data = _case_merge_seller_and_case_data(seller)
     return render_template_string(DEED_CASE_FORM_HTML, seller=seller, case_data=case_data)
 
-
-
-# =============================================================================
-# CASE_FORM_DOCX_DIRECT_V5：Word 直接 key 入案件輸入表（標楷體）
-# =============================================================================
-
-def _seller_case_form_template_docx_path():
-    candidates = []
-    env_path = os.environ.get("CASE_FORM_TEMPLATE_DOCX", "").strip()
-    if env_path:
-        candidates.append(env_path)
-    candidates.extend([
-        os.path.join(BASE_DIR, "assets", "案件輸入表-使用中.docx"),
-        os.path.join(BASE_DIR, "案件輸入表-使用中.docx"),
-        os.path.join(BASE_DIR, "case_form_template.docx"),
-    ])
-    for p in candidates:
-        if p and os.path.exists(p):
-            return p
-    raise FileNotFoundError("找不到 Word 案件輸入表範本，請放在 assets/案件輸入表-使用中.docx 或設定 CASE_FORM_TEMPLATE_DOCX")
-
-
-@app.route("/sellers/<seller_id>/case-form-filled.docx")
-@login_required
-def seller_case_form_filled_docx(seller_id):
-    snap = db.collection("sellers").document(seller_id).get()
-    if not snap.exists:
-        flash("找不到這筆委託", "danger")
-        return redirect(url_for("sellers"))
-
-    seller = doc_to_dict(snap)
-    case_data = _case_merge_seller_and_case_data(seller)
-
-    try:
-        from case_form_docx_tool import fill_case_form_docx_bytes
-        template_path = _seller_case_form_template_docx_path()
-        docx_bytes = fill_case_form_docx_bytes(template_path, case_data, seller=seller)
-    except Exception as e:
-        flash(f"產生 Word 案件輸入表失敗：{e}", "danger")
-        try:
-            return redirect(url_for("seller_deed_case_form", seller_id=seller_id))
-        except Exception:
-            return redirect(url_for("seller_detail", seller_id=seller_id))
-
-    filename = f"案件輸入表_{seller.get('name') or seller_id}.docx"
-    return send_file(
-        BytesIO(docx_bytes),
-        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        as_attachment=True,
-        download_name=filename,
-    )
-
-# =============================================================================
-# CASE_FORM_DOCX_DIRECT_V5 End
-# =============================================================================
 
 
 @app.route("/sellers/<seller_id>/case-form-filled.pdf")

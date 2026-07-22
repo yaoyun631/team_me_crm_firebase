@@ -14,7 +14,7 @@
     </form>
     <a href="{{ url_for('seller_case_tools', seller_id=seller.id) }}" class="btn btn-outline-primary me-2">案件表 / AI文案</a>
     <a href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}" class="btn btn-outline-success me-2">上傳謄本填表</a>
-    <a href="{{ url_for('seller_case_form_filled_docx', seller_id=seller.id) }}" target="_blank" class="btn btn-outline-success me-2">下載Word案件表</a>
+    <a href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}#cadastral-map-upload" class="btn btn-outline-success me-2">上傳地籍圖</a>
     <a href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}" target="_blank" class="btn btn-outline-dark me-2">下載填好案件表</a>
     <a href="{{ url_for('seller_edit', seller_id=seller.id) }}" class="btn btn-warning me-2">編輯資料</a>
     <a href="{{ url_for('sellers') }}" class="btn btn-secondary">返回列表</a>
@@ -50,9 +50,8 @@
     {% if photos %}
       <p class="mb-3">
         <a href="#" data-bs-toggle="modal" data-bs-target="#sellerPhotoModal">
-          查看委託圖片（共 {{ photos|length }} 張）
-        </a>
-      </p>
+          查看委託圖片（共 {{ photos|length }} 張）</a>
+</p>
     {% endif %}
 
     <div class="row mb-2">

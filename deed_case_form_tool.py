@@ -369,9 +369,9 @@ def parse_building_block(block_text: str) -> dict[str, Any]:
 
 
 def parse_owner_personal_info(text: str) -> dict[str, str]:
-    """從謄本全文抓所有權人個資。
+    """從謄本 OCR / PDF 文字抓所有權人個資。
 
-    支援你貼的格式：
+    支援格式：
     所有權人：陳龍騰
     統一編號：C120801873
     出生日期：民國066年01月04日
@@ -394,7 +394,6 @@ def parse_owner_personal_info(text: str) -> dict[str, str]:
         "household_address": "",
     }
 
-    # 優先從所有權部抓；抓不到就全篇抓，因為有些 PDF 斷行會讓區塊標題遺失。
     owner_block = first_match(text, [
         r"(?:土地所有權部|建物所有權部)(.*?)(?:土地他項權利部|建物他項權利部|共同擔保|標示部|本謄本僅係|$)",
     ]) or text
@@ -457,16 +456,7 @@ def parse_owner_personal_info(text: str) -> dict[str, str]:
 
 
 def parse_cadastral_map_text(text: str) -> dict[str, str]:
-    """解析地籍圖謄本。
-
-    地籍圖可讀：
-    - 土地坐落
-    - 比例尺
-    - 周邊地號
-
-    但路寬不自動亂填；除非你另外手動輸入 road_width。
-    因為地籍圖也會註明「實地界址以複丈鑑界結果為準」。
-    """
+    """解析地籍圖謄本，與一般謄本解析資料分開保存。"""
     text = normalize_text(text)
     if "地籍圖謄本" not in text and "比例尺" not in text:
         return {}
@@ -480,7 +470,6 @@ def parse_cadastral_map_text(text: str) -> dict[str, str]:
     if scale:
         out["cadastral_scale"] = f"1/{scale}"
 
-    # 只做輔助判斷，不自動填面臨路寬。
     out["cadastral_road_access"] = "需人工確認"
     out["road_width_source"] = "地籍圖輔助判斷"
     out["cadastral_note"] = (
@@ -615,6 +604,8 @@ def to_case_data(parsed: dict[str, Any]) -> dict[str, Any]:
         "owner_birth_month": owner_info.get("owner_birth_month", ""),
         "owner_birth_day": owner_info.get("owner_birth_day", ""),
         "owner_household_address": owner_info.get("owner_household_address", ""),
+        "registered_address": owner_info.get("registered_address", ""),
+        "household_address": owner_info.get("household_address", ""),
         "cadastral_lot": cadastral_info.get("cadastral_lot", ""),
         "cadastral_scale": cadastral_info.get("cadastral_scale", ""),
         "cadastral_note": cadastral_info.get("cadastral_note", ""),

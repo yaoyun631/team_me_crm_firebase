@@ -331,10 +331,10 @@ def register_case_font():
 # x, y_top, font_size, width, max_lines
 TEXT_POS = {
     "owner_name": (56, 124.0, CASE_FORM_NORMAL_SIZE, 68, 1),
-    "owner_id": (188, 124.0, CASE_FORM_NORMAL_SIZE, 76, 1),
-    "owner_birth_year": (438, 124.0, CASE_FORM_NORMAL_SIZE, 22, 1),
-    "owner_birth_month": (474, 124.0, CASE_FORM_NORMAL_SIZE, 22, 1),
-    "owner_birth_day": (510, 124.0, CASE_FORM_NORMAL_SIZE, 18, 1),
+    "owner_id": (188, 124.0, CASE_FORM_NORMAL_SIZE, 92, 1),
+    "owner_birth_year": (438, 124.0, CASE_FORM_NORMAL_SIZE, 24, 1),
+    "owner_birth_month": (478, 124.0, CASE_FORM_NORMAL_SIZE, 20, 1),
+    "owner_birth_day": (514, 124.0, CASE_FORM_NORMAL_SIZE, 20, 1),
     "owner_home_phone": (80, 151.0, CASE_FORM_NORMAL_SIZE, 88, 1),
     "owner_company_phone": (245, 151.0, CASE_FORM_NORMAL_SIZE, 105, 1),
     "owner_mobile": (423, 151.0, CASE_FORM_NORMAL_SIZE, 110, 1),
@@ -446,8 +446,8 @@ CHECK_POS = {
     "source_friend": (296.4, 101.9, 4.7),
     "source_other": (344.5, 101.9, 4.7),
 
-    "gender_male": (310.8, 120.1, 4.5),
-    "gender_female": (335.4, 120.1, 4.5),
+    "gender_male": (307.9, 120.1, 4.3),
+    "gender_female": (332.9, 120.1, 4.3),
 
     "type_apartment": (86.4, 229.8, 4.7),
     "type_huaxia": (122.4, 229.8, 4.7),
@@ -634,14 +634,7 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
 
     put("owner_name", seller.get("name"), case_data.get("owner_name"), deed_owner_info.get("owner_name"), case_data.get("deed_owner"))
     owner_id_value = normalize_id_text(
-        seller.get("id_no")
-        or seller.get("identity_no")
-        or seller.get("id_number")
-        or seller.get("owner_id")
-        or seller.get("owner_identity_no")
-        or seller.get("身分證字號")
-        or seller.get("身份字號")
-        or case_data.get("owner_id")
+        case_data.get("owner_id")
         or case_data.get("owner_identity_no")
         or case_data.get("identity_no")
         or case_data.get("deed_owner_id")
@@ -650,6 +643,13 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
         or deed_owner_info.get("owner_id")
         or deed_owner_info.get("owner_identity_no")
         or deed_owner_info.get("identity_no")
+        or seller.get("id_no")
+        or seller.get("identity_no")
+        or seller.get("id_number")
+        or seller.get("owner_id")
+        or seller.get("owner_identity_no")
+        or seller.get("身分證字號")
+        or seller.get("身份字號")
     )
     put("owner_id", owner_id_value)
     put("owner_home_phone", seller.get("home_phone"), case_data.get("owner_home_phone"))
@@ -657,23 +657,31 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
     put("owner_mobile", seller.get("phone"), seller.get("mobile"), case_data.get("owner_phone"))
 
     by, bm, bd = parse_owner_birth_parts(
-        seller.get("birth_date")
-        or seller.get("owner_birth_date")
-        or seller.get("出生日期")
-        or seller.get("出生年月日")
-        or case_data.get("owner_birth_date")
+        case_data.get("owner_birth_date")
         or case_data.get("birth_date")
         or case_data.get("deed_owner_birth_date")
         or case_data.get("出生日期")
         or case_data.get("出生年月日")
         or deed_owner_info.get("owner_birth_date")
         or deed_owner_info.get("birth_date")
+        or seller.get("birth_date")
+        or seller.get("owner_birth_date")
+        or seller.get("出生日期")
+        or seller.get("出生年月日")
     )
     put("owner_birth_year", case_data.get("owner_birth_year"), deed_owner_info.get("owner_birth_year"), by)
     put("owner_birth_month", case_data.get("owner_birth_month"), deed_owner_info.get("owner_birth_month"), bm)
     put("owner_birth_day", case_data.get("owner_birth_day"), deed_owner_info.get("owner_birth_day"), bd)
     owner_household_address = (
-        seller.get("household_address")
+        case_data.get("owner_household_address")
+        or case_data.get("registered_address")
+        or case_data.get("household_address")
+        or case_data.get("戶籍地址")
+        or deed_owner_info.get("owner_household_address")
+        or deed_owner_info.get("registered_address")
+        or deed_owner_info.get("household_address")
+        or deed_owner_info.get("戶籍地址")
+        or seller.get("household_address")
         or seller.get("registered_address")
         or seller.get("owner_registered_address")
         or seller.get("owner_household_address")
@@ -681,12 +689,6 @@ def build_fill_fields(case_data: dict[str, Any], seller: dict[str, Any] | None =
         or seller.get("residence_address")
         or seller.get("戶籍地址")
         or seller.get("戶籍地址_完整")
-        or case_data.get("owner_household_address")
-        or deed_owner_info.get("owner_household_address")
-        or deed_owner_info.get("registered_address")
-        or deed_owner_info.get("戶籍地址")
-        or case_data.get("registered_address")
-        or case_data.get("戶籍地址")
     )
     # 第一個地址欄位是客戶資料的戶籍地址，不再用物件地址代填。
     fill_address_components(fields, "owner", owner_household_address)
@@ -783,14 +785,14 @@ def infer_checks(case_data: dict[str, Any], seller: dict[str, Any] | None = None
         checks["source_line"] = True
 
     gender = clean(
-        seller.get("gender")
-        or seller.get("sex")
-        or case_data.get("owner_gender")
+        case_data.get("owner_gender")
         or case_data.get("gender")
         or case_data.get("deed_owner_gender")
         or case_data.get("性別")
         or deed_owner_info.get("owner_gender")
         or deed_owner_info.get("gender")
+        or seller.get("gender")
+        or seller.get("sex")
     )
     if not gender:
         owner_id_for_gender = (
