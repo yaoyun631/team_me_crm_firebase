@@ -1,4 +1,4 @@
-﻿from io import BytesIO
+from io import BytesIO
 # -*- coding: utf-8 -*-
 # ✅ FULL_READY_20260621：包含 /line-card-preview、/line_card_preview、/debug/routes
 """
@@ -40456,6 +40456,58 @@ app.view_functions["daily_new_properties"] = daily_new_properties_v34
 print("✅ Team M.E v34 已啟用：網址一次抓取只判斷地址／每日新物件 591 與樂屋分來源查詢。")
 # =============================================================================
 # Team M.E v34 End
+# =============================================================================
+
+
+# =============================================================================
+# Team M.E v35｜每日新物件 591 URL 以卡片 ID 校正
+# =============================================================================
+_V35_ACTUAL_URL_BASE = _v33_actual_listing_url
+
+def _v35_numeric_id(value):
+    import re
+    text = str(value or "").strip()
+    if text.startswith("591:"):
+        text = text.split(":", 1)[1]
+    matched = re.search(r"(?<!\d)(\d{5,12})(?!\d)", text)
+    return matched.group(1) if matched else ""
+
+
+def _v35_href_id(value):
+    import re
+    text = _v33_clean_url_value(value)
+    for pattern in (
+        r"/home/house/detail/(?:[^/?#]+/)*(\d+)\.html(?:[?#]|$)",
+        r"/detail/(?:[^/?#]+/)*(\d+)\.html(?:[?#]|$)",
+        r"/v2/sale/(\d+)(?:[/?#]|$)",
+    ):
+        matched = re.search(pattern, text, flags=re.I)
+        if matched: return matched.group(1)
+    return ""
+
+
+def _v35_591_id(data):
+    data = data or {}; raw = data.get("raw") or {}
+    card = _v35_numeric_id(data.get("card_data_id")) or _v35_numeric_id(data.get("data_id"))
+    if isinstance(raw, dict):
+        card = card or _v35_numeric_id(raw.get("card_data_id")) or _v35_numeric_id(raw.get("data_id"))
+    href_values = [data.get("title_href"), data.get("header_href"), data.get("detail_href"), data.get("captured_detail_url")]
+    if isinstance(raw, dict): href_values += [raw.get("title_href"), raw.get("header_href"), raw.get("detail_href"), raw.get("href")]
+    href_id = next((value for value in (_v35_href_id(v) for v in href_values) if value), "")
+    stored = _v35_numeric_id(data.get("source_listing_id")) or _v35_numeric_id(data.get("listing_key"))
+    return card or href_id or stored
+
+
+def _v33_actual_listing_url(data):
+    source = str((data or {}).get("source_platform") or (data or {}).get("market_scope_source") or (data or {}).get("platform") or "").lower()
+    if source.startswith("591") or "591.com.tw" in str((data or {}).get("url") or "").lower():
+        listing_id = _v35_591_id(data or {})
+        return f"https://sale.591.com.tw/home/house/detail/2/{listing_id}.html" if listing_id else ""
+    return _V35_ACTUAL_URL_BASE(data)
+
+print("✅ Team M.E v35 已啟用：591 每日物件網址以卡片 ID／標題 href 校正成桌機正式網址。")
+# =============================================================================
+# Team M.E v35 End
 # =============================================================================
 
 if __name__ == "__main__":
