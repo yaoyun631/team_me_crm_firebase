@@ -22507,6 +22507,7 @@ CASE_DETAIL_FIELD_KEYS = [
     "deed_main_use", "deed_main_material", "deed_right_scope", "deed_mortgage_note",
     "deed_pdf_filename", "deed_parsed_json",
     "cadastral_lot", "cadastral_scale", "cadastral_note", "estimated_road_width", "cadastral_road_width",
+    "cadastral_road_access",
     "ai_sales_title", "ai_selling_points", "ai_group_copy", "ai_listing_description", "ai_feature_note",
 ]
 
@@ -22874,7 +22875,6 @@ CASE_TOOLS_HTML = r'''
   </div>
   <div>
     <a class="btn btn-outline-success" href="{{ url_for('seller_deed_case_form', seller_id=seller.id) }}">上傳謄本填表</a>
-    <a class="btn btn-outline-success" target="_blank" href="{{ url_for('seller_case_form_filled_docx', seller_id=seller.id) }}">下載Word案件表</a>
     <a class="btn btn-outline-primary" target="_blank" href="{{ url_for('seller_case_form_filled_pdf', seller_id=seller.id) }}">下載填好的案件表 PDF</a>
     <a class="btn btn-outline-secondary" target="_blank" href="{{ url_for('seller_case_form_pdf', seller_id=seller.id) }}">下載原本案件表 PDF</a>
     <a class="btn btn-secondary" href="{{ url_for('seller_detail', seller_id=seller.id) }}">回委託詳細</a>
@@ -23095,6 +23095,12 @@ DEED_CASE_FORM_HTML = r"""
       <input type="file" name="deed_pdf" class="form-control" accept="application/pdf,.pdf">
       <div class="form-text">電子謄本 PDF 通常可以直接抽文字；掃描圖 PDF 可能需要 OCR。</div>
     </div>
+
+    <div class="mb-3" id="cadastral-map-upload">
+      <label class="form-label">上傳地籍圖 PDF</label>
+      <input type="file" name="cadastral_pdf" class="form-control" accept="application/pdf,.pdf">
+      <div class="form-text">地籍圖會解析土地坐落、比例尺與備註；面臨路寬先不自動填，避免誤判。</div>
+    </div>
     <div class="mb-3">
       <label class="form-label">或貼上謄本 OCR 文字</label>
       <textarea name="deed_text" class="form-control" rows="8" placeholder="可貼上 PDF 複製出的文字或 OCR 文字">{{ case_data.deed_raw_text or '' }}</textarea>
@@ -23208,10 +23214,37 @@ def seller_deed_case_form(seller_id):
     if request.method == "POST":
         action = request.form.get("action", "parse")
         upload = request.files.get("deed_pdf")
+        cadastral_upload = request.files.get("cadastral_pdf")
         deed_text = request.form.get("deed_text", "")
 
         try:
-            parsed, raw_text, filename = _seller_deed_parse_pdf_or_text(upload, deed_text)
+            parsed = {}
+            raw_text = ""
+            filename = ""
+
+            if upload and getattr(upload, "filename", ""):
+                parsed, raw_text, filename = _seller_deed_parse_pdf_or_text(upload, deed_text)
+            elif deed_text and deed_text.strip():
+                parsed, raw_text, filename = _seller_deed_parse_pdf_or_text(None, deed_text)
+
+            if cadastral_upload and getattr(cadastral_upload, "filename", ""):
+                from deed_case_form_tool import extract_deed_pdf_text_from_bytes, parse_deed_text
+                cadastral_bytes = cadastral_upload.read()
+                cadastral_text = extract_deed_pdf_text_from_bytes(cadastral_bytes)
+                cadastral_parsed = parse_deed_text(cadastral_text)
+                if not parsed:
+                    parsed = cadastral_parsed
+                    raw_text = cadastral_text
+                else:
+                    parsed["cadastral_info"] = cadastral_parsed.get("cadastral_info") or {}
+                    parsed.setdefault("case_data", {}).update(cadastral_parsed.get("case_data") or {})
+                    if cadastral_text:
+                        raw_text = (raw_text + "\n\n---地籍圖---\n" + cadastral_text).strip()
+                filename = (filename + "+" if filename else "") + secure_filename(cadastral_upload.filename)
+
+            if not parsed:
+                raise RuntimeError("請上傳謄本 PDF、地籍圖 PDF，或貼上謄本 OCR 文字。")
+
             _seller_apply_deed_case_data(seller_id, parsed, raw_text=raw_text, filename=filename)
 
             if action == "parse_and_download":

@@ -369,62 +369,124 @@ def parse_building_block(block_text: str) -> dict[str, Any]:
 
 
 def parse_owner_personal_info(text: str) -> dict[str, str]:
-    """從謄本全文盡量抓所有權人個資；找不到就留白，避免亂填。"""
+    """從謄本全文抓所有權人個資。
+
+    支援你貼的格式：
+    所有權人：陳龍騰
+    統一編號：C120801873
+    出生日期：民國066年01月04日
+    住址：嘉義市東區圳頭里23鄰五福街185巷26號之1
+
+    「住址」會視為客戶資料區的戶籍地址 / 登記住址。
+    """
     text = normalize_text(text)
     info = {
-        "owner_name": "", "owner_id": "", "owner_gender": "", "owner_birth_date": "",
-        "owner_birth_year": "", "owner_birth_month": "", "owner_birth_day": "", "owner_household_address": "",
+        "owner_name": "",
+        "owner_id": "",
+        "owner_identity_no": "",
+        "owner_gender": "",
+        "owner_birth_date": "",
+        "owner_birth_year": "",
+        "owner_birth_month": "",
+        "owner_birth_day": "",
+        "owner_household_address": "",
+        "registered_address": "",
+        "household_address": "",
     }
+
+    # 優先從所有權部抓；抓不到就全篇抓，因為有些 PDF 斷行會讓區塊標題遺失。
     owner_block = first_match(text, [
-        r"(?:土地所有權部|建物所有權部)(.*?)(?:土地他項權利部|建物他項權利部|標示部|本謄本僅係|$)",
+        r"(?:土地所有權部|建物所有權部)(.*?)(?:土地他項權利部|建物他項權利部|共同擔保|標示部|本謄本僅係|$)",
     ]) or text
+
     info["owner_name"] = first_match(owner_block, [
-        r"(?:所有權人|權利人|登記名義人|納稅義務人)\s*[:：]?\s*([\u4e00-\u9fff]{2,6})(?=\s|\n|,|，|\*)",
+        r"(?:所有權人|權利人|登記名義人|納稅義務人)\s*[:：]?\s*([\u4e00-\u9fff]{2,8})(?=\s|\n|,|，|\*)",
         r"(?:所有權人|權利人|登記名義人|納稅義務人)\s*[:：]?\s*([^\n\s，,：:]{2,12})",
     ])
+
     raw_id = first_match(owner_block, [
-        r"(?:國民身分證統一編號|身分證統一編號|身分證明文件字號|身分證字號|身份字號|統一編號)\s*[:：]?\s*([A-Z][12\*][0-9\*]{7,9})",
+        r"(?:國民身分證統一編號|身分證統一編號|身分證明文件字號|身分證字號|身份字號|統一編號)\s*[:：]?\s*([A-Z][12][0-9]{8})",
         r"\b([A-Z][12][0-9]{8})\b",
-        r"\b([A-Z][12\*][0-9\*]{7,9})\b",
     ])
-    info["owner_id"] = raw_id.upper().replace(" ", "")
+    raw_id = raw_id.upper().replace(" ", "")
+    info["owner_id"] = raw_id
+    info["owner_identity_no"] = raw_id
+
     gender = first_match(owner_block, [r"性\s*別\s*[:：]?\s*([男女])"])
-    if gender not in {"男", "女"} and len(info["owner_id"]) >= 2:
-        if info["owner_id"][1] == "1": gender = "男"
-        elif info["owner_id"][1] == "2": gender = "女"
+    if gender not in {"男", "女"} and len(raw_id) >= 2:
+        if raw_id[1] == "1":
+            gender = "男"
+        elif raw_id[1] == "2":
+            gender = "女"
     info["owner_gender"] = gender if gender in {"男", "女"} else ""
+
     birth = first_match(owner_block, [
-        r"(?:出生日期|出生年月日|出生)\s*[:：]?\s*(民國\s*\d{2,3}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)",
+        r"(?:出生日期|出生年月日|出生)\s*[:：]?\s*(民國\s*\d{2,4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)",
         r"(?:出生日期|出生年月日|出生)\s*[:：]?\s*(\d{2,4}\s*[年/-]\s*\d{1,2}\s*[月/-]\s*\d{1,2}\s*日?)",
-        r"(民國\s*\d{2,3}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s*(?:出生|生)",
     ])
     info["owner_birth_date"] = birth
     if birth:
-        b = birth.translate(str.maketrans({"０":"0","１":"1","２":"2","３":"3","４":"4","５":"5","６":"6","７":"7","８":"8","９":"9"}))
-        m = re.search(r"民國\s*(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})", b) or re.search(r"(\d{2,4})\s*[年/-]\s*(\d{1,2})\s*[月/-]\s*(\d{1,2})", b)
+        b = birth.translate(str.maketrans({
+            "０":"0","１":"1","２":"2","３":"3","４":"4",
+            "５":"5","６":"6","７":"7","８":"8","９":"9",
+        }))
+        m = re.search(r"民國\s*(\d{2,4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})", b) or re.search(r"(\d{2,4})\s*[年/-]\s*(\d{1,2})\s*[月/-]\s*(\d{1,2})", b)
         if m:
             y = int(m.group(1))
-            if y > 1911: y -= 1911
+            if y > 1911:
+                y -= 1911
             info["owner_birth_year"] = str(y)
             info["owner_birth_month"] = str(int(m.group(2)))
             info["owner_birth_day"] = str(int(m.group(3)))
-    address = first_match(owner_block, [r"(?:戶籍地址|戶籍住址|住\s*址|住\s*所|通訊地址)\s*[:：]?\s*([^\n]+)"])
-    address = re.split(r"\s{2,}|出生|統一編號|身分證|身份字號|性別", address)[0].strip() if address else ""
+
+    address = first_match(owner_block, [
+        r"(?:戶籍地址|戶籍住址|登記住址|住\s*址|住\s*所|通訊地址)\s*[:：]?\s*([^\n]+)",
+    ])
+    if address:
+        address = re.split(
+            r"\s+(?:權利範圍|權狀字號|登記日期|登記原因|其他登記事項|前次移轉|管理者)\s*[:：]?",
+            address,
+        )[0].strip()
+        address = re.sub(r"\s+", "", address)
     if address and not any(k in address for k in ["銀行", "股份有限公司", "有限公司", "抵押權"]):
         info["owner_household_address"] = address
+        info["registered_address"] = address
+        info["household_address"] = address
+
     return {k: v for k, v in info.items() if clean(v)}
 
 
 def parse_cadastral_map_text(text: str) -> dict[str, str]:
+    """解析地籍圖謄本。
+
+    地籍圖可讀：
+    - 土地坐落
+    - 比例尺
+    - 周邊地號
+
+    但路寬不自動亂填；除非你另外手動輸入 road_width。
+    因為地籍圖也會註明「實地界址以複丈鑑界結果為準」。
+    """
     text = normalize_text(text)
     if "地籍圖謄本" not in text and "比例尺" not in text:
         return {}
+
     out = {}
     lot = first_match(text, [r"土地坐落[:：]\s*([^\n]+)"])
     scale = first_match(text, [r"比例尺[:：]\s*1\s*/\s*(\d+)"])
-    if lot: out["cadastral_lot"] = lot
-    if scale: out["cadastral_scale"] = f"1/{scale}"
-    out["cadastral_note"] = "地籍圖可輔助判斷是否臨路與估算路寬；實際界址與可通行寬度仍需現場確認/複丈鑑界。"
+    if lot:
+        out["cadastral_lot"] = lot
+        out["land_lot_no"] = lot
+    if scale:
+        out["cadastral_scale"] = f"1/{scale}"
+
+    # 只做輔助判斷，不自動填面臨路寬。
+    out["cadastral_road_access"] = "需人工確認"
+    out["road_width_source"] = "地籍圖輔助判斷"
+    out["cadastral_note"] = (
+        "已上傳地籍圖。地籍圖可輔助判斷是否臨路與估算路寬；"
+        "但實際界址與可通行寬度仍需現場確認/複丈鑑界，因此面臨路寬先不自動填。"
+    )
     return out
 
 
@@ -546,6 +608,7 @@ def to_case_data(parsed: dict[str, Any]) -> dict[str, Any]:
     return {
         "owner_name": owner_info.get("owner_name", ""),
         "owner_id": owner_info.get("owner_id", ""),
+        "owner_identity_no": owner_info.get("owner_identity_no") or owner_info.get("owner_id", ""),
         "owner_gender": owner_info.get("owner_gender", ""),
         "owner_birth_date": owner_info.get("owner_birth_date", ""),
         "owner_birth_year": owner_info.get("owner_birth_year", ""),
