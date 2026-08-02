@@ -40606,6 +40606,518 @@ print("✅ Team M.E v36 已啟用：六項勾選地址比對／樂屋逐區掃�
 # Team M.E v36 End
 # =============================================================================
 
+
+# =============================================================================
+# Team M.E v39｜LINE 找物件即時回覆修正
+# - 不再依賴背景 push 才回推薦卡片，避免 LINE push 失敗時使用者只收到「搜尋中」
+# - #找物件 口語條件會補抓區域 / 類型 / 房數 / 預算 / 車位
+# - 推薦資料源：properties + property_radar_listings + property_alert_items
+# - 篩選改成柔性排序：缺主建物 / 缺建坪 / 區域不完全符合時不直接排除
+# - 舊版空推薦快取不再直接回空結果
+# =============================================================================
+
+try:
+    AI_RECOMMEND_BACKGROUND_ENABLED = False
+except Exception:
+    pass
+
+_V39_AI_PROPERTY_MEMORY_CACHE = globals().get('_V39_AI_PROPERTY_MEMORY_CACHE') or {}
+_V39_AI_PROPERTY_CACHE_TTL = int(os.environ.get('AI_PROPERTY_CACHE_TTL_SECONDS', '600') or 600)
+
+
+def _v39_truthy(value):
+    return str(value or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
+def _v39_split_keywords_text(text):
+    parts = re.split(r'[，,、/\n\s]+', str(text or ''))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _v39_get_value(data, *keys, default=''):
+    data = data or {}
+    for key in keys:
+        try:
+            value = data.get(key)
+        except Exception:
+            value = None
+        if value not in (None, '', [], {}):
+            return value
+    raw = data.get('raw') if isinstance(data, dict) else None
+    if isinstance(raw, dict):
+        for key in keys:
+            value = raw.get(key)
+            if value not in (None, '', [], {}):
+                return value
+    return default
+
+
+def _v39_extract_url(data):
+    try:
+        if '_v33_actual_listing_url' in globals():
+            url = _v33_actual_listing_url(data or {})
+            if url:
+                return url
+    except Exception:
+        pass
+    for key in ('url', 'listing_url', 'source_url', 'detail_url', 'captured_detail_url', 'href', 'rakuya_刊登來源網址', 'raw_型錄網址', '物件網址', '網址'):
+        url = str(_v39_get_value(data, key) or '').strip()
+        if url.startswith(('http://', 'https://')):
+            return url.replace('\\u0026', '&').replace('&amp;', '&')
+    try:
+        raw_text = json.dumps(data or {}, ensure_ascii=False)
+        m = re.search(r'https?://[^\s"<>]+(?:591\.com\.tw|rakuya\.com\.tw|houseol\.com\.tw)[^\s"<>]+', raw_text, flags=re.I)
+        if m:
+            return m.group(0).replace('\\u0026', '&').replace('&amp;', '&')
+    except Exception:
+        pass
+    return ''
+
+
+def _v39_property_normalized(prop):
+    prop = prop or {}
+    try:
+        old_norm = globals().get('_v39_property_normalized_before')
+        base = old_norm(prop) if old_norm else {}
+    except Exception:
+        base = {}
+    base = base or {}
+
+    title = str(base.get('title') or _v39_get_value(prop, 'title', 'listing_title', 'name', 'raw_標題', 'rakuya_物件名稱', '物件名稱', '案名') or '未命名物件').strip()
+    area = str(base.get('area') or _v39_get_value(prop, 'area', 'district', 'rakuya_行政區', '行政區') or '').strip()
+    address = str(base.get('address') or _v39_get_value(prop, 'address', 'public_address', 'property_address', 'raw_完整地址', 'rakuya_地址全文', '地址') or '').strip()
+    ptype = str(base.get('property_type') or _v39_get_value(prop, 'property_type', 'type', 'rakuya_現況類型', 'rakuya_現況型式', 'raw_類型現況', '產品類型') or '').strip()
+    desc = str(base.get('description') or _v39_get_value(prop, 'description', 'desc', 'rakuya_特色描述', 'raw_環境特色', 'searchable_text', '特色描述') or '').strip()
+    url = str(base.get('url') or _v39_extract_url(prop) or '').strip()
+
+    source = str(_v39_get_value(prop, 'source_platform', 'platform', 'market_scope_source', 'source') or '').lower()
+    deal_type = str(_v39_get_value(prop, 'deal_type', 'intent_type') or base.get('deal_type') or '').lower()
+    all_for_type = f'{source} {deal_type} {title} {ptype} {desc}'
+    if deal_type in ('rent', '出租', '租賃') or any(k in all_for_type for k in ('出租', '租金', '月租', 'rent')):
+        deal_type = 'rent'
+    else:
+        deal_type = 'sale'
+
+    def fnum(*keys, current=None):
+        val = current if current not in (None, '') else _v39_get_value(prop, *keys)
+        try:
+            return _ai_safe_float(val, None)
+        except Exception:
+            return None
+
+    price_wan = fnum('price_wan', 'rakuya_總價_萬', 'raw_委託總價', '總價_萬', 'total_price', 'sale_price', 'price', current=base.get('price_wan'))
+    rent_price = fnum('rent_price', 'rakuya_租金_元', 'raw_租金', 'raw_月租金_卡片', '租金_元', '租金', 'rent', current=base.get('rent_price'))
+    if deal_type == 'rent' and rent_price and rent_price < 1000:
+        rent_price *= 10000
+    rooms = fnum('rooms', 'rakuya_房', '房', current=base.get('rooms'))
+    age = fnum('age', 'building_age', 'rakuya_屋齡', 'raw_屋齡', '屋齡', current=base.get('age'))
+    main_area = fnum('main_building_area', 'main_building_area_ping', 'main_area_ping', 'rakuya_主建物', 'raw_主建物坪', 'rakuya_使用坪數', '主建物', '使用坪數', current=base.get('main_building_area'))
+    building_area = fnum('building_area', 'building_area_ping', 'area_ping', 'rakuya_建物登記', 'rakuya_權狀面積', 'raw_登記坪數', 'raw_建物面積', '建物面積', '權狀面積', current=base.get('building_area'))
+    parking = str(base.get('parking') or _v39_get_value(prop, 'parking', 'car', 'car_need', '車位', 'rakuya_車位') or '').strip()
+
+    full_text = ' '.join(str(x or '') for x in [title, area, address, ptype, desc, parking, prop.get('searchable_text', '')])
+    out = dict(base)
+    out.update({
+        'id': prop.get('id') or base.get('id') or str(prop.get('source_listing_id') or prop.get('listing_key') or ''),
+        'deal_type': deal_type,
+        'title': title,
+        'area': area,
+        'address': address,
+        'property_type': ptype,
+        'description': desc,
+        'url': url,
+        'price_wan': price_wan,
+        'rent_price': rent_price,
+        'rooms': rooms,
+        'age': age,
+        'main_building_area': main_area,
+        'building_area': building_area,
+        'parking': parking,
+        'searchable_text': full_text,
+        'raw': prop,
+    })
+    return out
+
+try:
+    _v39_property_normalized_before = _property_normalized
+except Exception:
+    _v39_property_normalized_before = None
+_property_normalized = _v39_property_normalized
+
+
+def _v39_fetch_docs(collection_name, deal_type='sale', limit=1000):
+    docs = []
+    try:
+        if collection_name == 'properties':
+            try:
+                docs = list(db.collection(collection_name).where('deal_type', '==', deal_type).limit(int(limit)).stream())
+            except Exception:
+                docs = list(db.collection(collection_name).limit(int(limit)).stream())
+        else:
+            try:
+                docs = list(db.collection(collection_name).order_by('updated_at', direction=firestore.Query.DESCENDING).limit(int(limit)).stream())
+            except Exception:
+                try:
+                    docs = list(db.collection(collection_name).order_by('first_seen_at', direction=firestore.Query.DESCENDING).limit(int(limit)).stream())
+                except Exception:
+                    docs = list(db.collection(collection_name).limit(int(limit)).stream())
+    except Exception as exc:
+        print(f'⚠️ v39 讀取 {collection_name} 失敗：', exc)
+    return docs
+
+
+def _fetch_active_properties(deal_type='sale', max_docs=2500):
+    import time as _time
+    deal_type = 'rent' if str(deal_type).lower() == 'rent' else 'sale'
+    cache_key = f'v39_fetch_active_properties_{deal_type}_{max_docs}'
+    now_ts = _time.time()
+    cached = _V39_AI_PROPERTY_MEMORY_CACHE.get(cache_key)
+    if cached and now_ts - cached.get('ts', 0) < _V39_AI_PROPERTY_CACHE_TTL:
+        return cached.get('items') or []
+
+    sources = [
+        ('properties', min(int(max_docs or 2500), 2500)),
+        ('property_radar_listings', int(os.environ.get('AI_PROPERTY_RADAR_LIMIT', '1200') or 1200)),
+        ('property_alert_items', int(os.environ.get('AI_PROPERTY_ALERT_LIMIT', '600') or 600)),
+    ]
+    items, seen = [], set()
+    for collection_name, limit in sources:
+        for doc in _v39_fetch_docs(collection_name, deal_type=deal_type, limit=limit):
+            data = doc.to_dict() or {}
+            data['id'] = data.get('id') or doc.id
+            if data.get('active') is False or data.get('status') in ('deleted', 'excluded'):
+                continue
+            item = _v39_property_normalized(data)
+            if deal_type == 'rent' and item.get('deal_type') != 'rent':
+                continue
+            if deal_type == 'sale' and item.get('deal_type') == 'rent':
+                continue
+            key = item.get('url') or item.get('id') or f"{item.get('title')}|{item.get('address')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+            if len(items) >= int(max_docs or 2500):
+                break
+        if len(items) >= int(max_docs or 2500):
+            break
+    _V39_AI_PROPERTY_MEMORY_CACHE[cache_key] = {'ts': now_ts, 'items': items}
+    return items
+
+
+def _v39_supplement_parsed_need(parsed, buyer, extra_text=''):
+    parsed = dict(parsed or {})
+    buyer = buyer or {}
+    raw_all = ' '.join(str(x or '') for x in [
+        buyer.get('preferred_areas'), buyer.get('property_type'), buyer.get('room_range'), buyer.get('car_need'),
+        buyer.get('requirement_must'), buyer.get('requirement_nice'), buyer.get('note'), extra_text
+    ])
+    if not parsed.get('areas'):
+        areas_text = ''
+        try:
+            areas_text = _ai_extract_areas_from_text(raw_all)
+        except Exception:
+            areas_text = ''
+        parsed['areas'] = _v39_split_keywords_text(areas_text)
+    if not parsed.get('property_types'):
+        type_text = ''
+        try:
+            type_text = _ai_extract_property_types_from_text(raw_all)
+        except Exception:
+            type_text = ''
+        parsed['property_types'] = _v39_split_keywords_text(type_text)
+    if not parsed.get('room_min'):
+        m = re.search(r'(\d+)\s*房', raw_all)
+        if m:
+            parsed['room_min'] = int(m.group(1))
+    if parsed.get('intent_type') == 'rent':
+        if not parsed.get('rent_max'):
+            m = re.search(r'(?:租金|月租|租)?\s*(\d+(?:\.\d+)?)\s*萬\s*(?:內|以下|以內)?', raw_all)
+            if m:
+                parsed['rent_max'] = float(m.group(1)) * 10000
+            else:
+                m = re.search(r'(?:租金|月租|租)?\s*(\d{4,6})\s*(?:元|內|以下|以內)?', raw_all)
+                if m:
+                    parsed['rent_max'] = int(m.group(1))
+    else:
+        if not parsed.get('budget_max_buy_wan'):
+            m = re.search(r'(\d+(?:\.\d+)?)\s*萬\s*(?:內|以下|以內)?', raw_all)
+            if m:
+                parsed['budget_max_buy_wan'] = float(m.group(1))
+    if parsed.get('need_parking') is None and any(k in raw_all for k in ['車位', '平車', '雙車', '停車', '車庫']):
+        parsed['need_parking'] = True
+    if not parsed.get('summary'):
+        parsed['summary'] = raw_all[:180]
+    return parsed
+
+try:
+    _v39_ai_buyer_need_to_parsed_before = _ai_buyer_need_to_parsed
+    def _ai_buyer_need_to_parsed(buyer: dict, extra_text: str = ''):
+        parsed = _v39_ai_buyer_need_to_parsed_before(buyer, extra_text=extra_text)
+        return _v39_supplement_parsed_need(parsed, buyer, extra_text=extra_text)
+except Exception as exc:
+    print('⚠️ v39 客需補強解析套用失敗：', exc)
+
+try:
+    _v39_parse_ai_free_property_search_text_before = _parse_ai_free_property_search_text
+    def _parse_ai_free_property_search_text(text: str):
+        parsed = _v39_parse_ai_free_property_search_text_before(text)
+        if not parsed or isinstance(parsed, dict):
+            return parsed
+        buyer, extra_text, top_n = parsed
+        all_text = ' '.join(str(x or '') for x in [extra_text, buyer.get('note'), buyer.get('preferred_areas'), buyer.get('property_type')])
+        if not buyer.get('preferred_areas'):
+            try:
+                buyer['preferred_areas'] = _ai_extract_areas_from_text(all_text)
+            except Exception:
+                buyer['preferred_areas'] = ''
+        if not buyer.get('property_type'):
+            try:
+                buyer['property_type'] = _ai_extract_property_types_from_text(all_text)
+            except Exception:
+                buyer['property_type'] = ''
+        if not buyer.get('room_range'):
+            m = re.search(r'(\d+)\s*房', all_text)
+            if m:
+                buyer['room_range'] = m.group(1) + '房'
+        if not buyer.get('car_need') and any(k in all_text for k in ['車位', '平車', '雙車', '停車', '車庫']):
+            buyer['car_need'] = '需要車位'
+        return buyer, extra_text, top_n
+except Exception as exc:
+    print('⚠️ v39 #找物件解析補強失敗：', exc)
+
+
+def _hard_filter_properties_for_buyer(parsed_need: dict, top_limit=AI_PROPERTY_MAX_CANDIDATES):
+    parsed_need = parsed_need or {}
+    deal_type = 'rent' if parsed_need.get('intent_type') == 'rent' else 'sale'
+    props = _fetch_active_properties(deal_type=deal_type, max_docs=int(os.environ.get('AI_PROPERTY_FETCH_MAX_DOCS', '2500') or 2500))
+    areas = [str(a).replace('台中市', '').replace('臺中市', '').strip() for a in (parsed_need.get('areas') or []) if str(a).strip()]
+    ptypes = [str(t).strip() for t in (parsed_need.get('property_types') or []) if str(t).strip()]
+    keywords = [str(k).strip() for k in (parsed_need.get('search_keywords') or []) if str(k).strip()]
+    budget_max = _ai_safe_float(parsed_need.get('budget_max_buy_wan'), None)
+    rent_max = _ai_safe_float(parsed_need.get('rent_max'), None)
+    room_min = _ai_safe_float(parsed_need.get('room_min'), None)
+    age_max = _ai_safe_float(parsed_need.get('age_max'), None)
+    main_min = _ai_safe_float(parsed_need.get('main_building_area_min'), None)
+    building_min = _ai_safe_float(parsed_need.get('building_area_min'), None)
+    need_parking = parsed_need.get('need_parking')
+    scored = []
+    for p in props:
+        full_text = p.get('searchable_text') or ''
+        score, reasons = 0, []
+        if deal_type == 'sale' and budget_max:
+            if p.get('price_wan') is not None:
+                if p['price_wan'] <= budget_max:
+                    score += 25; reasons.append('總價符合預算')
+                else:
+                    over = (float(p['price_wan']) - float(budget_max)) / max(float(budget_max), 1)
+                    if over > 0.22:
+                        continue
+                    score -= 12; reasons.append('總價略高')
+            else:
+                score -= 1; reasons.append('總價未填')
+        if deal_type == 'rent' and rent_max:
+            if p.get('rent_price') is not None:
+                if p['rent_price'] <= rent_max:
+                    score += 25; reasons.append('租金符合預算')
+                else:
+                    over = (float(p['rent_price']) - float(rent_max)) / max(float(rent_max), 1)
+                    if over > 0.22:
+                        continue
+                    score -= 12; reasons.append('租金略高')
+            else:
+                score -= 1; reasons.append('租金未填')
+        if areas:
+            if any(a and (a in p.get('area', '') or a in p.get('address', '') or a in full_text) for a in areas):
+                score += 24; reasons.append('區域符合')
+            else:
+                score -= 10; reasons.append('區域需確認')
+        if ptypes:
+            if any(t and (t in p.get('property_type', '') or t in p.get('title', '') or t in full_text) for t in ptypes):
+                score += 18; reasons.append('產品類型符合')
+            else:
+                score -= 6; reasons.append('類型需確認')
+        if room_min:
+            if p.get('rooms') is not None and p['rooms'] >= room_min:
+                score += 8; reasons.append('房數符合')
+            elif p.get('rooms') is not None:
+                score -= 5
+        if age_max:
+            if p.get('age') is not None and p['age'] <= age_max:
+                score += 10; reasons.append('屋齡符合')
+            elif p.get('age') is not None:
+                score -= 8
+        if main_min:
+            if p.get('main_building_area') is not None and p['main_building_area'] >= main_min:
+                score += 14; reasons.append(f'主建物約 {main_min:g} 坪以上')
+            elif p.get('main_building_area') is not None:
+                score -= 8
+            else:
+                score -= 1; reasons.append('主建物未填')
+        if building_min:
+            if p.get('building_area') is not None and p['building_area'] >= building_min:
+                score += 10; reasons.append(f'建坪約 {building_min:g} 坪以上')
+            elif p.get('building_area') is not None:
+                score -= 7
+            else:
+                score -= 1; reasons.append('建坪未填')
+        if need_parking is True:
+            if any(k in full_text for k in ['車位', '平車', '雙車', '停車', '車庫', '前院']):
+                score += 9; reasons.append('可能符合停車需求')
+            else:
+                score -= 4
+        matched = [k for k in keywords if k and k in full_text]
+        if matched:
+            score += min(15, len(matched) * 3); reasons.append('關鍵字符合：' + '、'.join(matched[:4]))
+        if p.get('url'):
+            score += 2
+        if p.get('description'):
+            score += 2
+        item = dict(p)
+        item['rule_score'] = score
+        item['basic_reasons'] = dedupe_keep_order(reasons) if 'dedupe_keep_order' in globals() else reasons
+        if score >= int(os.environ.get('AI_PROPERTY_MIN_RULE_SCORE', '-25') or -25):
+            scored.append(item)
+    scored.sort(key=lambda x: x.get('rule_score', 0), reverse=True)
+    return scored[:max(1, int(top_limit or AI_PROPERTY_MAX_CANDIDATES))]
+
+try:
+    _v39_get_ai_recommend_cache_before = _get_ai_recommend_cache
+    def _get_ai_recommend_cache(buyer: dict, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text: str = ''):
+        data = _v39_get_ai_recommend_cache_before(buyer, top_n=top_n, extra_text=extra_text)
+        if not data:
+            return None
+        if _v39_truthy(os.environ.get('AI_RECOMMEND_IGNORE_EMPTY_CACHE', '1')) and not (data.get('recommendations') or []):
+            return None
+        return data
+except Exception as exc:
+    print('⚠️ v39 空推薦快取修正失敗：', exc)
+
+
+def recommend_properties_for_buyer_data(buyer: dict, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text: str = '', force_refresh: bool = False):
+    buyer = buyer or {}
+    top_n = max(1, min(10, int(top_n or AI_PROPERTY_DEFAULT_TOP_N)))
+    if not force_refresh:
+        cached = _get_ai_recommend_cache(buyer, top_n=top_n, extra_text=extra_text) if '_get_ai_recommend_cache' in globals() else None
+        if cached:
+            return {'parsed_need': cached.get('parsed_need') or {}, 'recommendations': cached.get('recommendations') or [], 'cache_hit': True}
+    parsed = _ai_try_parse_buyer_need_with_gemini(buyer, extra_text=extra_text)
+    parsed = _v39_supplement_parsed_need(parsed, buyer, extra_text=extra_text)
+    candidates = _hard_filter_properties_for_buyer(parsed, top_limit=max(int(AI_PROPERTY_MAX_CANDIDATES or 25), top_n * 6))
+    use_gemini_rank = _v39_truthy(os.environ.get('AI_RECOMMEND_USE_GEMINI_RANKING', '0'))
+    if use_gemini_rank:
+        ranked = _rank_properties_with_gemini(parsed, candidates, top_n=top_n)
+    else:
+        ranked = _rank_properties_with_gemini_no_api(candidates, top_n=top_n)
+    result = {'parsed_need': parsed, 'recommendations': ranked, 'cache_hit': False, 'candidate_count': len(candidates)}
+    try:
+        _save_ai_recommend_cache(buyer, result, top_n=top_n, extra_text=extra_text)
+    except Exception:
+        pass
+    return result
+
+
+def _v39_no_result_text(result):
+    parsed = result.get('parsed_need') or {}
+    deal = '出租' if parsed.get('intent_type') == 'rent' else '出售'
+    areas = '、'.join(parsed.get('areas') or []) or '未指定'
+    ptypes = '、'.join(parsed.get('property_types') or []) or '未指定'
+    return f'目前沒有找到足夠符合的{deal}物件。\n已查詢公司物件庫與市場雷達快取。\n條件：區域 {areas}｜類型 {ptypes}\n建議：放寬區域、預算或產品類型後再查一次。'
+
+
+def _v39_recommend_result_dict(buyer, extra_text='', top_n=5, parsed_tag='找物件'):
+    result = recommend_properties_for_buyer_data(buyer, top_n=top_n, extra_text=extra_text, force_refresh=False)
+    recs = result.get('recommendations') or []
+    flex = build_property_recommend_flex(buyer, recs, parsed_need=result.get('parsed_need') or {})
+    return {
+        'handled': True,
+        'ok': True,
+        'reply_text': '條件搜尋推薦物件' if recs else _v39_no_result_text(result),
+        'reply_flex': flex,
+        'target_type': 'buyer' if buyer.get('id') and not str(buyer.get('id')).startswith('free_search_') else '',
+        'target_id': buyer.get('id') if buyer.get('id') and not str(buyer.get('id')).startswith('free_search_') else '',
+        'customer_name': buyer.get('name', ''),
+        'phone': buyer.get('phone', ''),
+        'parsed_tag': parsed_tag,
+    }
+
+
+def process_line_free_property_search_event(event):
+    msg = (event or {}).get('message') or {}
+    if msg.get('type') != 'text':
+        return {'handled': False}
+    parsed = _parse_ai_free_property_search_text(msg.get('text') or '')
+    if not parsed:
+        return {'handled': False}
+    if isinstance(parsed, dict) and parsed.get('error'):
+        return {'handled': True, 'ok': False, 'reply_text': parsed.get('error')}
+    ok, reason = _line_source_ai_recommend_allowed(event) if '_line_source_ai_recommend_allowed' in globals() else (True, '')
+    if not ok:
+        return {'handled': True, 'ok': False, 'reply_text': reason}
+    if '_ai_free_search_feature_enabled' in globals() and not _ai_free_search_feature_enabled():
+        return {'handled': True, 'ok': False, 'reply_text': 'AI條件找物件功能目前尚未啟用，請到設定中心開啟。'}
+    buyer, extra_text, top_n = parsed
+    try:
+        return _v39_recommend_result_dict(buyer, extra_text=extra_text, top_n=top_n, parsed_tag='找物件')
+    except Exception as exc:
+        return {'handled': True, 'ok': False, 'reply_text': f'AI找物件失敗：{exc}'}
+
+
+def process_line_recommend_properties_event(event):
+    msg = (event or {}).get('message') or {}
+    text = (msg.get('text') or '').strip()
+    first = text.splitlines()[0].strip().replace(' ', '') if text else ''
+    if first not in ('#推薦物件', '#AI推薦物件', '#物件推薦'):
+        return {'handled': False}
+    ok, reason = _line_source_ai_recommend_allowed(event) if '_line_source_ai_recommend_allowed' in globals() else (True, '')
+    if not ok:
+        return {'handled': True, 'ok': False, 'reply_text': reason}
+    fields = _parse_recommend_command_fields(text)
+    top_n = parse_int_limit(fields.get('limit') or fields.get('筆數') or 5, default=5, max_value=10)
+    extra_text = fields.get('補充') or fields.get('content') or fields.get('note') or ''
+    buyer_doc, err = _find_buyer_doc_for_recommend(fields)
+    if err:
+        return {'handled': True, 'ok': False, 'reply_text': err}
+    buyer = buyer_doc.to_dict() or {}
+    buyer['id'] = buyer_doc.id
+    try:
+        if event is not None and '_line_event_can_view_buyer' in globals() and not _line_event_can_view_buyer(event, buyer):
+            return {'handled': True, 'ok': False, 'reply_text': '你沒有權限查詢這筆個人客需的推薦物件。'}
+    except Exception:
+        pass
+    return _v39_recommend_result_dict(buyer, extra_text=extra_text, top_n=top_n, parsed_tag='推薦物件')
+
+
+def _make_recommendation_result_for_buyer_doc(buyer_doc, event=None, top_n=AI_PROPERTY_DEFAULT_TOP_N, extra_text=''):
+    if not buyer_doc or not getattr(buyer_doc, 'exists', False):
+        return {'handled': True, 'ok': False, 'reply_text': '找不到這筆客需，無法推薦物件。'}
+    buyer = buyer_doc.to_dict() or {}
+    buyer['id'] = buyer_doc.id
+    return _v39_recommend_result_dict(buyer, extra_text=extra_text, top_n=top_n, parsed_tag='推薦物件')
+
+try:
+    _v39_process_line_message_event_before = process_line_message_event
+    def process_line_message_event(event):
+        msg = (event or {}).get('message') or {}
+        if msg.get('type') == 'text':
+            text = (msg.get('text') or '').strip()
+            first = text.splitlines()[0].strip().replace(' ', '') if text else ''
+            if first.startswith(('#找物件', '#搜尋物件', '#AI找物件', '#查物件', '#找公司物件')):
+                result = process_line_free_property_search_event(event)
+                if result.get('handled'):
+                    return result
+            if first.startswith(('#推薦物件', '#AI推薦物件', '#物件推薦')):
+                result = process_line_recommend_properties_event(event)
+                if result.get('handled'):
+                    return result
+        return _v39_process_line_message_event_before(event)
+    print('✅ Team M.E v39 已啟用：LINE #找物件 / #推薦物件 直接回覆推薦卡片。')
+except Exception as exc:
+    print('⚠️ Team M.E v39 LINE 找物件路由套用失敗：', exc)
+# =============================================================================
+# Team M.E v39 End
+# =============================================================================
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
     print("Routes:", app.url_map)
