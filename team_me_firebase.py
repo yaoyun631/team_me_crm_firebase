@@ -42821,6 +42821,69 @@ def workspace_after_request_v20260817(response):
 
         wid = current_workspace_id()
         wname = current_workspace_name()
+
+        # 目前工作區名稱同步到頁面左上角品牌標題。
+        # 不要求每一個 template 都改成 Jinja 變數，避免漏掉舊版 / Patch 內嵌頁面。
+        _workspace_brand_name_js = json.dumps(wname or "工作區", ensure_ascii=False)
+        workspace_brand_script = fr"""
+<script id="teamme-workspace-brand-sync">
+(function() {{
+  const workspaceName = {_workspace_brand_name_js};
+
+  function syncWorkspaceBrand() {{
+    const preferredSelectors = [
+      '.navbar-brand',
+      '#navbar-brand',
+      '[data-workspace-brand]',
+      '.sidebar-brand .brand-text',
+      '.sidebar-brand',
+      '.app-brand',
+      '.brand'
+    ];
+
+    let changed = false;
+    for (const selector of preferredSelectors) {{
+      const nodes = document.querySelectorAll(selector);
+      for (const el of nodes) {{
+        if (!el || el.dataset.workspaceBrandSynced === '1') continue;
+        const rect = el.getBoundingClientRect();
+        const text = (el.textContent || '').trim();
+        const looksLikeBrand = /厝米|Team\s*M\.E|TEAM\s*M\.E|CRM/i.test(text);
+        const nearTopLeft = rect.top < 180 && rect.left < Math.max(520, window.innerWidth * 0.45);
+        if (selector === '[data-workspace-brand]' || (looksLikeBrand && nearTopLeft)) {{
+          el.textContent = workspaceName;
+          el.dataset.workspaceBrandSynced = '1';
+          el.setAttribute('title', '目前工作區：' + workspaceName);
+          changed = true;
+        }}
+      }}
+    }}
+
+    // 舊模板若沒有固定 class，補一層文字掃描，只改頁面左上方且看起來像品牌的元素。
+    if (!changed) {{
+      const candidates = document.querySelectorAll('header a, nav a, header div, nav div, aside a, aside div');
+      for (const el of candidates) {{
+        const rect = el.getBoundingClientRect();
+        const text = (el.textContent || '').trim();
+        if (rect.top < 180 && rect.left < Math.max(520, window.innerWidth * 0.45) && /厝米|Team\s*M\.E|TEAM\s*M\.E|CRM/i.test(text)) {{
+          el.textContent = workspaceName;
+          el.dataset.workspaceBrandSynced = '1';
+          el.setAttribute('title', '目前工作區：' + workspaceName);
+          break;
+        }}
+      }}
+    }}
+  }}
+
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', syncWorkspaceBrand);
+  }} else {{
+    syncWorkspaceBrand();
+  }}
+}})();
+</script>
+"""
+
         workspace_button = (
             '<div id="teamme-workspace-switch" style="position:fixed;right:16px;bottom:16px;z-index:99999;">'
             '<a href="' + _workspace_html.escape(url_for("workspace_home")) + '" '
@@ -42839,7 +42902,7 @@ def workspace_after_request_v20260817(response):
                 '<div id="teamme-data-scope" style="position:fixed;left:16px;bottom:16px;z-index:99999;display:flex;gap:6px;background:rgba(255,255,255,.92);padding:6px;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.10);">'
                 + chip("all", "全部") + chip("shared", "群組共享") + chip("mine", "我的資料") + '</div>'
             )
-        body = body.replace("</body>", workspace_button + filter_html + "</body>")
+        body = body.replace("</body>", workspace_brand_script + workspace_button + filter_html + "</body>")
         response.set_data(body)
         return response
     except Exception as exc:
@@ -42852,6 +42915,599 @@ print("✅ Team M.E Workspace v20260817 已啟用：多工作區、多成員、L
 # Team M.E Workspace 多團隊 / 多租戶隔離 Patch End
 # =============================================================================
 
+
+# =============================================================================
+# Team M.E Workspace Performance Patch v3 / 20260817
+# - 修正 Workspace N+1 Firestore 權限查詢
+# - request + process TTL cache：user / workspace / membership
+# - 已完成 workspace_id migration 後，Firestore 直接 where(workspace_id == current)
+# - 非預設 Workspace 永遠可使用原生 workspace query（舊無 workspace_id 資料只屬預設 Workspace）
+# - 原生 query 遇到 Firestore composite index 不足時，自動回退相容模式，不中斷網站
+# - Migration 改成 batch write，完成後切換全系統 Fast Mode
+# =============================================================================
+
+from flask import g
+import time as _workspace_v3_time
+
+WORKSPACE_V3_CACHE_SECONDS = max(5, int(os.environ.get("WORKSPACE_CACHE_SECONDS", "30") or 30))
+WORKSPACE_V3_SCHEMA_COLLECTION = os.environ.get("WORKSPACE_SCHEMA_COLLECTION", "workspace_system")
+WORKSPACE_V3_SCHEMA_DOC = os.environ.get("WORKSPACE_SCHEMA_DOC", "workspace_v3")
+
+_WORKSPACE_V3_CACHE = {
+    "users": {},
+    "workspaces": {},
+    "memberships": {},
+    "migration": None,
+}
+_WORKSPACE_V3_BOOTSTRAP_CONFIRMED = False
+_WORKSPACE_V3_NATIVE_SAFE_COLLECTIONS = set()
+_WORKSPACE_V3_FALLBACK_WARNED = set()
+
+
+def _workspace_v3_now_mono():
+    return _workspace_v3_time.monotonic()
+
+
+def _workspace_v3_cache_get(bucket: str, key):
+    item = (_WORKSPACE_V3_CACHE.get(bucket) or {}).get(key)
+    if not item:
+        return None
+    expires_at, value = item
+    if expires_at < _workspace_v3_now_mono():
+        try:
+            del _WORKSPACE_V3_CACHE[bucket][key]
+        except Exception:
+            pass
+        return None
+    return value
+
+
+def _workspace_v3_cache_set(bucket: str, key, value, ttl=None):
+    ttl = WORKSPACE_V3_CACHE_SECONDS if ttl is None else max(1, int(ttl))
+    _WORKSPACE_V3_CACHE.setdefault(bucket, {})[key] = (_workspace_v3_now_mono() + ttl, value)
+    return value
+
+
+def _workspace_v3_request_cache():
+    if not has_request_context():
+        return None
+    cache = getattr(g, "_teamme_workspace_v3", None)
+    if cache is None:
+        cache = {
+            "users": {},
+            "workspaces": {},
+            "memberships": {},
+            "member_map": {},
+            "permissions": {},
+        }
+        g._teamme_workspace_v3 = cache
+    return cache
+
+
+def _workspace_v3_invalidate_all():
+    global _WORKSPACE_V3_BOOTSTRAP_CONFIRMED
+    for key in ("users", "workspaces", "memberships"):
+        _WORKSPACE_V3_CACHE[key].clear()
+    _WORKSPACE_V3_CACHE["migration"] = None
+    _WORKSPACE_V3_NATIVE_SAFE_COLLECTIONS.clear()
+    _WORKSPACE_V3_BOOTSTRAP_CONFIRMED = False
+
+
+def _workspace_v3_invalidate_user(user_id: str = ""):
+    user_id = _workspace_safe_str(user_id)
+    if not user_id:
+        return
+    _WORKSPACE_V3_CACHE["users"].pop(user_id, None)
+    _WORKSPACE_V3_CACHE["memberships"].pop((user_id, True), None)
+    _WORKSPACE_V3_CACHE["memberships"].pop((user_id, False), None)
+
+
+# ---------- 快取版 Firestore identity / workspace helpers ----------
+def _workspace_raw_user(user_id: str):
+    user_id = _workspace_safe_str(user_id)
+    if not user_id:
+        return {}
+    req = _workspace_v3_request_cache()
+    if req is not None and user_id in req["users"]:
+        return req["users"][user_id]
+    cached = _workspace_v3_cache_get("users", user_id)
+    if cached is not None:
+        if req is not None:
+            req["users"][user_id] = cached
+        return cached
+    try:
+        snap = _WORKSPACE_RAW_DB.collection("users").document(user_id).get()
+        data = (snap.to_dict() or {}) if snap.exists else {}
+    except Exception:
+        data = {}
+    _workspace_v3_cache_set("users", user_id, data)
+    if req is not None:
+        req["users"][user_id] = data
+    return data
+
+
+def _workspace_doc(workspace_id: str):
+    workspace_id = _workspace_safe_str(workspace_id)
+    if not workspace_id:
+        return {}
+    req = _workspace_v3_request_cache()
+    if req is not None and workspace_id in req["workspaces"]:
+        return req["workspaces"][workspace_id]
+    cached = _workspace_v3_cache_get("workspaces", workspace_id)
+    if cached is not None:
+        if req is not None:
+            req["workspaces"][workspace_id] = cached
+        return cached
+    try:
+        snap = _WORKSPACE_RAW_DB.collection(WORKSPACE_COLLECTION).document(workspace_id).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            data["id"] = snap.id
+        else:
+            data = {}
+    except Exception:
+        data = {}
+    _workspace_v3_cache_set("workspaces", workspace_id, data)
+    if req is not None:
+        req["workspaces"][workspace_id] = data
+    return data
+
+
+def _workspace_memberships_for_user(user_id: str, active_only=True):
+    user_id = _workspace_safe_str(user_id)
+    if not user_id:
+        return []
+    cache_key = (user_id, bool(active_only))
+    req = _workspace_v3_request_cache()
+    if req is not None and cache_key in req["memberships"]:
+        return req["memberships"][cache_key]
+    cached = _workspace_v3_cache_get("memberships", cache_key)
+    if cached is not None:
+        if req is not None:
+            req["memberships"][cache_key] = cached
+            req["member_map"].update({
+                (user_id, _workspace_safe_str(x.get("workspace_id"))): x
+                for x in cached if _workspace_safe_str(x.get("workspace_id"))
+            })
+        return cached
+
+    rows = []
+    try:
+        member_snaps = list(
+            _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION)
+            .where("user_id", "==", user_id)
+            .stream()
+        )
+        workspace_ids = []
+        raw_members = []
+        for snap in member_snaps:
+            data = snap.to_dict() or {}
+            data["id"] = snap.id
+            wid = _workspace_safe_str(data.get("workspace_id"))
+            if not wid:
+                continue
+            raw_members.append((wid, data))
+            workspace_ids.append(wid)
+
+        # 用 get_all 一次 RPC 取回多個 workspace，避免每個 membership 再做一次網路 round-trip。
+        ws_map = {}
+        missing_refs = []
+        missing_ids = []
+        for wid in dict.fromkeys(workspace_ids):
+            ws_cached = _workspace_v3_cache_get("workspaces", wid)
+            if ws_cached is not None:
+                ws_map[wid] = ws_cached
+            else:
+                missing_ids.append(wid)
+                missing_refs.append(_WORKSPACE_RAW_DB.collection(WORKSPACE_COLLECTION).document(wid))
+        if missing_refs:
+            try:
+                for snap in _WORKSPACE_RAW_DB.get_all(missing_refs):
+                    wid = snap.id
+                    data = snap.to_dict() or {} if snap.exists else {}
+                    if snap.exists:
+                        data["id"] = wid
+                    ws_map[wid] = data
+                    _workspace_v3_cache_set("workspaces", wid, data)
+            except Exception:
+                # 舊版 Firestore client 沒 get_all 時保留相容 fallback。
+                for wid in missing_ids:
+                    ws_map[wid] = _workspace_doc(wid)
+
+        for wid, data in raw_members:
+            ws = ws_map.get(wid) or {}
+            if not ws:
+                continue
+            if active_only and (data.get("active", True) is False or ws.get("active", True) is False):
+                continue
+            data["workspace"] = ws
+            data["workspace_name"] = ws.get("name") or wid
+            rows.append(data)
+    except Exception as exc:
+        print("⚠️ Workspace v3 成員關係讀取失敗：", exc)
+
+    rows.sort(key=lambda x: (x.get("workspace_name") or "", x.get("workspace_id") or ""))
+    _workspace_v3_cache_set("memberships", cache_key, rows)
+    if req is not None:
+        req["memberships"][cache_key] = rows
+        req["member_map"].update({
+            (user_id, _workspace_safe_str(x.get("workspace_id"))): x
+            for x in rows if _workspace_safe_str(x.get("workspace_id"))
+        })
+    return rows
+
+
+def _workspace_membership(workspace_id: str, user_id: str):
+    workspace_id = _workspace_safe_str(workspace_id)
+    user_id = _workspace_safe_str(user_id)
+    if not workspace_id or not user_id:
+        return {}
+    req = _workspace_v3_request_cache()
+    key = (user_id, workspace_id)
+    if req is not None and key in req["member_map"]:
+        return req["member_map"][key]
+
+    # 先利用該使用者的 membership cache；一個 request 裡後續所有文件權限判斷都不再打 Firestore。
+    memberships = _workspace_memberships_for_user(user_id, active_only=False)
+    for mem in memberships:
+        if _workspace_safe_str(mem.get("workspace_id")) == workspace_id:
+            if req is not None:
+                req["member_map"][key] = mem
+            return mem
+    if req is not None:
+        req["member_map"][key] = {}
+    return {}
+
+
+def _workspace_user_can(workspace_id: str, user_id: str, module: str = "") -> bool:
+    workspace_id = _workspace_safe_str(workspace_id)
+    user_id = _workspace_safe_str(user_id)
+    module = _workspace_safe_str(module)
+    if not workspace_id or not user_id:
+        return False
+    req = _workspace_v3_request_cache()
+    pkey = (workspace_id, user_id, module)
+    if req is not None and pkey in req["permissions"]:
+        return req["permissions"][pkey]
+    mem = _workspace_membership(workspace_id, user_id)
+    allowed = False
+    if mem and mem.get("active", True) is not False:
+        role = _workspace_safe_str(mem.get("role") or "member")
+        if role in ("owner", "admin"):
+            allowed = True
+        elif not module:
+            allowed = True
+        else:
+            modules = set(mem.get("modules") or [])
+            allowed = ("all" in modules or module in modules)
+    if req is not None:
+        req["permissions"][pkey] = bool(allowed)
+    return bool(allowed)
+
+
+def _workspace_bootstrap_for_first_user(user_id: str):
+    global _WORKSPACE_V3_BOOTSTRAP_CONFIRMED
+    if _WORKSPACE_V3_BOOTSTRAP_CONFIRMED:
+        return
+    user_id = _workspace_safe_str(user_id)
+    if not user_id:
+        return
+    try:
+        has_member = any(True for _ in _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).limit(1).stream())
+    except Exception:
+        has_member = False
+    if has_member:
+        _WORKSPACE_V3_BOOTSTRAP_CONFIRMED = True
+        return
+
+    now = _workspace_now_iso()
+    try:
+        _WORKSPACE_RAW_DB.collection(WORKSPACE_COLLECTION).document(WORKSPACE_DEFAULT_ID).set({
+            "name": WORKSPACE_DEFAULT_NAME,
+            "active": True,
+            "created_at": now,
+            "created_by_id": user_id,
+            "updated_at": now,
+        }, merge=True)
+        _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).document(
+            _workspace_member_doc_id(WORKSPACE_DEFAULT_ID, user_id)
+        ).set({
+            "workspace_id": WORKSPACE_DEFAULT_ID,
+            "user_id": user_id,
+            "role": "owner",
+            "modules": WORKSPACE_ALL_MODULES,
+            "active": True,
+            "created_at": now,
+            "created_by_id": user_id,
+            "updated_at": now,
+        }, merge=True)
+        _WORKSPACE_RAW_DB.collection("users").document(user_id).set({
+            "is_super_admin": True,
+            "updated_at": now,
+        }, merge=True)
+        _WORKSPACE_V3_BOOTSTRAP_CONFIRMED = True
+        _workspace_v3_invalidate_all()
+        _WORKSPACE_V3_BOOTSTRAP_CONFIRMED = True
+        print(f"✅ Workspace v3 初始建立完成：{WORKSPACE_DEFAULT_NAME} / owner={user_id}")
+    except Exception as exc:
+        print("⚠️ Workspace v3 初始建立失敗：", exc)
+
+
+def _workspace_ensure_session():
+    if not has_request_context():
+        return
+    user_id = _workspace_safe_str(session.get("user_id"))
+    if not user_id:
+        return
+    _workspace_bootstrap_for_first_user(user_id)
+    memberships = _workspace_memberships_for_user(user_id)
+    allowed = {x.get("workspace_id") for x in memberships if x.get("workspace_id")}
+    current = _workspace_safe_str(session.get("workspace_id"))
+    if current not in allowed:
+        if memberships:
+            current = memberships[0].get("workspace_id") or ""
+            session["workspace_id"] = current
+            session["workspace_name"] = memberships[0].get("workspace_name") or current
+            session["workspace_role"] = memberships[0].get("role") or "member"
+        else:
+            session.pop("workspace_id", None)
+            session.pop("workspace_name", None)
+            session.pop("workspace_role", None)
+    elif current:
+        mem = next((x for x in memberships if x.get("workspace_id") == current), {})
+        # 只有真的變更時才寫 session，避免每個 request 都讓 session cookie 被標記修改。
+        new_name = mem.get("workspace_name") or current
+        new_role = mem.get("role") or "member"
+        if session.get("workspace_name") != new_name:
+            session["workspace_name"] = new_name
+        if session.get("workspace_role") != new_role:
+            session["workspace_role"] = new_role
+
+
+# ---------- Migration / Native query Fast Mode ----------
+def _workspace_v3_migration_state(force=False):
+    cached = _WORKSPACE_V3_CACHE.get("migration")
+    if not force and cached:
+        expires_at, value = cached
+        if expires_at >= _workspace_v3_now_mono():
+            return value
+    try:
+        snap = _WORKSPACE_RAW_DB.collection(WORKSPACE_V3_SCHEMA_COLLECTION).document(WORKSPACE_V3_SCHEMA_DOC).get()
+        data = snap.to_dict() or {} if snap.exists else {}
+    except Exception:
+        data = {}
+    _WORKSPACE_V3_CACHE["migration"] = (_workspace_v3_now_mono() + max(30, WORKSPACE_V3_CACHE_SECONDS), data)
+    return data
+
+
+def _workspace_v3_native_scope_available(collection_name: str, workspace_id: str) -> bool:
+    collection_name = _workspace_safe_str(collection_name)
+    workspace_id = _workspace_safe_str(workspace_id)
+    if collection_name not in _WORKSPACE_SCOPED_COLLECTIONS or not workspace_id:
+        return False
+    # 舊的無 workspace_id 資料邏輯上只屬於預設 Workspace；其他 Workspace 可以直接原生過濾。
+    if workspace_id != WORKSPACE_DEFAULT_ID:
+        return True
+    if collection_name in _WORKSPACE_V3_NATIVE_SAFE_COLLECTIONS:
+        return True
+    state = _workspace_v3_migration_state()
+    return bool(state.get("legacy_migration_complete"))
+
+
+def _workspace_v3_add_workspace_filter(raw_query, workspace_id: str):
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+        return raw_query.where(filter=FieldFilter("workspace_id", "==", workspace_id))
+    except Exception:
+        return raw_query.where("workspace_id", "==", workspace_id)
+
+
+def _workspace_v3_snapshot_allowed_native(collection_name: str, snapshot) -> bool:
+    """已由 Firestore 保證 workspace_id 相符後，只做個人/列表範圍判斷，避免重複會員查詢。"""
+    try:
+        if not snapshot.exists:
+            return True
+        data = snapshot.to_dict() or {}
+    except Exception:
+        return False
+
+    source_kind = _workspace_safe_str(_WORKSPACE_CONTEXT_SOURCE_KIND.get())
+    if collection_name in _WORKSPACE_PRIMARY_VISIBILITY_COLLECTIONS and source_kind not in ("group", "room", "user"):
+        if has_request_context() and session.get("user_id"):
+            vis = _workspace_safe_str(data.get("visibility") or "public")
+            if vis == "personal" and not _workspace_personal_owned_by_actor(data):
+                return False
+    return _workspace_request_scope_filter_allows(collection_name, data)
+
+
+def _workspace_v3_query_stream(self, *args, **kwargs):
+    collection_name = self._collection_name
+    if collection_name in _WORKSPACE_SCOPED_COLLECTIONS and not _workspace_collection_module_allowed(collection_name):
+        return iter(())
+
+    wid, active = _workspace_scope_state()
+    native_scope = bool(active and _workspace_v3_native_scope_available(collection_name, wid))
+
+    def _slice_and_wrap(raw_snaps, native=False):
+        passed = []
+        allow_fn = _workspace_v3_snapshot_allowed_native if native else _workspace_snapshot_allowed
+        for snap in raw_snaps:
+            if not allow_fn(collection_name, snap):
+                continue
+            passed.append(snap)
+        if getattr(self, "_limit_to_last", None) is not None:
+            passed = passed[-int(self._limit_to_last):]
+        if self._logical_offset:
+            passed = passed[self._logical_offset:]
+        if self._logical_limit is not None:
+            passed = passed[:self._logical_limit]
+        return [_WorkspaceSnapshotProxy(s, collection_name, allowed=True) for s in passed]
+
+    def _generator():
+        nonlocal native_scope
+        if native_scope:
+            try:
+                q = _workspace_v3_add_workspace_filter(self._raw, wid)
+                # 關鍵效能優化只下推 workspace_id。
+                # limit / offset 仍在完成個人資料權限過濾後套用，避免「前 N 筆剛好是別人的 personal」而漏掉後面的可見資料。
+                native_rows = list(q.stream(*args, **kwargs))
+                result = _slice_and_wrap(native_rows, native=True)
+                for row in result:
+                    yield row
+                return
+            except Exception as exc:
+                # Composite index 尚未建立 / SDK 查詢不相容時，不讓正式網站直接掛掉。
+                warn_key = (collection_name, type(exc).__name__, str(exc)[:160])
+                if warn_key not in _WORKSPACE_V3_FALLBACK_WARNED:
+                    _WORKSPACE_V3_FALLBACK_WARNED.add(warn_key)
+                    print(f"⚠️ Workspace v3 原生查詢回退相容模式 [{collection_name}]：{exc}")
+
+        # 相容模式：預設 Workspace 尚有舊資料時仍完整可見。
+        raw_rows = []
+        saw_legacy = False
+        for snap in self._raw.stream(*args, **kwargs):
+            raw_rows.append(snap)
+            if collection_name in _WORKSPACE_SCOPED_COLLECTIONS:
+                try:
+                    data = snap.to_dict() or {}
+                    if not _workspace_safe_str(data.get("workspace_id")):
+                        saw_legacy = True
+                except Exception:
+                    pass
+        # 若這是未加任何 where 的 collection.stream()，而且掃完整 collection 後沒有 legacy，
+        # 同一個 worker 後續就直接進 native mode，不必等待手動 migration flag。
+        if isinstance(self, _WorkspaceCollectionProxy) and collection_name in _WORKSPACE_SCOPED_COLLECTIONS and not saw_legacy:
+            _WORKSPACE_V3_NATIVE_SAFE_COLLECTIONS.add(collection_name)
+        for row in _slice_and_wrap(raw_rows, native=False):
+            yield row
+
+    return _generator()
+
+
+# Monkey-patch class method：既有 db / Blueprint 已持有的 Proxy 物件也立即得到新行為。
+_WorkspaceQueryProxy.stream = _workspace_v3_query_stream
+
+
+# ---------- 更快且可標記完成狀態的舊資料 Migration ----------
+def workspace_migrate_legacy_v3():
+    workspace_id = _workspace_safe_str(request.form.get("workspace_id"))
+    if not _workspace_admin_allowed(workspace_id):
+        abort(403)
+    # 目前架構明確定義：無 workspace_id 的歷史資料屬於最初的厝米 Workspace。
+    # 禁止誤按到新建 Workspace 導致整批舊資料被搬錯群組。
+    if workspace_id != WORKSPACE_DEFAULT_ID:
+        flash(f"舊資料只能先歸入預設工作區「{WORKSPACE_DEFAULT_NAME}」，避免誤搬到新群組。", "warning")
+        return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+    ws = _workspace_doc(workspace_id)
+    if not ws:
+        flash("找不到工作區。", "danger")
+        return redirect(url_for("workspace_admin"))
+
+    counts = {}
+    failures = []
+    now = _workspace_now_iso()
+    for collection_name in sorted(_WORKSPACE_SCOPED_COLLECTIONS):
+        count = 0
+        batch = _WORKSPACE_RAW_DB.batch()
+        batch_count = 0
+        try:
+            for snap in _WORKSPACE_RAW_DB.collection(collection_name).stream():
+                data = snap.to_dict() or {}
+                if _workspace_safe_str(data.get("workspace_id")):
+                    continue
+                batch.set(snap.reference, {
+                    "workspace_id": workspace_id,
+                    "workspace_name": ws.get("name") or workspace_id,
+                    "workspace_migrated_at": now,
+                    "workspace_migrated_by": session.get("user_id"),
+                }, merge=True)
+                batch_count += 1
+                count += 1
+                if batch_count >= 400:
+                    batch.commit()
+                    batch = _WORKSPACE_RAW_DB.batch()
+                    batch_count = 0
+            if batch_count:
+                batch.commit()
+        except Exception as exc:
+            failures.append(f"{collection_name}: {exc}")
+            print("⚠️ Workspace v3 舊資料遷移失敗：", collection_name, exc)
+        counts[collection_name] = count
+
+    total = sum(counts.values())
+    if not failures:
+        state = {
+            "legacy_migration_complete": True,
+            "legacy_workspace_id": workspace_id,
+            "completed_at": now,
+            "completed_by": session.get("user_id"),
+            "scoped_collections": sorted(_WORKSPACE_SCOPED_COLLECTIONS),
+        }
+        try:
+            _WORKSPACE_RAW_DB.collection(WORKSPACE_V3_SCHEMA_COLLECTION).document(WORKSPACE_V3_SCHEMA_DOC).set(state, merge=True)
+            _WORKSPACE_V3_CACHE["migration"] = (_workspace_v3_now_mono() + 3600, state)
+            _WORKSPACE_V3_NATIVE_SAFE_COLLECTIONS.update(_WORKSPACE_SCOPED_COLLECTIONS)
+        except Exception as exc:
+            failures.append(f"migration-state: {exc}")
+
+    _workspace_v3_invalidate_all()
+    if not failures:
+        # invalidate_all 會清 migration cache，因此立即重新寫入 fast-mode state cache。
+        state = {
+            "legacy_migration_complete": True,
+            "legacy_workspace_id": workspace_id,
+            "completed_at": now,
+            "completed_by": session.get("user_id"),
+            "scoped_collections": sorted(_WORKSPACE_SCOPED_COLLECTIONS),
+        }
+        _WORKSPACE_V3_CACHE["migration"] = (_workspace_v3_now_mono() + 3600, state)
+        _WORKSPACE_V3_NATIVE_SAFE_COLLECTIONS.update(_WORKSPACE_SCOPED_COLLECTIONS)
+        flash(f"舊資料標記完成，共 {total} 筆。Workspace Fast Mode 已啟用。", "success")
+    else:
+        flash(f"已處理 {total} 筆，但有 {len(failures)} 個項目失敗；為安全起見尚未啟用完整 Fast Mode。", "warning")
+    return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+
+
+# 用新版 migration view 取代 v2 endpoint，不重複註冊 URL rule。
+try:
+    app.view_functions["workspace_migrate_legacy"] = login_required(workspace_migrate_legacy_v3)
+except Exception as exc:
+    print("⚠️ Workspace v3 migration endpoint 套用失敗：", exc)
+
+
+# 管理資料變更後清掉短期快取，避免新增成員/移除成員後還要等 TTL。
+@app.after_request
+def workspace_v3_cache_invalidate_after_mutation(response):
+    try:
+        if request.method == "POST" and request.endpoint in {
+            "workspace_create", "workspace_member_save", "workspace_member_remove",
+            "workspace_line_link_save", "workspace_line_link_delete", "workspace_migrate_legacy",
+        }:
+            _workspace_v3_invalidate_all()
+    except Exception:
+        pass
+    return response
+
+
+# 外部 Blueprint 取得的 helper 也更新成 v3 快取版。
+try:
+    app.extensions.setdefault("workspace_helpers", {})
+    app.extensions["workspace_helpers"].update({
+        "current_workspace_id": current_workspace_id,
+        "current_workspace_name": current_workspace_name,
+        "user_can": _workspace_user_can,
+        "membership": _workspace_membership,
+        "memberships_for_user": _workspace_memberships_for_user,
+        "default_workspace_id": WORKSPACE_DEFAULT_ID,
+        "performance_version": "v3",
+    })
+except Exception:
+    pass
+
+print(f"✅ Team M.E Workspace Performance v3 已啟用：權限快取 {WORKSPACE_V3_CACHE_SECONDS}s + Firestore 原生 Workspace Query Fast Mode。")
+# =============================================================================
+# Team M.E Workspace Performance Patch v3 End
+# =============================================================================
 
 
 if __name__ == "__main__":
