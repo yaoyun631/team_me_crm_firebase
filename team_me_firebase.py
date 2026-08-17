@@ -41118,6 +41118,1742 @@ except Exception as exc:
 # Team M.E v39 End
 # =============================================================================
 
+
+# =============================================================================
+# Team M.E Workspace 多團隊 / 多租戶隔離 Patch v20260817_WORKSPACE
+#
+# 目的：
+# 1. 一個網站帳號可同時加入多個 Workspace（多對多）。
+# 2. 客需 / 委託 / 開發 / 待辦 / 行事曆 / 追蹤 / 屋主回報 / 部落格資料先依 Workspace 隔離。
+# 3. Workspace 內仍保留「群組共享(public) / 僅自己(personal)」。
+# 4. LINE 群組固定綁定一個 Workspace；LINE 私訊可 #目前群組 / #切換群組。
+# 5. 公開工具（實價登錄、properties 物件庫、地址查詢等）不做 Workspace 隔離。
+# 6. 舊資料若沒有 workspace_id，只在預設 Workspace（team_me）可見，避免升級後資料消失。
+#
+# 注意：這個 Patch 刻意放在整支主程式最後、app.run 之前，讓它成為最終權限層。
+# =============================================================================
+
+from contextvars import ContextVar
+from contextlib import contextmanager
+from urllib.parse import urlencode
+from flask import has_request_context, abort
+import html as _workspace_html
+
+WORKSPACE_DEFAULT_ID = os.environ.get("WORKSPACE_DEFAULT_ID", "team_me").strip() or "team_me"
+WORKSPACE_DEFAULT_NAME = os.environ.get("WORKSPACE_DEFAULT_NAME", "厝米 Team M.E").strip() or "厝米 Team M.E"
+WORKSPACE_COLLECTION = os.environ.get("WORKSPACE_COLLECTION", "workspaces")
+WORKSPACE_MEMBER_COLLECTION = os.environ.get("WORKSPACE_MEMBER_COLLECTION", "workspace_members")
+WORKSPACE_LINE_LINK_COLLECTION = os.environ.get("WORKSPACE_LINE_LINK_COLLECTION", "workspace_line_links")
+WORKSPACE_LINE_STATE_COLLECTION = os.environ.get("WORKSPACE_LINE_STATE_COLLECTION", "workspace_line_states")
+
+WORKSPACE_MODULE_OPTIONS = [
+    ("buyer", "客需"),
+    ("seller", "委託"),
+    ("development", "開發"),
+    ("blog", "部落格"),
+    ("todo", "待辦事項"),
+    ("calendar", "行事曆"),
+]
+WORKSPACE_ALL_MODULES = [x[0] for x in WORKSPACE_MODULE_OPTIONS]
+WORKSPACE_ROLE_OPTIONS = [
+    ("owner", "擁有者"),
+    ("admin", "管理員"),
+    ("member", "成員"),
+]
+
+# public / personal 欄位名稱維持不變，避免既有 templates / LINE / Firestore 舊資料全部重做；
+# 但使用者看到的文字改成「群組共享 / 僅自己」。
+CRM_VISIBILITY_OPTIONS = [("public", "群組共享"), ("personal", "僅自己")]
+
+
+def crm_record_visibility_text(data: dict):
+    return "僅自己" if (data or {}).get("visibility") == "personal" else "群組共享"
+
+
+# 保留原始 Firestore Client，Workspace 管理資料永遠走原始 client，避免自己把自己過濾掉。
+_WORKSPACE_RAW_DB = db
+_WORKSPACE_CONTEXT_ID = ContextVar("teamme_workspace_id", default=None)
+_WORKSPACE_CONTEXT_FORCE = ContextVar("teamme_workspace_force", default=False)
+_WORKSPACE_CONTEXT_ACTOR_USER_ID = ContextVar("teamme_workspace_actor_user_id", default="")
+_WORKSPACE_CONTEXT_SOURCE_KIND = ContextVar("teamme_workspace_source_kind", default="")
+_WORKSPACE_BYPASS = ContextVar("teamme_workspace_bypass", default=False)
+
+
+def _workspace_now_iso():
+    try:
+        return now_taipei().isoformat()
+    except Exception:
+        return datetime.now(TAIPEI_TZ).isoformat()
+
+
+def _workspace_safe_str(value):
+    return str(value or "").strip()
+
+
+def _workspace_member_doc_id(workspace_id: str, user_id: str) -> str:
+    return f"{_workspace_safe_str(workspace_id)}__{_workspace_safe_str(user_id)}"
+
+
+def _workspace_raw_user(user_id: str):
+    user_id = _workspace_safe_str(user_id)
+    if not user_id:
+        return {}
+    try:
+        snap = _WORKSPACE_RAW_DB.collection("users").document(user_id).get()
+        return (snap.to_dict() or {}) if snap.exists else {}
+    except Exception:
+        return {}
+
+
+def _workspace_is_super_admin(user_id: str = "") -> bool:
+    user_id = _workspace_safe_str(user_id or (session.get("user_id") if has_request_context() else ""))
+    if not user_id:
+        return False
+    user = _workspace_raw_user(user_id)
+    return bool(user.get("is_super_admin") or user.get("super_admin") or user.get("system_admin"))
+
+
+def _workspace_doc(workspace_id: str):
+    workspace_id = _workspace_safe_str(workspace_id)
+    if not workspace_id:
+        return {}
+    try:
+        snap = _WORKSPACE_RAW_DB.collection(WORKSPACE_COLLECTION).document(workspace_id).get()
+        if not snap.exists:
+            return {}
+        data = snap.to_dict() or {}
+        data["id"] = snap.id
+        return data
+    except Exception:
+        return {}
+
+
+def _workspace_list_all(active_only=True):
+    rows = []
+    try:
+        for snap in _WORKSPACE_RAW_DB.collection(WORKSPACE_COLLECTION).stream():
+            data = snap.to_dict() or {}
+            data["id"] = snap.id
+            if active_only and data.get("active", True) is False:
+                continue
+            rows.append(data)
+    except Exception as exc:
+        print("⚠️ Workspace 清單讀取失敗：", exc)
+    rows.sort(key=lambda x: ((x.get("name") or ""), x.get("created_at") or ""))
+    return rows
+
+
+def _workspace_memberships_for_user(user_id: str, active_only=True):
+    user_id = _workspace_safe_str(user_id)
+    if not user_id:
+        return []
+    rows = []
+    try:
+        docs = _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).where("user_id", "==", user_id).stream()
+        for snap in docs:
+            data = snap.to_dict() or {}
+            data["id"] = snap.id
+            wid = _workspace_safe_str(data.get("workspace_id"))
+            if not wid:
+                continue
+            ws = _workspace_doc(wid)
+            if not ws:
+                continue
+            if active_only and (data.get("active", True) is False or ws.get("active", True) is False):
+                continue
+            data["workspace"] = ws
+            data["workspace_name"] = ws.get("name") or wid
+            rows.append(data)
+    except Exception as exc:
+        print("⚠️ Workspace 成員關係讀取失敗：", exc)
+    rows.sort(key=lambda x: (x.get("workspace_name") or "", x.get("workspace_id") or ""))
+    return rows
+
+
+def _workspace_membership(workspace_id: str, user_id: str):
+    workspace_id = _workspace_safe_str(workspace_id)
+    user_id = _workspace_safe_str(user_id)
+    if not workspace_id or not user_id:
+        return {}
+    try:
+        snap = _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).document(
+            _workspace_member_doc_id(workspace_id, user_id)
+        ).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            data["id"] = snap.id
+            return data
+    except Exception:
+        pass
+    # 相容手動建立、文件 id 非固定格式的資料。
+    try:
+        docs = _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).where("workspace_id", "==", workspace_id).where("user_id", "==", user_id).limit(1).stream()
+        for snap in docs:
+            data = snap.to_dict() or {}
+            data["id"] = snap.id
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _workspace_bootstrap_for_first_user(user_id: str):
+    """第一次升級：若系統完全沒有 Workspace 成員，將第一位登入者設為厝米 owner + super admin。"""
+    user_id = _workspace_safe_str(user_id)
+    if not user_id:
+        return
+    try:
+        has_member = any(True for _ in _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).limit(1).stream())
+    except Exception:
+        has_member = False
+    if has_member:
+        return
+
+    now = _workspace_now_iso()
+    try:
+        _WORKSPACE_RAW_DB.collection(WORKSPACE_COLLECTION).document(WORKSPACE_DEFAULT_ID).set({
+            "name": WORKSPACE_DEFAULT_NAME,
+            "active": True,
+            "created_at": now,
+            "created_by_id": user_id,
+            "updated_at": now,
+        }, merge=True)
+        _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).document(
+            _workspace_member_doc_id(WORKSPACE_DEFAULT_ID, user_id)
+        ).set({
+            "workspace_id": WORKSPACE_DEFAULT_ID,
+            "user_id": user_id,
+            "role": "owner",
+            "modules": WORKSPACE_ALL_MODULES,
+            "active": True,
+            "created_at": now,
+            "created_by_id": user_id,
+            "updated_at": now,
+        }, merge=True)
+        _WORKSPACE_RAW_DB.collection("users").document(user_id).set({
+            "is_super_admin": True,
+            "updated_at": now,
+        }, merge=True)
+        print(f"✅ Workspace 初始建立完成：{WORKSPACE_DEFAULT_NAME} / owner={user_id}")
+    except Exception as exc:
+        print("⚠️ Workspace 初始建立失敗：", exc)
+
+
+def _workspace_ensure_session():
+    if not has_request_context():
+        return
+    user_id = _workspace_safe_str(session.get("user_id"))
+    if not user_id:
+        return
+    _workspace_bootstrap_for_first_user(user_id)
+    memberships = _workspace_memberships_for_user(user_id)
+    allowed = {x.get("workspace_id") for x in memberships if x.get("workspace_id")}
+    current = _workspace_safe_str(session.get("workspace_id"))
+    if current not in allowed:
+        if memberships:
+            current = memberships[0].get("workspace_id") or ""
+            session["workspace_id"] = current
+            session["workspace_name"] = memberships[0].get("workspace_name") or current
+            session["workspace_role"] = memberships[0].get("role") or "member"
+        else:
+            session.pop("workspace_id", None)
+            session.pop("workspace_name", None)
+            session.pop("workspace_role", None)
+    elif current:
+        mem = next((x for x in memberships if x.get("workspace_id") == current), {})
+        session["workspace_name"] = mem.get("workspace_name") or current
+        session["workspace_role"] = mem.get("role") or "member"
+
+
+def current_workspace_id():
+    ctx = _WORKSPACE_CONTEXT_ID.get()
+    if ctx is not None:
+        return _workspace_safe_str(ctx)
+    if has_request_context():
+        return _workspace_safe_str(session.get("workspace_id"))
+    return ""
+
+
+def current_workspace_name():
+    wid = current_workspace_id()
+    if has_request_context() and _workspace_safe_str(session.get("workspace_id")) == wid:
+        name = _workspace_safe_str(session.get("workspace_name"))
+        if name:
+            return name
+    ws = _workspace_doc(wid)
+    return ws.get("name") or wid or "未選擇工作區"
+
+
+def _workspace_scope_state():
+    """回傳 (workspace_id, 是否強制套用 scope)。系統背景工作沒有登入/LINE context 時不強制。"""
+    if _WORKSPACE_BYPASS.get():
+        return "", False
+    if _WORKSPACE_CONTEXT_FORCE.get():
+        return current_workspace_id(), True
+    if has_request_context() and session.get("user_id"):
+        return current_workspace_id(), True
+    return "", False
+
+
+def _workspace_actor_user_id():
+    ctx_uid = _workspace_safe_str(_WORKSPACE_CONTEXT_ACTOR_USER_ID.get())
+    if ctx_uid:
+        return ctx_uid
+    if has_request_context():
+        return _workspace_safe_str(session.get("user_id"))
+    return ""
+
+
+@contextmanager
+def workspace_scope_context(workspace_id: str, actor_user_id: str = "", source_kind: str = ""):
+    tok_id = _WORKSPACE_CONTEXT_ID.set(_workspace_safe_str(workspace_id))
+    tok_force = _WORKSPACE_CONTEXT_FORCE.set(True)
+    tok_actor = _WORKSPACE_CONTEXT_ACTOR_USER_ID.set(_workspace_safe_str(actor_user_id))
+    tok_kind = _WORKSPACE_CONTEXT_SOURCE_KIND.set(_workspace_safe_str(source_kind))
+    try:
+        yield
+    finally:
+        _WORKSPACE_CONTEXT_ID.reset(tok_id)
+        _WORKSPACE_CONTEXT_FORCE.reset(tok_force)
+        _WORKSPACE_CONTEXT_ACTOR_USER_ID.reset(tok_actor)
+        _WORKSPACE_CONTEXT_SOURCE_KIND.reset(tok_kind)
+
+
+@contextmanager
+def workspace_scope_bypass():
+    token = _WORKSPACE_BYPASS.set(True)
+    try:
+        yield
+    finally:
+        _WORKSPACE_BYPASS.reset(token)
+
+
+def _workspace_user_can(workspace_id: str, user_id: str, module: str = "") -> bool:
+    workspace_id = _workspace_safe_str(workspace_id)
+    user_id = _workspace_safe_str(user_id)
+    if not workspace_id or not user_id:
+        return False
+    mem = _workspace_membership(workspace_id, user_id)
+    if not mem or mem.get("active", True) is False:
+        return False
+    role = _workspace_safe_str(mem.get("role") or "member")
+    if role in ("owner", "admin"):
+        return True
+    if not module:
+        return True
+    modules = set(mem.get("modules") or [])
+    return "all" in modules or module in modules
+
+
+def _workspace_admin_allowed(workspace_id: str = "") -> bool:
+    if not has_request_context():
+        return False
+    user_id = _workspace_safe_str(session.get("user_id"))
+    if not user_id:
+        return False
+    if _workspace_is_super_admin(user_id):
+        return True
+    workspace_id = _workspace_safe_str(workspace_id or session.get("workspace_id"))
+    mem = _workspace_membership(workspace_id, user_id)
+    return bool(mem and mem.get("active", True) is not False and (mem.get("role") in ("owner", "admin")))
+
+
+# 哪些 Firestore collection 需要依 Workspace 隔離。
+# properties / 實價任務 / 公開工具刻意不放進來。
+_WORKSPACE_COLLECTION_MODULES = {
+    "buyers": "buyer",
+    "buyer_followups": "buyer",
+    "sellers": "seller",
+    "seller_followups": "seller",
+    "developments": "development",
+    "development_followups": "development",
+    "development_routes": "development",
+    _workspace_safe_str(globals().get("LINE_TODO_COLLECTION", "line_todos")) or "line_todos": "todo",
+    _workspace_safe_str(globals().get("CALENDAR_EVENT_COLLECTION", "calendar_events")) or "calendar_events": "calendar",
+    _workspace_safe_str(globals().get("OWNER_REPORT_COLLECTION", "seller_owner_reports")) or "seller_owner_reports": "seller",
+    _workspace_safe_str(globals().get("OWNER_REPORT_DRAFT_COLLECTION", "seller_owner_report_drafts")) or "seller_owner_report_drafts": "seller",
+    # LINE 關聯記錄也帶 workspace，避免引用回覆跨團隊。
+    "line_logs": "",
+    "line_message_links": "",
+}
+
+# 部落格實際 collection 名稱在 blog.py；先支援常見名稱，也可用環境變數補上。
+for _blog_collection_name in (
+    "blogs", "blog_posts", "posts", "articles",
+    *[x.strip() for x in os.environ.get("WORKSPACE_BLOG_COLLECTIONS", "").split(",") if x.strip()],
+):
+    if _blog_collection_name:
+        _WORKSPACE_COLLECTION_MODULES[_blog_collection_name] = "blog"
+
+_WORKSPACE_SCOPED_COLLECTIONS = set(_WORKSPACE_COLLECTION_MODULES.keys())
+_WORKSPACE_PRIMARY_VISIBILITY_COLLECTIONS = {
+    "buyers", "sellers", "developments",
+    _workspace_safe_str(globals().get("LINE_TODO_COLLECTION", "line_todos")) or "line_todos",
+    _workspace_safe_str(globals().get("CALENDAR_EVENT_COLLECTION", "calendar_events")) or "calendar_events",
+}
+
+
+def _workspace_doc_workspace_allowed(data: dict) -> bool:
+    wid, active = _workspace_scope_state()
+    if not active:
+        return True
+    if not wid:
+        return False
+    data = data or {}
+    doc_wid = _workspace_safe_str(data.get("workspace_id"))
+    # 舊資料沒有 workspace_id：只視為預設厝米 Workspace 的資料。
+    if not doc_wid:
+        return wid == WORKSPACE_DEFAULT_ID
+    return doc_wid == wid
+
+
+def _workspace_collection_module_allowed(collection_name: str) -> bool:
+    wid, active = _workspace_scope_state()
+    if not active:
+        return True
+    if not wid:
+        return False
+    module = _WORKSPACE_COLLECTION_MODULES.get(collection_name) or ""
+    actor = _workspace_actor_user_id()
+    source_kind = _workspace_safe_str(_WORKSPACE_CONTEXT_SOURCE_KIND.get())
+    # LINE 群組沿用既有 LINE 群組權限矩陣，不要求群裡每位發話者都先綁網站帳號。
+    if source_kind in ("group", "room"):
+        return True
+    if not actor:
+        # 系統型處理 / 舊 LINE 相容：workspace 已確認時允許，再交給既有權限矩陣判斷。
+        return True
+    return _workspace_user_can(wid, actor, module)
+
+
+def _workspace_personal_owned_by_actor(data: dict) -> bool:
+    data = data or {}
+    actor = _workspace_actor_user_id()
+    if not actor:
+        return False
+    owner_uid = _workspace_safe_str(data.get("owner_user_id"))
+    if owner_uid:
+        return owner_uid == actor
+    # 舊資料 fallback：用 LINE ID 判斷，不再作為新資料的主要所有權依據。
+    owner_line = _workspace_safe_str(
+        data.get("owner_line_user_id")
+        or data.get("line_user_id")
+        or (data.get("line_target_id") if str(data.get("line_target_id") or "").startswith("U") else "")
+    )
+    if not owner_line:
+        return False
+    try:
+        user = _workspace_raw_user(actor)
+        actor_line = _workspace_safe_str(user.get("line_user_id") or user.get("line_personal_user_id"))
+        return bool(actor_line and actor_line == owner_line)
+    except Exception:
+        return False
+
+
+def _workspace_request_scope_filter_allows(collection_name: str, data: dict) -> bool:
+    """列表頁額外支援 data_scope=all/shared/mine；只套用主資料，不套追蹤紀錄。"""
+    if collection_name not in _WORKSPACE_PRIMARY_VISIBILITY_COLLECTIONS:
+        return True
+    if not has_request_context() or not session.get("user_id"):
+        return True
+    scope_view = _workspace_safe_str(request.args.get("data_scope") or "all")
+    if scope_view not in ("all", "shared", "mine"):
+        scope_view = "all"
+    vis = _workspace_safe_str((data or {}).get("visibility") or "public")
+    if vis not in ("public", "personal"):
+        vis = "public"
+    if scope_view == "shared":
+        return vis == "public"
+    if scope_view == "mine":
+        return vis == "personal" and _workspace_personal_owned_by_actor(data)
+    return True
+
+
+def _workspace_snapshot_allowed(collection_name: str, snapshot) -> bool:
+    if collection_name not in _WORKSPACE_SCOPED_COLLECTIONS:
+        return True
+    if not _workspace_collection_module_allowed(collection_name):
+        return False
+    try:
+        if not snapshot.exists:
+            return True
+        data = snapshot.to_dict() or {}
+    except Exception:
+        return False
+    if not _workspace_doc_workspace_allowed(data):
+        return False
+
+    # Web 後台的「僅自己」是真正的私有資料：所有讀取路徑（列表、下載、AI、直接查詢）都先擋。
+    # LINE 則交給既有 LINE 權限矩陣 + 下方 Workspace 版 permission_config_can_view 判斷。
+    source_kind = _workspace_safe_str(_WORKSPACE_CONTEXT_SOURCE_KIND.get())
+    if collection_name in _WORKSPACE_PRIMARY_VISIBILITY_COLLECTIONS and source_kind not in ("group", "room", "user"):
+        if has_request_context() and session.get("user_id"):
+            vis = _workspace_safe_str(data.get("visibility") or "public")
+            if vis == "personal" and not _workspace_personal_owned_by_actor(data):
+                return False
+
+    return _workspace_request_scope_filter_allows(collection_name, data)
+
+
+def _workspace_existing_record_write_allowed(collection_name: str, existing_data: dict) -> bool:
+    existing_data = existing_data or {}
+    if not existing_data:
+        return True
+    if collection_name not in _WORKSPACE_PRIMARY_VISIBILITY_COLLECTIONS:
+        return True
+    if _workspace_safe_str(existing_data.get("visibility") or "public") != "personal":
+        return True
+    source_kind = _workspace_safe_str(_WORKSPACE_CONTEXT_SOURCE_KIND.get())
+    # LINE 群組永遠不能修改個人資料。
+    if source_kind in ("group", "room"):
+        return False
+    actor = _workspace_actor_user_id()
+    if actor:
+        return _workspace_personal_owned_by_actor(existing_data)
+    # 無使用者 context 的系統背景工作保留相容性。
+    return True
+
+
+def _workspace_prepare_write(collection_name: str, data: dict, existing_data=None):
+    data = dict(data or {})
+    wid, active = _workspace_scope_state()
+    if collection_name not in _WORKSPACE_SCOPED_COLLECTIONS or not active:
+        return data
+    if not wid:
+        raise PermissionError("目前尚未選擇 Workspace，無法寫入團隊資料。")
+    if not _workspace_collection_module_allowed(collection_name):
+        raise PermissionError("你在目前 Workspace 沒有此功能的操作權限。")
+
+    existing_data = existing_data or {}
+    existing_wid = _workspace_safe_str(existing_data.get("workspace_id"))
+    requested_wid = _workspace_safe_str(data.get("workspace_id"))
+    if existing_wid and existing_wid != wid:
+        raise PermissionError("這筆資料屬於其他 Workspace。")
+    if requested_wid and requested_wid != wid:
+        raise PermissionError("不可將資料寫入目前 Workspace 以外的工作區。")
+
+    data["workspace_id"] = wid
+    if not data.get("workspace_name"):
+        data["workspace_name"] = current_workspace_name()
+
+    # personal 的真正權限所有者改以網站 user_id 為準；LINE ID 只是通知對象。
+    visibility = _workspace_safe_str(data.get("visibility") or existing_data.get("visibility"))
+    if visibility == "personal" and not (data.get("owner_user_id") or existing_data.get("owner_user_id")):
+        actor = _workspace_actor_user_id()
+        if actor:
+            data["owner_user_id"] = actor
+            user = _workspace_raw_user(actor)
+            data.setdefault("owner_user_name", user.get("name") or user.get("email") or actor)
+    return data
+
+
+class _WorkspaceSnapshotProxy:
+    def __init__(self, raw_snapshot, collection_name: str, allowed=True):
+        self._raw = raw_snapshot
+        self._collection_name = collection_name
+        self._allowed = bool(allowed)
+
+    @property
+    def exists(self):
+        try:
+            return bool(self._allowed and self._raw.exists)
+        except Exception:
+            return False
+
+    @property
+    def id(self):
+        return self._raw.id
+
+    @property
+    def reference(self):
+        return _WorkspaceDocumentProxy(self._raw.reference, self._collection_name)
+
+    def to_dict(self):
+        if not self.exists:
+            return None
+        return self._raw.to_dict()
+
+    def get(self, *args, **kwargs):
+        if not self.exists:
+            return None
+        return self._raw.get(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+class _WorkspaceCountValue:
+    def __init__(self, value):
+        self.value = int(value)
+
+
+class _WorkspaceCountProxy:
+    def __init__(self, query_proxy):
+        self._query = query_proxy
+
+    def get(self, *args, **kwargs):
+        count = sum(1 for _ in self._query.stream())
+        return [(_WorkspaceCountValue(count),)]
+
+
+class _WorkspaceQueryProxy:
+    def __init__(self, raw_query, collection_name: str, logical_limit=None, logical_offset=0):
+        self._raw = raw_query
+        self._collection_name = collection_name
+        self._logical_limit = logical_limit
+        self._logical_offset = int(logical_offset or 0)
+
+    def _clone(self, raw_query=None, logical_limit=None, logical_offset=None):
+        return _WorkspaceQueryProxy(
+            raw_query if raw_query is not None else self._raw,
+            self._collection_name,
+            self._logical_limit if logical_limit is None else logical_limit,
+            self._logical_offset if logical_offset is None else logical_offset,
+        )
+
+    def where(self, *args, **kwargs):
+        return self._clone(raw_query=self._raw.where(*args, **kwargs))
+
+    def order_by(self, *args, **kwargs):
+        return self._clone(raw_query=self._raw.order_by(*args, **kwargs))
+
+    def select(self, *args, **kwargs):
+        return self._clone(raw_query=self._raw.select(*args, **kwargs))
+
+    def start_at(self, *args, **kwargs):
+        return self._clone(raw_query=self._raw.start_at(*args, **kwargs))
+
+    def start_after(self, *args, **kwargs):
+        return self._clone(raw_query=self._raw.start_after(*args, **kwargs))
+
+    def end_at(self, *args, **kwargs):
+        return self._clone(raw_query=self._raw.end_at(*args, **kwargs))
+
+    def end_before(self, *args, **kwargs):
+        return self._clone(raw_query=self._raw.end_before(*args, **kwargs))
+
+    def limit(self, count):
+        # 不把 limit 提前送進 Firestore，否則同電話跨 Workspace 時可能先拿到別組資料後被過濾成 0 筆。
+        return self._clone(logical_limit=max(0, int(count)))
+
+    def limit_to_last(self, count):
+        # 目前系統很少用；為安全起見以 workspace 過濾後的最後 N 筆處理。
+        clone = self._clone(logical_limit=None)
+        clone._limit_to_last = max(0, int(count))
+        return clone
+
+    def offset(self, count):
+        return self._clone(logical_offset=max(0, int(count)))
+
+    def count(self, *args, **kwargs):
+        return _WorkspaceCountProxy(self)
+
+    def stream(self, *args, **kwargs):
+        if self._collection_name in _WORKSPACE_SCOPED_COLLECTIONS and not _workspace_collection_module_allowed(self._collection_name):
+            return iter(())
+
+        def _generator():
+            passed = []
+            for snap in self._raw.stream(*args, **kwargs):
+                if not _workspace_snapshot_allowed(self._collection_name, snap):
+                    continue
+                passed.append(snap)
+            if getattr(self, "_limit_to_last", None) is not None:
+                passed = passed[-int(self._limit_to_last):]
+            if self._logical_offset:
+                passed = passed[self._logical_offset:]
+            if self._logical_limit is not None:
+                passed = passed[:self._logical_limit]
+            for snap in passed:
+                yield _WorkspaceSnapshotProxy(snap, self._collection_name, allowed=True)
+        return _generator()
+
+    def get(self, *args, **kwargs):
+        return list(self.stream(*args, **kwargs))
+
+    def __iter__(self):
+        return iter(self.stream())
+
+    def __getattr__(self, name):
+        attr = getattr(self._raw, name)
+        if callable(attr):
+            def _wrapped(*args, **kwargs):
+                result = attr(*args, **kwargs)
+                # Firestore Query / CollectionReference 類別名稱跨版本不同，採 duck-typing 判斷。
+                if hasattr(result, "stream") and hasattr(result, "where"):
+                    return self._clone(raw_query=result)
+                return result
+            return _wrapped
+        return attr
+
+
+class _WorkspaceDocumentProxy:
+    def __init__(self, raw_ref, collection_name: str):
+        self._raw = raw_ref
+        self._collection_name = collection_name
+
+    @property
+    def id(self):
+        return self._raw.id
+
+    @property
+    def path(self):
+        return self._raw.path
+
+    @property
+    def parent(self):
+        try:
+            return _WorkspaceCollectionProxy(self._raw.parent, self._collection_name)
+        except Exception:
+            return self._raw.parent
+
+    def get(self, *args, **kwargs):
+        snap = self._raw.get(*args, **kwargs)
+        allowed = _workspace_snapshot_allowed(self._collection_name, snap)
+        return _WorkspaceSnapshotProxy(snap, self._collection_name, allowed=allowed)
+
+    def set(self, document_data, merge=False, *args, **kwargs):
+        existing = {}
+        try:
+            old = self._raw.get()
+            if old.exists:
+                existing = old.to_dict() or {}
+                if not _workspace_doc_workspace_allowed(existing):
+                    raise PermissionError("這筆資料屬於其他 Workspace。")
+                if not _workspace_existing_record_write_allowed(self._collection_name, existing):
+                    raise PermissionError("這筆資料是其他使用者的個人資料。")
+        except PermissionError:
+            raise
+        except Exception:
+            existing = {}
+        payload = _workspace_prepare_write(self._collection_name, document_data, existing_data=existing)
+        return self._raw.set(payload, merge=merge, *args, **kwargs)
+
+    def update(self, field_updates, *args, **kwargs):
+        existing = {}
+        try:
+            old = self._raw.get()
+            if old.exists:
+                existing = old.to_dict() or {}
+                if not _workspace_doc_workspace_allowed(existing):
+                    raise PermissionError("這筆資料屬於其他 Workspace。")
+                if not _workspace_existing_record_write_allowed(self._collection_name, existing):
+                    raise PermissionError("這筆資料是其他使用者的個人資料。")
+        except PermissionError:
+            raise
+        payload = _workspace_prepare_write(self._collection_name, field_updates, existing_data=existing)
+        return self._raw.update(payload, *args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        try:
+            old = self._raw.get()
+            if old.exists:
+                existing = old.to_dict() or {}
+                if not _workspace_doc_workspace_allowed(existing):
+                    raise PermissionError("這筆資料屬於其他 Workspace。")
+                if not _workspace_existing_record_write_allowed(self._collection_name, existing):
+                    raise PermissionError("這筆資料是其他使用者的個人資料。")
+        except PermissionError:
+            raise
+        if self._collection_name in _WORKSPACE_SCOPED_COLLECTIONS and not _workspace_collection_module_allowed(self._collection_name):
+            raise PermissionError("你在目前 Workspace 沒有此功能的操作權限。")
+        return self._raw.delete(*args, **kwargs)
+
+    def collection(self, collection_id):
+        # 子集合目前 CRM 沒有使用 Workspace scope；保持 Firebase 原生行為。
+        return self._raw.collection(collection_id)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+class _WorkspaceCollectionProxy(_WorkspaceQueryProxy):
+    def __init__(self, raw_collection, collection_name: str):
+        super().__init__(raw_collection, collection_name)
+        self._raw_collection = raw_collection
+
+    @property
+    def id(self):
+        return self._raw_collection.id
+
+    def document(self, document_id=None):
+        if document_id is None:
+            raw_ref = self._raw_collection.document()
+        else:
+            raw_ref = self._raw_collection.document(document_id)
+        return _WorkspaceDocumentProxy(raw_ref, self._collection_name)
+
+    def add(self, document_data, document_id=None, *args, **kwargs):
+        payload = _workspace_prepare_write(self._collection_name, document_data)
+        if document_id is not None:
+            ref = self.document(document_id)
+            ref.set(payload)
+            return None, ref
+        # google-cloud-firestore add() 回傳 (update_time, DocumentReference)
+        result = self._raw_collection.add(payload, *args, **kwargs)
+        try:
+            update_time, raw_ref = result
+            return update_time, _WorkspaceDocumentProxy(raw_ref, self._collection_name)
+        except Exception:
+            return result
+
+
+class _WorkspaceFirestoreClientProxy:
+    def __init__(self, raw_client):
+        self._raw = raw_client
+
+    def collection(self, collection_id, *args, **kwargs):
+        raw_collection = self._raw.collection(collection_id, *args, **kwargs)
+        if collection_id in _WORKSPACE_SCOPED_COLLECTIONS:
+            return _WorkspaceCollectionProxy(raw_collection, collection_id)
+        return raw_collection
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+# 從這一行開始，既有函式執行時取得的 global db 會自動套 Workspace scope。
+db = _WorkspaceFirestoreClientProxy(_WORKSPACE_RAW_DB)
+
+# 讓另外載入的 Blueprint（例如 blog/routes.py）在「請求執行時」取得同一個
+# Workspace-aware Firestore client。Blueprint 本身會在本段程式之前 import，
+# 因此不能在 blog 模組 import 時直接引用這裡的 db；改由 Flask app.extensions 延遲取得。
+try:
+    app.extensions["workspace_firestore_db"] = db
+    app.extensions["workspace_firestore_raw_db"] = _WORKSPACE_RAW_DB
+    app.extensions["workspace_helpers"] = {
+        "current_workspace_id": current_workspace_id,
+        "current_workspace_name": current_workspace_name,
+        "user_can": _workspace_user_can,
+        "membership": _workspace_membership,
+        "default_workspace_id": WORKSPACE_DEFAULT_ID,
+    }
+    print("✅ Workspace Firestore client 已提供給外部 Blueprint")
+except Exception as exc:
+    print("⚠️ Workspace Firestore client 提供給 Blueprint 失敗：", exc)
+
+
+# ---------- 後台公開 / 個人：改成 Workspace 內「群組共享 / 僅自己」 ----------
+try:
+    _backend_normalize_record_visibility_before_workspace = _backend_normalize_record_visibility
+except Exception:
+    _backend_normalize_record_visibility_before_workspace = None
+
+
+def _backend_normalize_record_visibility(data: dict):
+    if _backend_normalize_record_visibility_before_workspace:
+        try:
+            data = _backend_normalize_record_visibility_before_workspace(data)
+        except Exception:
+            data = dict(data or {})
+    else:
+        data = dict(data or {})
+    vis = _workspace_safe_str(data.get("visibility"))
+    if vis not in ("public", "personal"):
+        vis = "public"
+    data["visibility"] = vis
+    return data
+
+
+def backend_can_view_personal_record(data: dict) -> bool:
+    data = _backend_normalize_record_visibility(data)
+    if not _workspace_doc_workspace_allowed(data):
+        return False
+    vis = data.get("visibility") or "public"
+    if vis != "personal":
+        return True
+    # 新架構：網站 owner_user_id 是唯一主要判斷；LINE ID 只做舊資料 fallback。
+    return _workspace_personal_owned_by_actor(data)
+
+
+def _backend_visible_items(items):
+    rows = []
+    for item in (items or []):
+        if not backend_can_view_personal_record(item):
+            continue
+        # data_scope=shared / mine 讓列表真的可以只看共享或只看自己的個人資料。
+        if has_request_context():
+            scope_view = _workspace_safe_str(request.args.get("data_scope") or "all")
+            vis = _workspace_safe_str((item or {}).get("visibility") or "public")
+            if scope_view == "shared" and vis != "public":
+                continue
+            if scope_view == "mine" and not (vis == "personal" and _workspace_personal_owned_by_actor(item)):
+                continue
+        rows.append(item)
+    return rows
+
+
+def _backend_can_view_doc(collection_name: str, doc_id: str) -> bool:
+    if not doc_id:
+        return False
+    try:
+        snap = db.collection(collection_name).document(doc_id).get()
+        if not snap.exists:
+            return False
+        return backend_can_view_personal_record(snap.to_dict() or {})
+    except Exception as exc:
+        print("⚠️ Workspace 後台權限檢查失敗：", collection_name, doc_id, exc)
+        return False
+
+
+# 編輯共享資料改成「僅自己」時，所有權直接轉給目前操作的網站帳號；
+# 避免共享資料早期留下的 owner_user_id 讓畫面看似個人、實際卻屬於原建立者。
+try:
+    _crm_record_visibility_payload_before_workspace = crm_record_visibility_payload_from_form
+except Exception:
+    _crm_record_visibility_payload_before_workspace = None
+
+
+def crm_record_visibility_payload_from_form(form, existing=None):
+    existing = dict(existing or {})
+    if _crm_record_visibility_payload_before_workspace:
+        payload = dict(_crm_record_visibility_payload_before_workspace(form, existing) or {})
+    else:
+        visibility = _workspace_safe_str(form.get("visibility") or existing.get("visibility") or "public")
+        payload = {"visibility": visibility if visibility in ("public", "personal") else "public"}
+    visibility = _workspace_safe_str(payload.get("visibility") or "public")
+    old_visibility = _workspace_safe_str(existing.get("visibility") or "public")
+    if visibility == "personal":
+        current_uid = _workspace_safe_str(session.get("user_id")) if has_request_context() else _workspace_actor_user_id()
+        if current_uid and (old_visibility != "personal" or not _workspace_safe_str(existing.get("owner_user_id"))):
+            user = _workspace_raw_user(current_uid)
+            payload["owner_user_id"] = current_uid
+            payload["owner_user_name"] = user.get("name") or user.get("email") or current_uid
+    return payload
+
+
+# ---------- Workspace / LINE 對應 ----------
+def _workspace_line_kind_target(event):
+    try:
+        return line_event_source_kind_and_id(event)
+    except Exception:
+        source = (event or {}).get("source") or {}
+        if source.get("groupId"):
+            return "group", source.get("groupId")
+        if source.get("roomId"):
+            return "room", source.get("roomId")
+        if source.get("userId"):
+            return "user", source.get("userId")
+        return "unknown", ""
+
+
+def _workspace_user_id_from_line(line_user_id: str):
+    line_user_id = _workspace_safe_str(line_user_id)
+    if not line_user_id:
+        return ""
+    for field in ("line_user_id", "line_personal_user_id"):
+        try:
+            docs = list(_WORKSPACE_RAW_DB.collection("users").where(field, "==", line_user_id).limit(2).stream())
+            if len(docs) == 1:
+                return docs[0].id
+            if len(docs) > 1:
+                # 不應發生；重複綁定時拒絕猜測。
+                return ""
+        except Exception:
+            pass
+    # 相容設定中心舊資料 crm_user_id。
+    try:
+        settings = get_line_card_settings()
+        for row in settings.get("line_personal_users") or []:
+            uid = _workspace_safe_str(row.get("user_id") or row.get("line_user_id"))
+            crm_uid = _workspace_safe_str(row.get("crm_user_id"))
+            if uid == line_user_id and crm_uid:
+                return crm_uid
+    except Exception:
+        pass
+    return ""
+
+
+def _workspace_linked_workspace_for_line_group(target_id: str):
+    target_id = _workspace_safe_str(target_id)
+    if not target_id:
+        return ""
+    try:
+        snap = _WORKSPACE_RAW_DB.collection(WORKSPACE_LINE_LINK_COLLECTION).document(target_id).get()
+        if snap.exists:
+            wid = _workspace_safe_str((snap.to_dict() or {}).get("workspace_id"))
+            if wid and _workspace_doc(wid):
+                return wid
+    except Exception:
+        pass
+    # 舊系統升級相容：只有一個 Workspace 時，未綁 LINE 群先視為唯一 Workspace。
+    all_ws = _workspace_list_all(active_only=True)
+    if len(all_ws) == 1:
+        return all_ws[0].get("id") or ""
+    return ""
+
+
+def _workspace_private_line_current(line_user_id: str, crm_user_id: str):
+    line_user_id = _workspace_safe_str(line_user_id)
+    crm_user_id = _workspace_safe_str(crm_user_id)
+    memberships = _workspace_memberships_for_user(crm_user_id) if crm_user_id else []
+    allowed = {x.get("workspace_id") for x in memberships if x.get("workspace_id")}
+    if not allowed:
+        # 單 Workspace 舊版相容；多 Workspace 時一定要先綁網站帳號。
+        all_ws = _workspace_list_all(active_only=True)
+        if len(all_ws) == 1:
+            return all_ws[0].get("id") or ""
+        return ""
+    try:
+        snap = _WORKSPACE_RAW_DB.collection(WORKSPACE_LINE_STATE_COLLECTION).document(line_user_id).get()
+        state_wid = _workspace_safe_str((snap.to_dict() or {}).get("workspace_id")) if snap.exists else ""
+        if state_wid in allowed:
+            return state_wid
+    except Exception:
+        pass
+    # 預設第一個；使用者之後可以 #切換群組。
+    return memberships[0].get("workspace_id") or ""
+
+
+def _workspace_context_from_line_event(event):
+    kind, target_id = _workspace_line_kind_target(event)
+    if kind in ("group", "room"):
+        return _workspace_linked_workspace_for_line_group(target_id), "", kind
+    if kind == "user":
+        crm_user_id = _workspace_user_id_from_line(target_id)
+        wid = _workspace_private_line_current(target_id, crm_user_id)
+        return wid, crm_user_id, kind
+    return "", "", kind
+
+
+def _workspace_line_switch_command(event):
+    msg = (event or {}).get("message") or {}
+    if msg.get("type") != "text":
+        return None
+    text = _workspace_safe_str(msg.get("text"))
+    if not text:
+        return None
+    first = text.splitlines()[0].strip()
+    compact = first.replace(" ", "")
+    kind, target_id = _workspace_line_kind_target(event)
+
+    current_cmds = ("#目前群組", "#目前工作區", "#當前群組", "#當前工作區")
+    list_cmds = ("#我的群組", "#我的工作區", "#切換群組", "#切換工作區")
+    is_current = any(compact.startswith(x.replace(" ", "")) for x in current_cmds)
+    is_switch = any(compact.startswith(x.replace(" ", "")) for x in list_cmds)
+    if not is_current and not is_switch:
+        return None
+
+    if kind in ("group", "room"):
+        wid = _workspace_linked_workspace_for_line_group(target_id)
+        if not wid:
+            return {"handled": True, "ok": False, "reply_text": "這個 LINE 群組尚未綁定 Workspace，請由系統管理員到網站的『工作區』設定。"}
+        ws = _workspace_doc(wid)
+        return {"handled": True, "ok": True, "reply_text": f"此 LINE 群組固定屬於：{ws.get('name') or wid}\n群組內不能切換工作區。"}
+
+    if kind != "user":
+        return {"handled": True, "ok": False, "reply_text": "目前無法辨識 LINE 使用者。"}
+
+    crm_user_id = _workspace_user_id_from_line(target_id)
+    if not crm_user_id:
+        return {
+            "handled": True,
+            "ok": False,
+            "reply_text": "這個 LINE 尚未綁定網站帳號。\n請先登入網站 → 個人後台 → 綁定你的 LINE 個人 ID，再使用多工作區查詢。",
+        }
+    memberships = _workspace_memberships_for_user(crm_user_id)
+    if not memberships:
+        return {"handled": True, "ok": False, "reply_text": "你的網站帳號目前尚未加入任何 Workspace。"}
+
+    current_wid = _workspace_private_line_current(target_id, crm_user_id)
+    if is_current and not is_switch:
+        ws = _workspace_doc(current_wid)
+        return {"handled": True, "ok": True, "reply_text": f"目前工作區：{ws.get('name') or current_wid}"}
+
+    # 取得「#切換群組」後面的參數。
+    arg = first
+    for prefix in ("#切換群組", "#切換工作區", "#我的群組", "#我的工作區"):
+        if arg.startswith(prefix):
+            arg = arg[len(prefix):].strip(" ：:")
+            break
+
+    if not arg or compact in ("#我的群組", "#我的工作區", "#切換群組", "#切換工作區"):
+        lines = ["你的工作區："]
+        for idx, mem in enumerate(memberships, start=1):
+            mark = "✓" if mem.get("workspace_id") == current_wid else " "
+            lines.append(f"{idx}. [{mark}] {mem.get('workspace_name') or mem.get('workspace_id')}")
+        lines.extend(["", "切換方式：", "#切換群組 2", "或：#切換群組 厝米 Team M.E"])
+        return {"handled": True, "ok": True, "reply_text": "\n".join(lines)[:5000]}
+
+    selected = None
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(memberships):
+            selected = memberships[idx]
+    if selected is None:
+        exact = [m for m in memberships if _workspace_safe_str(m.get("workspace_name")) == arg or _workspace_safe_str(m.get("workspace_id")) == arg]
+        if len(exact) == 1:
+            selected = exact[0]
+        else:
+            fuzzy = [m for m in memberships if arg and arg in _workspace_safe_str(m.get("workspace_name"))]
+            if len(fuzzy) == 1:
+                selected = fuzzy[0]
+    if selected is None:
+        return {"handled": True, "ok": False, "reply_text": "找不到唯一的工作區。請先輸入 #切換群組 查看編號。"}
+
+    wid = selected.get("workspace_id") or ""
+    _WORKSPACE_RAW_DB.collection(WORKSPACE_LINE_STATE_COLLECTION).document(target_id).set({
+        "line_user_id": target_id,
+        "crm_user_id": crm_user_id,
+        "workspace_id": wid,
+        "workspace_name": selected.get("workspace_name") or wid,
+        "updated_at": _workspace_now_iso(),
+    }, merge=True)
+    return {"handled": True, "ok": True, "reply_text": f"已切換工作區：{selected.get('workspace_name') or wid}"}
+
+
+# Workspace 版 LINE 可見權限：
+# - LINE 群組只能看群組共享，永遠不回傳任何人的 personal。
+# - LINE 私訊的「自己的個人資料」以網站 owner_user_id 為主，LINE ID 只作舊資料 fallback。
+try:
+    _permission_config_can_view_before_workspace = permission_config_can_view
+except Exception:
+    _permission_config_can_view_before_workspace = None
+
+
+def permission_config_can_view(source_cfg, data_type: str, data: dict, source_kind: str = "", source_id: str = "") -> bool:
+    if not source_cfg:
+        return False
+    data_type = _workspace_safe_str(data_type)
+    view_types = set(source_cfg.get("view_types") or [])
+    if "all" not in view_types and data_type and data_type not in view_types:
+        return False
+
+    visibility = _workspace_safe_str((data or {}).get("visibility") or "public")
+    if visibility not in ("public", "personal"):
+        visibility = "public"
+    try:
+        scope = _permission_normalize_scope(source_cfg.get("visibility_scope"), default="public_only")
+    except Exception:
+        scope = _workspace_safe_str(source_cfg.get("visibility_scope") or "public_only")
+
+    if visibility == "public":
+        return scope in ("public_only", "public_and_own", "all")
+
+    # 群組 / room 永遠不顯示個人資料。
+    if source_kind in ("group", "room"):
+        return False
+
+    if source_kind != "user":
+        return False
+    if scope == "all":
+        return True
+    if scope not in ("public_and_own", "own_only"):
+        return False
+
+    crm_uid = _workspace_user_id_from_line(source_id)
+    owner_uid = _workspace_safe_str((data or {}).get("owner_user_id"))
+    if crm_uid and owner_uid:
+        return crm_uid == owner_uid
+
+    owner_line_id = _workspace_safe_str(
+        (data or {}).get("owner_line_user_id")
+        or (data or {}).get("line_user_id")
+        or (data or {}).get("target_user_id")
+    )
+    return bool(owner_line_id and owner_line_id == _workspace_safe_str(source_id))
+
+
+# 最終包住 LINE 文字處理：先決定 Workspace，再讓原本所有 v1~v39 Patch 繼續跑。
+try:
+    _process_line_message_event_before_workspace = process_line_message_event
+
+    def process_line_message_event(event):
+        switch_result = _workspace_line_switch_command(event)
+        if switch_result is not None:
+            return switch_result
+
+        wid, actor_user_id, source_kind = _workspace_context_from_line_event(event)
+        msg = (event or {}).get("message") or {}
+        text = _workspace_safe_str(msg.get("text")) if msg.get("type") == "text" else ""
+        command_type = ""
+        try:
+            command_type = detect_line_command_type(text, event=event)
+        except Exception:
+            pass
+        # 只有 Workspace 私有類功能才要求先有 Workspace；公開物件/實價工具不硬擋。
+        needs_workspace = command_type in ("buyer", "seller", "development", "query", "todo", "calendar", "followup")
+        if needs_workspace and not wid:
+            kind, _ = _workspace_line_kind_target(event)
+            if kind in ("group", "room"):
+                return {"handled": True, "ok": False, "reply_text": "這個 LINE 群組尚未綁定 Workspace，請先到網站『工作區管理』設定。"}
+            if kind == "user":
+                return {"handled": True, "ok": False, "reply_text": "目前無法決定你要查哪個 Workspace。請先綁定網站帳號，再輸入 #切換群組。"}
+        if wid:
+            with workspace_scope_context(wid, actor_user_id=actor_user_id, source_kind=source_kind):
+                return _process_line_message_event_before_workspace(event)
+        return _process_line_message_event_before_workspace(event)
+
+    print("✅ Workspace：LINE 文字查詢已套用工作區隔離 + #切換群組")
+except Exception as exc:
+    print("⚠️ Workspace：LINE 文字處理套用失敗：", exc)
+
+
+try:
+    _process_line_postback_event_before_workspace = process_line_postback_event
+
+    def process_line_postback_event(event):
+        wid, actor_user_id, source_kind = _workspace_context_from_line_event(event)
+        if wid:
+            with workspace_scope_context(wid, actor_user_id=actor_user_id, source_kind=source_kind):
+                return _process_line_postback_event_before_workspace(event)
+        return _process_line_postback_event_before_workspace(event)
+
+    print("✅ Workspace：LINE postback 已套用工作區隔離")
+except Exception as exc:
+    print("⚠️ Workspace：LINE postback 套用失敗：", exc)
+
+
+# ---------- Web 登入後自動決定目前 Workspace ----------
+@app.before_request
+def workspace_before_request_v20260817():
+    try:
+        _workspace_ensure_session()
+    except Exception as exc:
+        print("⚠️ Workspace session 初始化失敗：", exc)
+
+    # 最後一道直接網址防護：就算前面的 route 曾被後續 Patch 覆寫，也不能用 ID 跨 Workspace 讀資料。
+    if not session.get("user_id") or request.endpoint in {
+        "login", "logout", "workspace_home", "workspace_switch", "workspace_admin",
+        "workspace_create", "workspace_member_save", "workspace_member_remove",
+        "workspace_line_link_save", "workspace_line_link_delete", "workspace_migrate_legacy",
+    }:
+        return None
+
+    view_args = request.view_args or {}
+    guard_specs = [
+        ("buyer_id", "buyers", "客需", "buyers"),
+        ("seller_id", "sellers", "委託", "sellers"),
+        ("development_id", "developments", "開發", "developments"),
+        ("todo_id", _workspace_safe_str(globals().get("LINE_TODO_COLLECTION", "line_todos")) or "line_todos", "待辦", "todos_page"),
+        ("event_id", _workspace_safe_str(globals().get("CALENDAR_EVENT_COLLECTION", "calendar_events")) or "calendar_events", "行程", "calendar_page"),
+    ]
+    for arg_name, collection_name, label, fallback in guard_specs:
+        rid = _workspace_safe_str(view_args.get(arg_name))
+        if not rid:
+            continue
+        try:
+            raw_snap = _WORKSPACE_RAW_DB.collection(collection_name).document(rid).get()
+            if not raw_snap.exists:
+                continue
+            data = raw_snap.to_dict() or {}
+            if not _workspace_doc_workspace_allowed(data) or not backend_can_view_personal_record(data):
+                flash(f"這筆{label}不屬於目前工作區，或你沒有查看權限。", "warning")
+                try:
+                    return redirect(url_for(fallback))
+                except Exception:
+                    return redirect(url_for("workspace_home"))
+        except Exception as exc:
+            print("⚠️ Workspace 最終網址防護失敗：", collection_name, rid, exc)
+    return None
+
+
+@app.context_processor
+def inject_workspace_context_v20260817():
+    if not session.get("user_id"):
+        return {
+            "current_workspace_id": "",
+            "current_workspace_name": "",
+            "workspace_memberships": [],
+            "workspace_module_options": WORKSPACE_MODULE_OPTIONS,
+        }
+    uid = _workspace_safe_str(session.get("user_id"))
+    return {
+        "current_workspace_id": current_workspace_id(),
+        "current_workspace_name": current_workspace_name(),
+        "workspace_memberships": _workspace_memberships_for_user(uid),
+        "workspace_module_options": WORKSPACE_MODULE_OPTIONS,
+        "workspace_data_scope": _workspace_safe_str(request.args.get("data_scope") or "all"),
+    }
+
+
+# ---------- Workspace 網站管理 UI：只改 py，不要求你同步改 templates ----------
+WORKSPACE_HOME_TEMPLATE = r"""
+{% extends "base.html" %}
+{% block content %}
+<div class="container py-3">
+  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+    <div>
+      <h3 class="mb-1">工作區</h3>
+      <div class="text-muted">同一個帳號可以加入多個團隊；切換後，客需 / 委託 / 開發 / 待辦等資料會整組切換。</div>
+    </div>
+    {% if can_admin %}<a class="btn btn-outline-primary" href="{{ url_for('workspace_admin') }}">工作區管理</a>{% endif %}
+  </div>
+
+  {% if memberships %}
+  <div class="row g-3">
+    {% for m in memberships %}
+    <div class="col-md-6 col-xl-4">
+      <div class="card h-100 {% if m.workspace_id == current_workspace_id %}border-primary{% endif %}">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-start gap-2">
+            <div>
+              <h5 class="card-title mb-1">{{ m.workspace_name }}</h5>
+              <div class="small text-muted">{{ {'owner':'擁有者','admin':'管理員','member':'成員'}.get(m.role, m.role) }}</div>
+            </div>
+            {% if m.workspace_id == current_workspace_id %}<span class="badge bg-primary">目前</span>{% endif %}
+          </div>
+          <div class="small mt-3">可使用：
+            {% if m.role in ['owner','admin'] %}全部功能{% else %}
+              {% for key,label in module_options %}{% if key in (m.modules or []) %}<span class="badge text-bg-light me-1">{{ label }}</span>{% endif %}{% endfor %}
+            {% endif %}
+          </div>
+        </div>
+        <div class="card-footer bg-transparent">
+          {% if m.workspace_id != current_workspace_id %}
+          <form method="post" action="{{ url_for('workspace_switch', workspace_id=m.workspace_id) }}">
+            <button class="btn btn-primary btn-sm">切換到這個工作區</button>
+          </form>
+          {% else %}<span class="small text-success">目前所有 CRM 頁面都使用此工作區</span>{% endif %}
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+    <div class="alert alert-warning">你的帳號目前尚未加入任何工作區。公開工具仍可使用，但客需 / 委託 / 開發等團隊資料不會顯示。請聯絡系統管理員加入團隊。</div>
+  {% endif %}
+</div>
+{% endblock %}
+"""
+
+
+WORKSPACE_ADMIN_TEMPLATE = r"""
+{% extends "base.html" %}
+{% block content %}
+<div class="container py-3">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <div><h3 class="mb-1">工作區管理</h3><div class="text-muted">建立團隊、把同一個人加入多個團隊、設定可看功能、綁定 LINE 群組。</div></div>
+    <a class="btn btn-outline-secondary" href="{{ url_for('workspace_home') }}">回工作區</a>
+  </div>
+
+  {% if is_super_admin %}
+  <div class="card mb-4">
+    <div class="card-header fw-bold">新增工作區</div>
+    <div class="card-body">
+      <form method="post" action="{{ url_for('workspace_create') }}" class="row g-2">
+        <div class="col-md-8"><input class="form-control" name="name" placeholder="例如：厝米 Team M.E / 海線幸福團隊" required></div>
+        <div class="col-md-4"><button class="btn btn-primary w-100">建立工作區</button></div>
+      </form>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="card mb-4">
+    <div class="card-header fw-bold">目前管理的工作區</div>
+    <div class="card-body">
+      <form method="get" class="row g-2 align-items-end">
+        <div class="col-md-8"><label class="form-label">選擇工作區</label><select class="form-select" name="workspace_id">
+          {% for ws in manageable_workspaces %}<option value="{{ ws.id }}" {% if ws.id == selected_workspace_id %}selected{% endif %}>{{ ws.name }}</option>{% endfor %}
+        </select></div>
+        <div class="col-md-4"><button class="btn btn-outline-primary w-100">開啟</button></div>
+      </form>
+    </div>
+  </div>
+
+  {% if selected_workspace %}
+  <div class="card mb-4">
+    <div class="card-header fw-bold">{{ selected_workspace.name }}｜成員</div>
+    <div class="card-body">
+      <form method="post" action="{{ url_for('workspace_member_save') }}" class="row g-2 border rounded p-2 mb-3">
+        <input type="hidden" name="workspace_id" value="{{ selected_workspace.id }}">
+        <div class="col-md-4"><label class="form-label">Email</label><input class="form-control" type="email" name="email" required placeholder="已有帳號可直接輸入 Email"></div>
+        <div class="col-md-3"><label class="form-label">姓名（新帳號）</label><input class="form-control" name="name"></div>
+        <div class="col-md-3"><label class="form-label">密碼（只有新帳號需要）</label><input class="form-control" type="password" name="password"></div>
+        <div class="col-md-2"><label class="form-label">角色</label><select class="form-select" name="role"><option value="member">成員</option><option value="admin">管理員</option><option value="owner">擁有者</option></select></div>
+        <div class="col-12"><div class="small fw-bold mb-1">一般成員可使用功能</div>
+          {% for key,label in module_options %}<label class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="modules" value="{{ key }}" checked> {{ label }}</label>{% endfor %}
+        </div>
+        <div class="col-12"><button class="btn btn-primary">新增 / 更新成員</button></div>
+      </form>
+
+      <div class="table-responsive"><table class="table align-middle"><thead><tr><th>姓名</th><th>Email</th><th>角色</th><th>可使用</th><th></th></tr></thead><tbody>
+        {% for m in members %}<tr>
+          <td>{{ m.user_name }}</td><td>{{ m.user_email }}</td><td>{{ m.role }}</td>
+          <td>{% if m.role in ['owner','admin'] %}全部{% else %}{{ (m.modules or [])|join('、') }}{% endif %}</td>
+          <td><form method="post" action="{{ url_for('workspace_member_remove') }}" onsubmit="return confirm('確定移除此成員？')"><input type="hidden" name="workspace_id" value="{{ selected_workspace.id }}"><input type="hidden" name="user_id" value="{{ m.user_id }}"><button class="btn btn-outline-danger btn-sm">移除</button></form></td>
+        </tr>{% endfor %}
+      </tbody></table></div>
+    </div>
+  </div>
+
+  <div class="card mb-4">
+    <div class="card-header fw-bold">{{ selected_workspace.name }}｜LINE 群組綁定</div>
+    <div class="card-body">
+      <div class="small text-muted mb-2">LINE 群組綁定後，在該群輸入 #查詢紀錄 / #新增客需 等，只會查這個工作區。LINE 私訊則可用 #切換群組。</div>
+      <form method="post" action="{{ url_for('workspace_line_link_save') }}" class="row g-2 mb-3">
+        <input type="hidden" name="workspace_id" value="{{ selected_workspace.id }}">
+        <div class="col-md-3"><select class="form-select" name="source_kind"><option value="group">群組</option><option value="room">聊天室</option></select></div>
+        <div class="col-md-6"><input class="form-control font-monospace" name="target_id" placeholder="LINE groupId / roomId" required></div>
+        <div class="col-md-3"><button class="btn btn-primary w-100">綁定 LINE</button></div>
+      </form>
+      {% if configured_line_groups %}<div class="small mb-2">你目前 LINE 設定中心已有的群組 ID，可直接複製：</div><div class="mb-3">
+        {% for g in configured_line_groups %}<span class="badge text-bg-light me-1 mb-1">{{ g.name }}｜{{ g.target_id }}</span>{% endfor %}
+      </div>{% endif %}
+      <div class="table-responsive"><table class="table"><thead><tr><th>類型</th><th>LINE ID</th><th>綁定工作區</th><th></th></tr></thead><tbody>
+        {% for link in line_links %}<tr><td>{{ link.source_kind }}</td><td class="font-monospace small">{{ link.target_id }}</td><td>{{ link.workspace_name }}</td><td><form method="post" action="{{ url_for('workspace_line_link_delete') }}"><input type="hidden" name="target_id" value="{{ link.target_id }}"><input type="hidden" name="workspace_id" value="{{ selected_workspace.id }}"><button class="btn btn-outline-danger btn-sm">解除</button></form></td></tr>{% endfor %}
+      </tbody></table></div>
+    </div>
+  </div>
+
+  <div class="card mb-4 border-warning">
+    <div class="card-header fw-bold">舊資料標記</div>
+    <div class="card-body"><div class="small text-muted mb-2">舊資料沒有 workspace_id 時，目前只會在預設厝米工作區顯示。確認無誤後，可把所有未標記舊資料正式寫入目前工作區。</div>
+      <form method="post" action="{{ url_for('workspace_migrate_legacy') }}" onsubmit="return confirm('確定把所有尚未標記的舊 CRM 資料歸到此工作區？')"><input type="hidden" name="workspace_id" value="{{ selected_workspace.id }}"><button class="btn btn-outline-warning">將未標記舊資料歸入此工作區</button></form>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+"""
+
+
+@app.route("/workspace")
+@login_required
+def workspace_home():
+    _workspace_ensure_session()
+    uid = _workspace_safe_str(session.get("user_id"))
+    memberships = _workspace_memberships_for_user(uid)
+    can_admin = _workspace_is_super_admin(uid) or any((m.get("role") in ("owner", "admin")) for m in memberships)
+    return render_template_string(
+        WORKSPACE_HOME_TEMPLATE,
+        memberships=memberships,
+        current_workspace_id=current_workspace_id(),
+        module_options=WORKSPACE_MODULE_OPTIONS,
+        can_admin=can_admin,
+    )
+
+
+@app.route("/workspace/switch/<workspace_id>", methods=["POST"])
+@login_required
+def workspace_switch(workspace_id):
+    uid = _workspace_safe_str(session.get("user_id"))
+    mem = _workspace_membership(workspace_id, uid)
+    if not mem or mem.get("active", True) is False:
+        flash("你不是這個工作區的成員。", "danger")
+        return redirect(url_for("workspace_home"))
+    ws = _workspace_doc(workspace_id)
+    session["workspace_id"] = workspace_id
+    session["workspace_name"] = ws.get("name") or workspace_id
+    session["workspace_role"] = mem.get("role") or "member"
+    flash(f"已切換工作區：{session['workspace_name']}", "success")
+    return redirect(request.referrer or url_for("workspace_home"))
+
+
+def _workspace_manageable_workspaces_for_user(user_id):
+    if _workspace_is_super_admin(user_id):
+        return _workspace_list_all(active_only=True)
+    ids = []
+    for mem in _workspace_memberships_for_user(user_id):
+        if mem.get("role") in ("owner", "admin"):
+            ids.append(mem.get("workspace_id"))
+    return [ws for ws in _workspace_list_all(active_only=True) if ws.get("id") in ids]
+
+
+def _workspace_members_for_workspace(workspace_id):
+    rows = []
+    try:
+        docs = _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).where("workspace_id", "==", workspace_id).stream()
+        for snap in docs:
+            m = snap.to_dict() or {}
+            m["id"] = snap.id
+            uid = _workspace_safe_str(m.get("user_id"))
+            user = _workspace_raw_user(uid)
+            m["user_name"] = user.get("name") or user.get("email") or uid
+            m["user_email"] = user.get("email") or ""
+            rows.append(m)
+    except Exception as exc:
+        print("⚠️ Workspace 成員列表失敗：", exc)
+    rows.sort(key=lambda x: (x.get("role") != "owner", x.get("user_name") or ""))
+    return rows
+
+
+def _workspace_line_links_for_workspace(workspace_id):
+    rows = []
+    try:
+        docs = _WORKSPACE_RAW_DB.collection(WORKSPACE_LINE_LINK_COLLECTION).where("workspace_id", "==", workspace_id).stream()
+        for snap in docs:
+            d = snap.to_dict() or {}
+            d["id"] = snap.id
+            d["workspace_name"] = (_workspace_doc(workspace_id).get("name") or workspace_id)
+            rows.append(d)
+    except Exception:
+        pass
+    return rows
+
+
+@app.route("/workspace/admin")
+@login_required
+def workspace_admin():
+    uid = _workspace_safe_str(session.get("user_id"))
+    manageable = _workspace_manageable_workspaces_for_user(uid)
+    if not manageable:
+        flash("你沒有工作區管理權限。", "warning")
+        return redirect(url_for("workspace_home"))
+    selected_id = _workspace_safe_str(request.args.get("workspace_id") or session.get("workspace_id"))
+    if selected_id not in {x.get("id") for x in manageable}:
+        selected_id = manageable[0].get("id") or ""
+    selected = _workspace_doc(selected_id)
+    try:
+        configured_line_groups = get_enabled_line_groups()
+    except Exception:
+        configured_line_groups = []
+    return render_template_string(
+        WORKSPACE_ADMIN_TEMPLATE,
+        is_super_admin=_workspace_is_super_admin(uid),
+        manageable_workspaces=manageable,
+        selected_workspace_id=selected_id,
+        selected_workspace=selected,
+        members=_workspace_members_for_workspace(selected_id) if selected else [],
+        line_links=_workspace_line_links_for_workspace(selected_id) if selected else [],
+        configured_line_groups=configured_line_groups,
+        module_options=WORKSPACE_MODULE_OPTIONS,
+    )
+
+
+@app.route("/workspace/admin/create", methods=["POST"])
+@login_required
+def workspace_create():
+    uid = _workspace_safe_str(session.get("user_id"))
+    if not _workspace_is_super_admin(uid):
+        abort(403)
+    name = _workspace_safe_str(request.form.get("name"))
+    if not name:
+        flash("請輸入工作區名稱。", "warning")
+        return redirect(url_for("workspace_admin"))
+    wid = "ws_" + uuid4().hex[:12]
+    now = _workspace_now_iso()
+    _WORKSPACE_RAW_DB.collection(WORKSPACE_COLLECTION).document(wid).set({
+        "name": name,
+        "active": True,
+        "created_at": now,
+        "created_by_id": uid,
+        "updated_at": now,
+    })
+    _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).document(_workspace_member_doc_id(wid, uid)).set({
+        "workspace_id": wid,
+        "user_id": uid,
+        "role": "owner",
+        "modules": WORKSPACE_ALL_MODULES,
+        "active": True,
+        "created_at": now,
+        "created_by_id": uid,
+        "updated_at": now,
+    })
+    flash(f"已建立工作區：{name}", "success")
+    return redirect(url_for("workspace_admin", workspace_id=wid))
+
+
+@app.route("/workspace/admin/member/save", methods=["POST"])
+@login_required
+def workspace_member_save():
+    workspace_id = _workspace_safe_str(request.form.get("workspace_id"))
+    if not _workspace_admin_allowed(workspace_id):
+        abort(403)
+    email = _workspace_safe_str(request.form.get("email")).lower()
+    name = _workspace_safe_str(request.form.get("name"))
+    password = request.form.get("password") or ""
+    role = _workspace_safe_str(request.form.get("role") or "member")
+    if role not in ("owner", "admin", "member"):
+        role = "member"
+    modules = [x for x in request.form.getlist("modules") if x in WORKSPACE_ALL_MODULES]
+    if not email:
+        flash("請輸入 Email。", "warning")
+        return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+
+    docs = list(_WORKSPACE_RAW_DB.collection("users").where("email", "==", email).limit(2).stream())
+    if len(docs) > 1:
+        flash("系統內有重複 Email，請先整理使用者資料。", "danger")
+        return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+    if docs:
+        user_ref = docs[0].reference
+        user_id = docs[0].id
+        if name:
+            user_ref.set({"name": name, "updated_at": _workspace_now_iso()}, merge=True)
+    else:
+        if len(password) < 6:
+            flash("新帳號請輸入至少 6 碼密碼。", "warning")
+            return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+        user_ref = _WORKSPACE_RAW_DB.collection("users").document()
+        user_id = user_ref.id
+        user_ref.set({
+            "email": email,
+            "name": name or email,
+            "password_hash": generate_password_hash(password),
+            "created_at": _workspace_now_iso(),
+        })
+
+    now = _workspace_now_iso()
+    _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).document(_workspace_member_doc_id(workspace_id, user_id)).set({
+        "workspace_id": workspace_id,
+        "user_id": user_id,
+        "role": role,
+        "modules": WORKSPACE_ALL_MODULES if role in ("owner", "admin") else modules,
+        "active": True,
+        "updated_at": now,
+        "updated_by_id": session.get("user_id"),
+        "created_at": now,
+    }, merge=True)
+    flash(f"已將 {email} 加入工作區。", "success")
+    return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+
+
+@app.route("/workspace/admin/member/remove", methods=["POST"])
+@login_required
+def workspace_member_remove():
+    workspace_id = _workspace_safe_str(request.form.get("workspace_id"))
+    user_id = _workspace_safe_str(request.form.get("user_id"))
+    if not _workspace_admin_allowed(workspace_id):
+        abort(403)
+    if user_id == _workspace_safe_str(session.get("user_id")):
+        flash("為避免把自己鎖在工作區外，請由另一位管理員移除你。", "warning")
+        return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+    try:
+        _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).document(_workspace_member_doc_id(workspace_id, user_id)).delete()
+        # 相容非固定 id 的舊 member 文件。
+        for snap in _WORKSPACE_RAW_DB.collection(WORKSPACE_MEMBER_COLLECTION).where("workspace_id", "==", workspace_id).where("user_id", "==", user_id).stream():
+            snap.reference.delete()
+        flash("已移除成員。", "success")
+    except Exception as exc:
+        flash(f"移除成員失敗：{exc}", "danger")
+    return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+
+
+@app.route("/workspace/admin/line-link/save", methods=["POST"])
+@login_required
+def workspace_line_link_save():
+    workspace_id = _workspace_safe_str(request.form.get("workspace_id"))
+    if not _workspace_admin_allowed(workspace_id):
+        abort(403)
+    target_id = _workspace_safe_str(request.form.get("target_id"))
+    source_kind = _workspace_safe_str(request.form.get("source_kind") or "group")
+    if source_kind not in ("group", "room"):
+        source_kind = "group"
+    if not target_id:
+        flash("請輸入 LINE groupId / roomId。", "warning")
+        return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+    ws = _workspace_doc(workspace_id)
+    _WORKSPACE_RAW_DB.collection(WORKSPACE_LINE_LINK_COLLECTION).document(target_id).set({
+        "target_id": target_id,
+        "source_kind": source_kind,
+        "workspace_id": workspace_id,
+        "workspace_name": ws.get("name") or workspace_id,
+        "updated_at": _workspace_now_iso(),
+        "updated_by_id": session.get("user_id"),
+    }, merge=True)
+    flash("LINE 群組已綁定工作區。", "success")
+    return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+
+
+@app.route("/workspace/admin/line-link/delete", methods=["POST"])
+@login_required
+def workspace_line_link_delete():
+    workspace_id = _workspace_safe_str(request.form.get("workspace_id"))
+    if not _workspace_admin_allowed(workspace_id):
+        abort(403)
+    target_id = _workspace_safe_str(request.form.get("target_id"))
+    if target_id:
+        try:
+            snap = _WORKSPACE_RAW_DB.collection(WORKSPACE_LINE_LINK_COLLECTION).document(target_id).get()
+            if snap.exists and _workspace_safe_str((snap.to_dict() or {}).get("workspace_id")) == workspace_id:
+                snap.reference.delete()
+                flash("已解除 LINE 群組綁定。", "success")
+        except Exception as exc:
+            flash(f"解除失敗：{exc}", "danger")
+    return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+
+
+@app.route("/workspace/admin/migrate-legacy", methods=["POST"])
+@login_required
+def workspace_migrate_legacy():
+    workspace_id = _workspace_safe_str(request.form.get("workspace_id"))
+    if not _workspace_admin_allowed(workspace_id):
+        abort(403)
+    ws = _workspace_doc(workspace_id)
+    if not ws:
+        flash("找不到工作區。", "danger")
+        return redirect(url_for("workspace_admin"))
+    counts = {}
+    now = _workspace_now_iso()
+    # 只補沒有 workspace_id 的舊資料；已有其他 Workspace 的資料絕不搬動。
+    for collection_name in sorted(_WORKSPACE_SCOPED_COLLECTIONS):
+        count = 0
+        try:
+            for snap in _WORKSPACE_RAW_DB.collection(collection_name).stream():
+                data = snap.to_dict() or {}
+                if _workspace_safe_str(data.get("workspace_id")):
+                    continue
+                snap.reference.set({
+                    "workspace_id": workspace_id,
+                    "workspace_name": ws.get("name") or workspace_id,
+                    "workspace_migrated_at": now,
+                    "workspace_migrated_by": session.get("user_id"),
+                }, merge=True)
+                count += 1
+        except Exception as exc:
+            print("⚠️ Workspace 舊資料遷移失敗：", collection_name, exc)
+        counts[collection_name] = count
+    total = sum(counts.values())
+    flash(f"舊資料標記完成，共 {total} 筆。", "success")
+    return redirect(url_for("workspace_admin", workspace_id=workspace_id))
+
+
+# ---------- 在不改 base.html 的情況下，加一個固定的 Workspace 入口與 CRM 顯示篩選 ----------
+def _workspace_query_url(scope_value):
+    try:
+        args = request.args.to_dict(flat=False)
+        args["data_scope"] = [scope_value]
+        return request.path + ("?" + urlencode(args, doseq=True) if args else "")
+    except Exception:
+        return request.path
+
+
+@app.after_request
+def workspace_after_request_v20260817(response):
+    try:
+        if not session.get("user_id") or response.direct_passthrough:
+            return response
+        ctype = response.headers.get("Content-Type", "")
+        if "text/html" not in ctype.lower():
+            return response
+        body = response.get_data(as_text=True)
+        if "</body>" not in body:
+            return response
+
+        wid = current_workspace_id()
+        wname = current_workspace_name()
+        workspace_button = (
+            '<div id="teamme-workspace-switch" style="position:fixed;right:16px;bottom:16px;z-index:99999;">'
+            '<a href="' + _workspace_html.escape(url_for("workspace_home")) + '" '
+            'style="display:inline-block;background:#fff;border:1px solid #ddd;border-radius:999px;padding:8px 12px;box-shadow:0 4px 16px rgba(0,0,0,.12);text-decoration:none;color:#333;font-size:13px;">'
+            '🏠 ' + _workspace_html.escape(wname or "工作區") + '</a></div>'
+        )
+
+        filter_html = ""
+        if request.path.rstrip("/") in ("/buyers", "/sellers", "/developments", "/todos"):
+            current_scope = _workspace_safe_str(request.args.get("data_scope") or "all")
+            def chip(value, label):
+                active = current_scope == value
+                style = "background:#333;color:#fff;" if active else "background:#fff;color:#333;"
+                return '<a href="' + _workspace_html.escape(_workspace_query_url(value)) + '" style="' + style + 'border:1px solid #ccc;border-radius:999px;padding:6px 10px;text-decoration:none;font-size:12px;">' + label + '</a>'
+            filter_html = (
+                '<div id="teamme-data-scope" style="position:fixed;left:16px;bottom:16px;z-index:99999;display:flex;gap:6px;background:rgba(255,255,255,.92);padding:6px;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.10);">'
+                + chip("all", "全部") + chip("shared", "群組共享") + chip("mine", "我的資料") + '</div>'
+            )
+        body = body.replace("</body>", workspace_button + filter_html + "</body>")
+        response.set_data(body)
+        return response
+    except Exception as exc:
+        print("⚠️ Workspace HTML 入口注入失敗：", exc)
+        return response
+
+
+print("✅ Team M.E Workspace v20260817 已啟用：多工作區、多成員、LINE 工作區查詢、群組共享/僅自己隔離。")
+# =============================================================================
+# Team M.E Workspace 多團隊 / 多租戶隔離 Patch End
+# =============================================================================
+
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
     print("Routes:", app.url_map)
