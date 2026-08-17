@@ -2120,8 +2120,11 @@ def seller_edit(seller_id):
         form = request.form
 
         labels = get_request_labels(form)
+        # v4：委託編輯也必須真正寫回群組共享 / 僅自己設定。
+        crm_vis = crm_record_visibility_payload_from_form(form, seller)
 
         updated = {
+            **crm_vis,
             "name": form.get("name", "").strip(),
             "phone": form.get("phone", "").strip(),
             "email": form.get("email", "").strip(),
@@ -17071,7 +17074,7 @@ def line_personal_user_allows_command(user, command_type: str) -> bool:
 
 
 def calendar_event_visibility_text(event):
-    return "個人行程" if (event.get("visibility") or "") == "personal" else "公開行程"
+    return "僅自己" if (event.get("visibility") or "") == "personal" else "群組共享"
 
 
 def calendar_event_target_line_user_id(event):
@@ -17424,13 +17427,13 @@ def process_line_calendar_message_event(event):
                 "日期: 今天\n"
                 "時間: 10:00-10:30\n"
                 f"類型: {sample_category}\n"
-                "可見性: 公開\n"
+                "可見性: 公開  # 可省略；群組預設共享、私訊預設僅自己\n"
                 "標題: 童先生看農舍\n"
                 "客戶: 童先生\n"
                 "電話: 0921-123-456\n"
                 "地點: 清水、梧棲交界\n"
                 "備註: 退休夫妻，想看農舍、有空地\n\n"
-                "若要新增個人行程，請改成：可見性: 個人"
+                "私訊 Bot 時若不填可見性，會自動建立為僅自己；LINE 群組則一律建立為群組共享。"
             )
             return {"handled": True, "ok": True, "reply_text": example, "parsed_tag": "新增行程格式"}
 
@@ -17445,14 +17448,32 @@ def process_line_calendar_message_event(event):
             title = f"{fields.get('customer_name', '')} {category}".strip() or category
 
         kind, target_id = line_event_source_kind_and_id(event)
-        visibility_raw = (fields.get("可見性") or fields.get("visibility") or fields.get("行程可見性") or "公開").strip()
-        visibility = "personal" if visibility_raw in ("個人", "私人", "personal") else "public"
+        # v4：LINE 群組建立一律群組共享；LINE 私訊預設僅自己。
+        # 私訊仍可明確填「可見性: 公開/群組共享」改成共享。
+        explicit_visibility = (fields.get("可見性") or fields.get("visibility") or fields.get("行程可見性") or "").strip()
+        if kind in ("group", "room"):
+            visibility = "public"
+        elif explicit_visibility:
+            visibility = "personal" if explicit_visibility in ("個人", "私人", "僅自己", "personal") else "public"
+        else:
+            visibility = "personal"
+
         owner_line_user_id = ""
         owner_line_name = ""
+        owner_user_id = ""
+        owner_user_name = ""
         if visibility == "personal" and kind == "user":
             user_cfg = find_line_personal_user_by_user_id(target_id)
             owner_line_user_id = target_id
             owner_line_name = (user_cfg or {}).get("name") or get_line_sender_display_name(event) or ""
+            try:
+                if "_workspace_user_id_from_line" in globals():
+                    owner_user_id = _workspace_user_id_from_line(target_id) or ""
+                if owner_user_id and "_workspace_raw_user" in globals():
+                    owner_doc = _workspace_raw_user(owner_user_id) or {}
+                    owner_user_name = owner_doc.get("name") or owner_doc.get("email") or owner_user_id
+            except Exception:
+                pass
 
         payload = {
             "title": title,
@@ -17469,6 +17490,8 @@ def process_line_calendar_message_event(event):
             "location": fields.get("location", ""),
             "note": fields.get("note", ""),
             "visibility": visibility,
+            "owner_user_id": owner_user_id,
+            "owner_user_name": owner_user_name,
             "owner_line_user_id": owner_line_user_id,
             "owner_line_name": owner_line_name,
             "line_enabled": True,
@@ -18388,10 +18411,10 @@ LINE_VIEW_TYPE_OPTIONS = [
 ]
 
 LINE_VISIBILITY_SCOPE_OPTIONS = [
-    ("public_only", "只看公開資料"),
-    ("public_and_own", "公開資料 + 自己的個人資料"),
-    ("own_only", "只看自己的個人資料"),
-    ("all", "全部資料（公開 + 所有人個人資料）"),
+    ("public_only", "只看群組共享"),
+    ("public_and_own", "群組共享 + 自己的僅自己"),
+    ("own_only", "只看自己的僅自己"),
+    ("all", "全部（群組共享 + 所有人僅自己；LINE群組仍只看共享）"),
 ]
 
 _LINE_PERMISSION_CONTEXT = {}
@@ -18947,7 +18970,11 @@ def _line_source_kind_id_safe(event=None):
 
 
 def _line_visibility_payload_from_event(event=None):
-    """LINE 建立資料時：群組/聊天室=公開，個人私訊=個人。"""
+    """LINE 建立新資料時：群組/聊天室=群組共享；個人私訊=僅自己。
+
+    v4：若 LINE 個人帳號已綁定網站帳號，同時寫 owner_user_id，
+    網站與 LINE 的「本人」判斷使用同一套所有權，不再只靠 LINE userId。
+    """
     kind, target_id = _line_source_kind_id_safe(event)
     payload = {
         "line_created_source_kind": kind,
@@ -18960,8 +18987,20 @@ def _line_visibility_payload_from_event(event=None):
         except Exception:
             user_cfg = {}
         name = (user_cfg.get("name") or get_line_sender_display_name(event or {}) or "").strip()
+        owner_user_id = ""
+        owner_user_name = ""
+        try:
+            if "_workspace_user_id_from_line" in globals():
+                owner_user_id = _workspace_user_id_from_line(target_id) or ""
+            if owner_user_id and "_workspace_raw_user" in globals():
+                u = _workspace_raw_user(owner_user_id) or {}
+                owner_user_name = (u.get("name") or u.get("email") or owner_user_id).strip()
+        except Exception:
+            owner_user_id = owner_user_id or ""
         payload.update({
             "visibility": "personal",
+            "owner_user_id": owner_user_id,
+            "owner_user_name": owner_user_name or name,
             "owner_line_user_id": target_id,
             "owner_line_name": name,
         })
@@ -18973,8 +19012,13 @@ def _line_visibility_payload_from_event(event=None):
         })
     return payload
 
-
 def _apply_line_visibility_to_created_result(result, event=None):
+    """套用 LINE 建立資料的可見性。
+
+    v4 修正：
+    - 新資料（原本沒有有效 visibility）才依 LINE 來源自動設定。
+    - 已存在且已是 public/personal 的資料，LINE 後續註記不得偷偷改變分享範圍。
+    """
     if not result or not result.get("ok"):
         return result
     target_type = (result.get("target_type") or "").strip()
@@ -18983,19 +19027,32 @@ def _apply_line_visibility_to_created_result(result, event=None):
     if not coll or not target_id:
         return result
     try:
-        payload = _line_visibility_payload_from_event(event)
-        db.collection(coll).document(target_id).set(payload, merge=True)
-        result["visibility"] = payload.get("visibility")
-        result["owner_line_user_id"] = payload.get("owner_line_user_id")
-        result["owner_line_name"] = payload.get("owner_line_name")
-        if payload.get("visibility") == "personal":
-            result["reply_text"] = (result.get("reply_text") or "已寫入") + "\n已設為：個人資料"
-        else:
-            result["reply_text"] = (result.get("reply_text") or "已寫入") + "\n已設為：公開資料"
-    except Exception as e:
-        print("⚠️ 自動設定 LINE 新增資料公開/個人失敗：", e)
-    return result
+        doc_ref = db.collection(coll).document(target_id)
+        snap = doc_ref.get()
+        existing = snap.to_dict() or {} if getattr(snap, "exists", False) else {}
+        existing_vis = (existing.get("visibility") or "").strip()
 
+        # 已有明確設定：保留，不因 LINE 群組/私訊的再次註記而翻轉。
+        if existing_vis in ("public", "personal"):
+            result["visibility"] = existing_vis
+            result["owner_user_id"] = existing.get("owner_user_id") or ""
+            result["owner_line_user_id"] = existing.get("owner_line_user_id") or ""
+            result["owner_line_name"] = existing.get("owner_line_name") or ""
+            label = "僅自己" if existing_vis == "personal" else "群組共享"
+            result["reply_text"] = (result.get("reply_text") or "已寫入") + f"\n資料範圍：{label}（保留原設定）"
+            return result
+
+        payload = _line_visibility_payload_from_event(event)
+        doc_ref.set(payload, merge=True)
+        result["visibility"] = payload.get("visibility")
+        result["owner_user_id"] = payload.get("owner_user_id") or ""
+        result["owner_line_user_id"] = payload.get("owner_line_user_id") or ""
+        result["owner_line_name"] = payload.get("owner_line_name") or ""
+        label = "僅自己" if payload.get("visibility") == "personal" else "群組共享"
+        result["reply_text"] = (result.get("reply_text") or "已寫入") + f"\n已設為：{label}"
+    except Exception as e:
+        print("⚠️ 自動設定 LINE 新增資料群組共享/僅自己失敗：", e)
+    return result
 
 try:
     _create_buyer_need_before_visibility_auto = create_buyer_need
@@ -19402,7 +19459,7 @@ def create_line_todo(fields, event):
         'created_by_name': sender_display_name or 'LINE Bot',
         'reminder_sent_dates': [],
     })
-    vis_text = '個人待辦' if vis_payload.get('visibility') == 'personal' else '公開待辦'
+    vis_text = '僅自己待辦' if vis_payload.get('visibility') == 'personal' else '群組共享待辦'
     return {'handled': True, 'ok': True, 'reply_text': f"已新增{vis_text}：{title}\n日期：{todo_date}\nID：{doc_ref.id[:6]}", 'parsed_tag': '新增代辦'}
 
 
@@ -42018,6 +42075,16 @@ def crm_record_visibility_payload_from_form(form, existing=None):
             user = _workspace_raw_user(current_uid)
             payload["owner_user_id"] = current_uid
             payload["owner_user_name"] = user.get("name") or user.get("email") or current_uid
+
+        # v4：網站切成「僅自己」時，若表單沒指定 LINE 對象，自動使用目前帳號綁定的 LINE。
+        if not _workspace_safe_str(payload.get("owner_line_user_id")):
+            try:
+                line_uid, line_name = _current_bound_line_user_id()
+                if line_uid:
+                    payload["owner_line_user_id"] = line_uid
+                    payload["owner_line_name"] = line_name
+            except Exception:
+                pass
     return payload
 
 
@@ -43507,6 +43574,35 @@ except Exception:
 print(f"✅ Team M.E Workspace Performance v3 已啟用：權限快取 {WORKSPACE_V3_CACHE_SECONDS}s + Firestore 原生 Workspace Query Fast Mode。")
 # =============================================================================
 # Team M.E Workspace Performance Patch v3 End
+# =============================================================================
+
+
+# =============================================================================
+# Team M.E Visibility Consistency Patch v4 / 2026-08-17
+# 修正範圍：
+# 1. 委託編輯真正寫回 visibility。
+# 2. LINE 對既有 CRM 資料的後續註記不再覆寫原分享範圍。
+# 3. LINE 私訊新建 CRM / 待辦 / 行程預設僅自己；群組新建預設群組共享。
+# 4. LINE 個人資料同步 owner_user_id + owner_line_user_id。
+# 5. 網站 CRM 改為僅自己時，會自動綁目前登入者 LINE（若已有綁定）。
+# 6. 顯示文字統一為「群組共享 / 僅自己」。
+# =============================================================================
+
+# 最終再覆寫一次顯示文字，避免任何前段 Patch 的舊函式名稱影響執行期 global lookup。
+def crm_record_visibility_text(data: dict):
+    return "僅自己" if (data or {}).get("visibility") == "personal" else "群組共享"
+
+
+def calendar_event_visibility_text(event):
+    return "僅自己" if (event or {}).get("visibility") == "personal" else "群組共享"
+
+
+# 確保 context processor 在 request 執行時拿到 v4 的文字選項。
+CRM_VISIBILITY_OPTIONS = [("public", "群組共享"), ("personal", "僅自己")]
+
+print("✅ Team M.E Visibility v4 已啟用：委託/客需/開發/待辦/行事曆 + LINE 公開/個人一致性修正。")
+# =============================================================================
+# Team M.E Visibility Consistency Patch v4 End
 # =============================================================================
 
 
