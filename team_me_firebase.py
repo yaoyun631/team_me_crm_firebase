@@ -43766,6 +43766,81 @@ try:
 except Exception as _case_error:
     print("⚠️ 案件輸入表 V1 載入失敗：", _case_error)
 
+
+
+# ===== Team M.E 案件建檔權限修正 V1.1 =====
+# 必須在檔案最末尾載入：Webhook 以全域名稱查找 line_access_gate。
+PROPERTY_CASE_COMMAND_KEY = "property_case"
+if not any(key == PROPERTY_CASE_COMMAND_KEY for key, _ in LINE_COMMAND_TYPE_OPTIONS):
+    LINE_COMMAND_TYPE_OPTIONS.append((PROPERTY_CASE_COMMAND_KEY, "案件輸入表：#新增案件、#案件資料、#補充案件、#案件PDF、#完成案件；傳截圖辨識"))
+
+_property_original_detect = detect_line_command_type
+def detect_line_command_type(text, event=None):
+    t = (text or "").strip().replace("＃", "#")
+    first = t.splitlines()[0].strip() if t else ""
+    if first in ("#新增案件", "#案件資料", "#案件PDF", "#完成案件") or first.startswith("#補充案件"):
+        return PROPERTY_CASE_COMMAND_KEY
+    return _property_original_detect(text, event)
+
+_property_original_gate = line_access_gate
+def line_access_gate(event):
+    msg = (event or {}).get("message") or {}
+    text = (msg.get("text") or "").strip()
+    cmd_type = detect_line_command_type(text) if msg.get("type") == "text" else ""
+    is_case_image = False
+    if msg.get("type") == "image":
+        user_id = ((event or {}).get("source") or {}).get("userId", "")
+        if user_id:
+            try:
+                snap = db.collection("property_case_sessions").document(user_id).get()
+                is_case_image = bool(snap.exists and (snap.to_dict() or {}).get("case_id"))
+            except Exception:
+                app.logger.exception("無法檢查案件草稿")
+    if cmd_type != PROPERTY_CASE_COMMAND_KEY and not is_case_image:
+        return _property_original_gate(event)
+    kind, target_id = line_event_source_kind_and_id(event)
+    if kind == "user":
+        cfg = find_line_personal_user_by_user_id(target_id)
+        if not cfg:
+            return False, "未授權：請先在設定中心綁定 LINE 個人帳號。", None
+        allowed = bool(cfg.get("enabled", True)) and ("all" in (cfg.get("command_types") or []) or PROPERTY_CASE_COMMAND_KEY in (cfg.get("command_types") or []))
+    else:
+        cfg = find_line_group_by_target_id(target_id)
+        if not cfg:
+            return False, f"此群組尚未登錄。\n群組ID：{target_id}\n請到後台設定中心 → LINE 群組權限新增群組。", None
+        allowed = line_group_allows_command(cfg, PROPERTY_CASE_COMMAND_KEY)
+    if not allowed:
+        return False, "此來源尚未開放『案件輸入表』指令，請到設定中心的可使用指令勾選『案件輸入表』並儲存。", cfg
+    return True, PROPERTY_CASE_COMMAND_KEY, cfg
+
+# 將案件權限和群組設定入口放在設定中心頁面；原有勾選欄位保持不變。
+@app.after_request
+def _property_permission_shortcut(response):
+    try:
+        if request.method != "GET" or request.endpoint not in ("line_card_settings", "line_command_center"):
+            return response
+        if not session.get("user_id") or not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
+            return response
+        if response.status_code != 200 or "text/html" not in response.content_type:
+            return response
+        html = response.get_data(as_text=True)
+        if 'id="property-permission-shortcut"' in html:
+            return response
+        shortcut = ('<div id="property-permission-shortcut" style="margin:12px;padding:12px;border:1px solid #e4d4bd;'
+                    'background:#fff7ec;border-radius:10px">'
+                    '<strong>案件輸入表／群組權限</strong>：請在下方「LINE 群組權限」新增群組 ID，'
+                    '於「可使用指令」勾選「案件輸入表」，再按儲存。'
+                    '若為個人私訊，請在「LINE 個人帳號綁定」勾選同項權限。'
+                    '</div>')
+        html = html.replace('</body>', shortcut + '</body>', 1)
+        response.set_data(html.encode('utf-8'))
+        response.headers.pop('Content-Length', None)
+        response.headers.pop('ETag', None)
+    except Exception:
+        app.logger.exception("案件權限提示插入失敗")
+    return response
+print("✅ 案件建檔權限 V1.1 已載入：property_case / 截圖辨識 / 群組權限")
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
     print("Routes:", app.url_map)
