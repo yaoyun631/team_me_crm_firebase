@@ -43606,6 +43606,166 @@ print("✅ Team M.E Visibility v4 已啟用：委託/客需/開發/待辦/行事
 # =============================================================================
 
 
+
+# =============================================================================
+# Team M.E / LINE 指令統一入口 (2026-10-25)
+# 僅新增「指令總覽」頁面與既有設定頁的導航入口。
+# 保留所有原本的 LINE Webhook、任務分派、權限與資料庫邏輯。
+# 未開發的案件輸入表功能僅列於規劃區，不會假裝已經啟用。
+# =============================================================================
+from markupsafe import escape as _command_escape
+
+_LINE_COMMAND_GROUPS = [
+    ("行事曆", "#今日行程、#明日行程、#本週行程、#新增行程"),
+    ("待辦", "#今日待辦、#待辦、#新增待辦"),
+    ("客需", "#新增客需、#買方追蹤、#帶看、#成交"),
+    ("委託", "#新增委託、#賣方追蹤、#查詢委託到期"),
+    ("AI 文案／案件", "#補強委託資料、#生成強銷、#生成群組文案、#生成案件表"),
+    ("開發", "#新增開發、#開發追蹤、開發自由格式"),
+    ("紀錄", "#查詢紀錄、卡片回覆追蹤／勾選待辦／postback 操作"),
+    ("AI 推薦", "#推薦物件、#找物件、#搜尋物件、AI找物件"),
+    ("物件資料", "直接傳 CSV 更新出售／出租物件庫"),
+    ("愛屋後台", "更新 CSV：自動登入後台匯出並更新物件庫"),
+    ("樂屋曝光", "更新樂屋物件：自動登入樂屋執行更新"),
+    ("自動化", "#自動化、#執行、#指令列表、#上機狀態"),
+    ("房產查詢", "直接傳地址、樂屋網址、591 網址、房屋照片"),
+]
+_CASE_PLANNED_COMMANDS = [
+    ("#新增案件", "建立草稿、收集圖片"),
+    ("#案件資料", "顯示草稿資料"),
+    ("#補充案件", "以文字更新欄位"),
+    ("#案件表單", "開啟手機填寫表單"),
+    ("#完成案件", "確認並儲存案件"),
+    ("#案件PDF", "產生原格式 PDF"),
+    ("#查詢案件", "依地址或編號查詢"),
+]
+
+@app.route('/line-command-center', methods=['GET'], endpoint='line_command_center')
+@login_required
+def line_command_center():
+    if not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
+        return redirect(url_for('line_card_settings'))
+
+    # 使用 Firestore 既有指令清單，讓實際啟用狀態與任務代號維持同步。
+    try:
+        aliases = list_automation_aliases(include_disabled=True)
+        alias_error = ''
+    except Exception as exc:
+        aliases = []
+        alias_error = str(exc)
+
+    parts = [
+        '<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        '<title>Team M.E｜LINE 指令管理中心</title>',
+        '<style>body{font-family:system-ui,"Noto Sans TC",sans-serif;background:#f7f3ed;color:#39352f;margin:0}',
+        '.wrap{max-width:1120px;margin:32px auto;padding:0 18px}',
+        '.card{background:white;border:1px solid #eadfce;border-radius:16px;padding:22px;margin:18px 0}',
+        'h1{font-size:25px}h2{font-size:19px;margin:0 0 16px}',
+        '.links{display:flex;gap:10px;flex-wrap:wrap}.btn{display:inline-block;padding:10px 16px;border-radius:9px;',
+        'background:#f0e7dc;color:#4a382c;text-decoration:none}.primary{background:#e87936;color:white}',
+        'table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px;border-bottom:1px solid #eee}',
+        'th{background:#faf4ed}.muted{color:#827c74}.pill{font-size:12px;background:#f1ede7;padding:4px 8px;border-radius:20px}',
+        '.search{width:100%;box-sizing:border-box;padding:12px;border:1px solid #ddd;border-radius:9px}',
+        '.table-scroll{overflow-x:auto}@media(max-width:600px){h1{font-size:21px}th,td{font-size:13px}}',
+        '</style></head><body><main class="wrap">',
+        '<h1>LINE 指令管理中心</h1>',
+        '<p class="muted">統一檢視內建指令、電腦自動化指令與案件建檔規劃。此頁不改變原本的指令執行方式。</p>',
+        '<div class="links">',
+        f'<a class="btn" href="{url_for("line_card_settings")}">返回設定中心</a>',
+        f'<a class="btn primary" href="{url_for("automation_command_settings")}">管理電腦自動化指令</a>',
+        '</div><section class="card"><h2>搜尋指令</h2>',
+        '<input id="command-search" class="search" placeholder="輸入分類、指令或任務代號…" oninput="filterCommands()"></section>',
+        '<section class="card"><h2>LINE Bot 既有功能</h2><div class="table-scroll"><table class="filter-table">',
+        '<thead><tr><th>分類</th><th>可用指令／操作</th><th>執行位置</th></tr></thead><tbody>',
+    ]
+    for category, desc in _LINE_COMMAND_GROUPS:
+        parts.append(f'<tr><td>{_command_escape(category)}</td><td>{_command_escape(desc)}</td><td>LINE Bot</td></tr>')
+    parts.append('</tbody></table></div></section>')
+    parts.append('<section class="card"><h2>電腦自動化指令 <span class="pill">Firestore 即時清單</span></h2>')
+    if alias_error:
+        parts.append('<p class="muted">讀取指令清單失敗，請至原管理頁確認。</p>')
+    parts.append('<div class="table-scroll"><table class="filter-table"><thead><tr><th>LINE 指令</th><th>任務代號</th><th>主機</th><th>狀態</th></tr></thead><tbody>')
+    for item in aliases:
+        if not isinstance(item, dict):
+            continue
+        alias = str(item.get('alias') or '')
+        task = str(item.get('task_type') or '')
+        worker = str(item.get('target_worker') or '')
+        status = '已啟用' if item.get('enabled') else '停用'
+        parts.append('<tr>' + ''.join(f'<td>{_command_escape(v)}</td>' for v in ('#'+alias, task, worker, status)) + '</tr>')
+    parts.append('</tbody></table></div></section>')
+    parts.append('<section class="card"><h2>案件輸入表（規劃中，尚未啟用）</h2>')
+    parts.append('<p class="muted">下列指令只是開發規劃；目前不會在 LINE 上執行案件建檔。</p>')
+    parts.append('<div class="table-scroll"><table class="filter-table"><thead><tr><th>預定指令</th><th>用途</th><th>狀態</th></tr></thead><tbody>')
+    for command, desc in _CASE_PLANNED_COMMANDS:
+        parts.append(f'<tr><td>{_command_escape(command)}</td><td>{_command_escape(desc)}</td><td>待開發</td></tr>')
+    parts.append('</tbody></table></div></section>')
+    parts.append('''</main><script>
+function filterCommands(){
+ const q=document.getElementById('command-search').value.trim().toLowerCase();
+ document.querySelectorAll('.filter-table tbody tr').forEach(row=>{
+   row.style.display=row.textContent.toLowerCase().includes(q)?'':'none';
+ });
+}
+</script></body></html>''')
+    return Response(''.join(parts), mimetype='text/html; charset=utf-8')
+
+# 對設定中心和既有指令列表的 HTML 回應，加入固定可見的指令總覽入口。
+# 不動既有 Jinja 模板，也不改任何 POST／Webhook 邏輯。
+@app.after_request
+def _team_me_command_navigation(response):
+    try:
+        if request.method != 'GET' or request.endpoint not in {
+            'line_card_settings', 'automation_command_settings',
+        }:
+            return response
+        if not session.get('user_id') or not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
+            return response
+        if response.status_code != 200 or 'text/html' not in response.content_type:
+            return response
+        html = response.get_data(as_text=True)
+        if 'id="team-me-command-nav"' in html:
+            return response
+        nav = (
+            '<div id="team-me-command-nav" style="position:fixed;right:16px;bottom:16px;'
+            'z-index:9999;display:flex;gap:8px;flex-wrap:wrap">'
+            '<a href="' + url_for('line_command_center') + '" '
+            'style="background:#e87936;color:white;text-decoration:none;'
+            'padding:11px 16px;border-radius:24px;box-shadow:0 2px 12px #0002">'
+            'LINE 指令總覽</a>'
+            '<a href="' + url_for('automation_command_settings') + '" '
+            'style="background:#fff;color:#714b32;text-decoration:none;'
+            'padding:11px 16px;border:1px solid #ddd;border-radius:24px;box-shadow:0 2px 12px #0002">'
+            '指令設定</a></div>'
+        )
+        if '</body>' in html:
+            html = html.replace('</body>', nav + '</body>', 1)
+        else:
+            html += nav
+        response.set_data(html.encode('utf-8'))
+        response.headers.pop('Content-Length', None)
+        response.headers.pop('ETag', None)
+    except Exception as exc:
+        print('⚠️ LINE 指令導覽入口產生失敗：', exc)
+    return response
+
+print('✅ LINE 指令管理中心已載入：/line-command-center')
+# =============================================================================
+
+
+# ===== 案件輸入表 V1：LINE 圖片辨識、Firestore 草稿、原 PDF =====
+try:
+    from property_case_v1 import register_property_case_v1
+    register_property_case_v1(
+        app=app, db=db,
+        pdf_template=os.path.join(BASE_DIR, "案件輸入表-使用中.pdf"),
+        access_token=LINE_CHANNEL_ACCESS_TOKEN,
+    )
+    print("✅ 案件輸入表 V1 已載入：#新增案件 / #案件資料 / #補充案件 / #案件PDF")
+except Exception as _case_error:
+    print("⚠️ 案件輸入表 V1 載入失敗：", _case_error)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
     print("Routes:", app.url_map)
