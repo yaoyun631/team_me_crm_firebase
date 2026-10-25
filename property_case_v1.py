@@ -214,6 +214,7 @@ def register_property_case_v1(app, db, pdf_template, access_token):
         rows=[{'id':d.id,**(d.to_dict() or {})} for d in docs]
         return render_template_string('''<meta charset="utf-8"><title>案件建檔</title><style>body{font-family:Arial,sans-serif;max-width:950px;margin:30px auto}table{width:100%;border-collapse:collapse}td,th{padding:12px;border-bottom:1px solid #ddd}</style><h2>案件輸入表管理（初版）</h2><table><tr><th>地址／案名</th><th>狀態</th><th>更新時間</th><th>PDF</th></tr>{% for c in rows %}<tr><td>{{ c.get('fields',{}).get('address') or c.get('fields',{}).get('property_name') or c.id[:8] }}</td><td>{{c.get('status','草稿')}}</td><td>{{c.get('updated_at','')}}</td><td><a href="{{url_for('property_v1.pdf',cid=c.id)}}">下載</a></td></tr>{% endfor %}</table>''',rows=rows)
     app.register_blueprint(bp)
+    app.config["PROPERTY_CASE_V15_HANDLER"] = handle
     old=app.config.get('PROPERTY_V1_ORIGINAL_PROCESSOR')
     if old is None:
         old=app.view_functions.get('line_webhook')

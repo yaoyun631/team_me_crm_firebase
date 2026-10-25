@@ -43634,10 +43634,10 @@ _CASE_PLANNED_COMMANDS = [
     ("#新增案件", "建立草稿、收集圖片"),
     ("#案件資料", "顯示草稿資料"),
     ("#補充案件", "以文字更新欄位"),
-    ("#案件表單", "開啟手機填寫表單"),
-    ("#完成案件", "確認並儲存案件"),
-    ("#案件PDF", "傳送 A4 案件圖片"),
-    ("#查詢案件", "依地址或編號查詢"),
+    ("#案件圖片", "直接傳送 A4 案件輸入表圖片"),
+    ("#完成案件", "確認目前案件草稿"),
+    ("#案件PDF", "相容舊指令，同樣直接傳送 A4 圖片"),
+    
 ]
 
 @app.route('/line-command-center', methods=['GET'], endpoint='line_command_center')
@@ -43670,10 +43670,11 @@ def line_command_center():
         '.table-scroll{overflow-x:auto}@media(max-width:600px){h1{font-size:21px}th,td{font-size:13px}}',
         '</style></head><body><main class="wrap">',
         '<h1>LINE 指令管理中心</h1>',
-        '<p class="muted">統一檢視內建指令、電腦自動化指令與案件建檔規劃。此頁不改變原本的指令執行方式。</p>',
+        '<p class="muted">統一檢視內建指令、電腦自動化指令與案件建檔與權限設定。此頁不改變原本的指令執行方式。</p>',
         '<div class="links">',
         f'<a class="btn" href="{url_for("line_card_settings")}">返回設定中心</a>',
         f'<a class="btn primary" href="{url_for("automation_command_settings")}">管理電腦自動化指令</a>',
+        f'<a class="btn" href="{url_for("line_card_settings")}">設定群組／個人指令權限</a>',
         '</div><section class="card"><h2>搜尋指令</h2>',
         '<input id="command-search" class="search" placeholder="輸入分類、指令或任務代號…" oninput="filterCommands()"></section>',
         '<section class="card"><h2>LINE Bot 既有功能</h2><div class="table-scroll"><table class="filter-table">',
@@ -43695,12 +43696,12 @@ def line_command_center():
         status = '已啟用' if item.get('enabled') else '停用'
         parts.append('<tr>' + ''.join(f'<td>{_command_escape(v)}</td>' for v in ('#'+alias, task, worker, status)) + '</tr>')
     parts.append('</tbody></table></div></section>')
-    parts.append('<section class="card"><h2>案件輸入表（規劃中，尚未啟用）</h2>')
-    parts.append('<p class="muted">下列指令只是開發規劃；目前不會在 LINE 上執行案件建檔。</p>')
-    parts.append('<div class="table-scroll"><table class="filter-table"><thead><tr><th>預定指令</th><th>用途</th><th>狀態</th></tr></thead><tbody>')
+    parts.append('<section class="card"><h2>案件輸入表（已整合 V1.4）</h2>')
+    parts.append('<p class="muted">以下為已整合的 LINE 案件建檔指令；請在設定中心 → 群組或個人 → 可使用指令，勾選「案件輸入表」並儲存。截圖辨識需 Gemini API 有可用額度。</p>')
+    parts.append('<div class="table-scroll"><table class="filter-table"><thead><tr><th>LINE 指令</th><th>用途</th><th>狀態</th></tr></thead><tbody>')
     for command, desc in _CASE_PLANNED_COMMANDS:
-        parts.append(f'<tr><td>{_command_escape(command)}</td><td>{_command_escape(desc)}</td><td>待開發</td></tr>')
-    parts.append('</tbody></table></div></section>')
+        parts.append(f'<tr><td>{_command_escape(command)}</td><td>{_command_escape(desc)}</td><td>已整合</td></tr>')
+    parts.append('</tbody></table></div><p class="muted">傳送圖片：先輸入 #新增案件，再傳送物件截圖；輸入 #案件圖片 或 #案件PDF，會在 LINE 直接顯示 A4 圖片。注意：#案件表單、#查詢案件目前尚未實作。</p></section>')
     parts.append('''</main><script>
 function filterCommands(){
  const q=document.getElementById('command-search').value.trim().toLowerCase();
@@ -43720,7 +43721,7 @@ def _team_me_command_navigation(response):
             'line_card_settings', 'automation_command_settings',
         }:
             return response
-        if not session.get('user_id') or not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
+        if not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
             return response
         if response.status_code != 200 or 'text/html' not in response.content_type:
             return response
@@ -43733,7 +43734,7 @@ def _team_me_command_navigation(response):
             '<a href="' + url_for('line_command_center') + '" '
             'style="background:#e87936;color:white;text-decoration:none;'
             'padding:11px 16px;border-radius:24px;box-shadow:0 2px 12px #0002">'
-            'LINE 指令總覽</a>'
+            'LINE 指令／案件管理</a>'
             '<a href="' + url_for('automation_command_settings') + '" '
             'style="background:#fff;color:#714b32;text-decoration:none;'
             'padding:11px 16px;border:1px solid #ddd;border-radius:24px;box-shadow:0 2px 12px #0002">'
@@ -43756,13 +43757,13 @@ print('✅ LINE 指令管理中心已載入：/line-command-center')
 
 # ===== 案件輸入表 V1：LINE 圖片辨識、Firestore 草稿、原 PDF =====
 try:
-    from property_case_v13 import register_property_case_v1
+    from property_case_v15 import register_property_case_v1
     register_property_case_v1(
         app=app, db=db,
         pdf_template=os.path.join(BASE_DIR, "案件輸入表-使用中.pdf"),
         access_token=LINE_CHANNEL_ACCESS_TOKEN,
     )
-    print("✅ 案件輸入表 V1 已載入：#新增案件 / #案件資料 / #補充案件 / #案件PDF")
+    print("✅ 案件輸入表 V1.4 已載入：#新增案件 / #案件資料 / #補充案件 / #案件圖片 / #案件PDF")
 except Exception as _case_error:
     print("⚠️ 案件輸入表 V1 載入失敗：", _case_error)
 
@@ -43819,7 +43820,7 @@ def _property_permission_shortcut(response):
     try:
         if request.method != "GET" or request.endpoint not in ("line_card_settings", "line_command_center"):
             return response
-        if not session.get("user_id") or not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
+        if not session.get(LINE_SETTINGS_ADMIN_SESSION_KEY):
             return response
         if response.status_code != 200 or "text/html" not in response.content_type:
             return response
@@ -43840,6 +43841,88 @@ def _property_permission_shortcut(response):
         app.logger.exception("案件權限提示插入失敗")
     return response
 print("✅ 案件建檔權限 V1.1 已載入：property_case / 截圖辨識 / 群組權限")
+
+
+# =============================================================================
+# Team M.E V1.5 - 案件指令優先路由 / 依 LINE 事件 ID 去重
+# 保留既有 LINE CRM 及權限設定，不再讓舊文字內容去重攔截案件指令。
+# =============================================================================
+_CASE_V15_PREVIOUS_PROCESSOR = process_line_message_event
+_CASE_V15_COMMANDS = frozenset(("#新增案件", "#案件資料", "#案件圖片", "#案件PDF", "#完成案件"))
+
+def _case_v15_is_command(text):
+    text = str(text or "").strip().replace("＃", "#")
+    return text in _CASE_V15_COMMANDS or text.startswith("#補充案件")
+
+def _case_v15_event_key(event):
+    msg = (event or {}).get("message") or {}
+    eid = str((event or {}).get("webhookEventId") or "").strip()
+    mid = str(msg.get("id") or "").strip()
+    # 沒有 LINE 唯一識別碼時不以相同指令文字當作重複事件。
+    if not eid and not mid:
+        return None
+    import hashlib
+    raw = "webhook:" + eid if eid else "message:" + mid
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def _case_v15_active_image(event):
+    msg = (event or {}).get("message") or {}
+    if msg.get("type") != "image":
+        return False
+    uid = str(((event or {}).get("source") or {}).get("userId") or "")
+    if not uid:
+        return False
+    try:
+        snap = db.collection("property_case_sessions").document(uid).get()
+        return bool(snap.exists and (snap.to_dict() or {}).get("case_id"))
+    except Exception:
+        app.logger.exception("案件 V1.5 讀取草稿失敗")
+        return False
+
+def process_line_message_event(event):
+    message = (event or {}).get("message") or {}
+    text = str(message.get("text") or "")
+    is_case = message.get("type") == "text" and _case_v15_is_command(text)
+    is_case_image = _case_v15_active_image(event)
+    if not is_case and not is_case_image:
+        return _CASE_V15_PREVIOUS_PROCESSOR(event)
+
+    # 仍使用原本設定中心的群組/個人權限檢查。
+    allowed, reason, _cfg = line_access_gate(event)
+    if not allowed:
+        return {"handled": True, "ok": False, "reply_text": str(reason)}
+
+    handler = app.config.get("PROPERTY_CASE_V15_HANDLER")
+    if not callable(handler):
+        return {"handled": True, "ok": False,
+                "reply_text": "案件功能尚未成功載入，請檢查 property_case_v15.py 與 Render 日誌。"}
+
+    event_key = _case_v15_event_key(event)
+    if event_key:
+        try:
+            db.collection("property_case_v15_processed_events").document(event_key).create({
+                "created_at": datetime.now().isoformat(),
+                "event_id": str((event or {}).get("webhookEventId") or ""),
+                "message_id": str(message.get("id") or ""),
+            })
+        except Exception as exc:
+            if exc.__class__.__name__ in ("AlreadyExists", "Conflict"):
+                # LINE Webhook 重送不應再回覆一則「已略過重複訊息」。
+                return {"handled": True, "ok": True, "skipped_duplicate": True}
+            app.logger.exception("案件 V1.5 事件去重儲存失敗，繼續處理")
+
+    try:
+        result = handler(event)
+        if result is not None:
+            return result
+        return {"handled": True, "ok": False,
+                "reply_text": "尚未建立案件草稿，請先輸入 #新增案件。"}
+    except Exception:
+        app.logger.exception("案件 V1.5 處理失敗")
+        return {"handled": True, "ok": False,
+                "reply_text": "案件處理暫時失敗，請查看 Render 日誌後再試。"}
+
+print("✅ 案件 V1.5：優先路由、事件 ID 去重、保留群組權限與 A4 圖片回覆")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
