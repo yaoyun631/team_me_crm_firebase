@@ -5,8 +5,9 @@ import os, re, json, base64, tempfile
 from io import BytesIO
 from datetime import datetime
 import requests
-from flask import Blueprint, request, session, redirect, url_for, abort, send_file, render_template_string
+from flask import Blueprint, request, session, redirect, url_for, abort, send_file, render_template_string, current_app
 from google.cloud import firestore
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 FIELDS = {
  'address':'物件地址','building_no':'建號','land_no':'地號','property_name':'物件名稱','community':'社區名稱',
@@ -32,20 +33,93 @@ def parse_image(image_bytes, mime='image/jpeg'):
     return {k: str(v) for k,v in data.items() if k in FIELDS and v is not None}, data.get('_warnings', [])
 
 def parse_text(s):
+    """不耗 AI 額度的房仲文字解析；只填明確出現的欄位。"""
     out={}
-    for line in re.split(r'[\n,，;；]+',s):
-        m=re.search(r'(?:開價|售價)\s*[:：]?\s*([\d.]+)\s*萬',line)
-        if m: out['price']=m.group(1)
-        m=re.search(r'(\d+)房\s*(\d+)廳\s*(\d+)衛',line)
-        if m: out.update(zip(('rooms','halls','baths'),m.groups()))
-        for label,key in [('地址','address'),('物件名稱','property_name'),('社區','community'),('屋主','owner_name'),('手機','owner_phone'),('特色','features'),('備註','notes'),('管理費','management_fee')]:
-            m=re.search(re.escape(label)+r'\s*[:：]\s*(.+)',line)
-            if m: out[key]=m.group(1).strip()
+    t=(s or '').replace('＃','#')
+    for pat,key in [
+        (r'(?:物件地址|地址)\s*[:：]\s*([^\n，,]+)', 'address'),
+        (r'(?:開價|售價|總價)\s*[:：]?\s*([\d,.]+)\s*萬','price'),
+        (r'(?:月租金|租金|租金每月)\s*[:：]?\s*(?:[$＄])?\s*([\d,]+)','rent'),
+        (r'(?:管理費)\s*[:：]?\s*(?:[$＄])?\s*([\d,]+)','management_fee'),
+        (r'(?:押金)\s*[:：]?\s*([^\n，,]+)','deposit_note'),
+        (r'(?:租期)\s*[:：]?\s*([^\n，,]+)','lease_note'),
+        (r'(?:物件名稱|案名)\s*[:：]\s*([^\n，,]+)','property_name'),
+        (r'(?:社區名稱|社區)\s*[:：]\s*([^\n，,]+)','community'),
+        (r'(?:屋主|姓名)\s*[:：]\s*([^\n，,]+)','owner_name'),
+        (r'(?:手機|行動電話)\s*[:：]\s*([0-9\-]+)','owner_phone'),
+        (r'(?:備註|特色)\s*[:：]\s*([^\n]+)','features'),
+        (r'(?:總坪|建坪)\s*[:：]?\s*([\d.]+)\s*坪','total_ping'),
+        (r'(?:主坪|主建)\s*[:：]?\s*([\d.]+)\s*坪','main_ping'),
+        (r'(?:屋齡)\s*[:：]?\s*([\d.]+)\s*年','age'),
+    ]:
+        m=re.search(pat,t)
+        if m and key in FIELDS: out[key]=m.group(1).strip()
+    m=re.search(r'(\d+)\s*房\s*(\d+)\s*[廳厅]\s*(\d+)\s*衛',t)
+    if m: out.update(zip(('rooms','halls','baths'),m.groups()))
+    m=re.search(r'(?:格局)\s*[:：]?\s*(\d+)\s*房',t)
+    if m and 'rooms' not in out: out['rooms']=m.group(1)
+    m=re.search(r'(?:押金)\s*[:：]?\s*(兩|二|2)\s*個月',t)
+    if m: out['notes']=(out.get('notes','')+' 押金兩個月').strip()
+    if '租期' in t:
+        m=re.search(r'租期\s*[:：]?\s*([^\n，,]+)',t)
+        if m: out['notes']=(out.get('notes','')+' 租期：'+m.group(1)).strip()
+    m=re.search(r'(?:車位|停車)\s*[:：]?\s*([^\n，,]+)',t)
+    if m: out['parking_type']=m.group(1).strip()[:40]
+    # 沒有明確「地址：」時，允許直接擷取台灣門牌
+    if 'address' not in out:
+        m=re.search(r'(?:台|臺)[中北南東]市[^\n，,]{1,55}?\d+\s*號(?:\s*\d+\s*樓)?',t)
+        if m: out['address']=m.group(0).strip()
+    # 對於原始 PDF 沒有欄位的租期/押金，放入備註
     return out
 
 def register_property_case_v1(app, db, pdf_template, access_token):
     import fitz
     bp=Blueprint('property_v1',__name__)
+    def signer():
+        return URLSafeTimedSerializer(app.secret_key, salt='property-case-line-v12')
+    def share_url(cid,kind):
+        token=signer().dumps({'cid':cid,'kind':kind})
+        base=os.getenv('PUBLIC_BASE_URL','').rstrip('/') or request.host_url.rstrip('/')
+        return f'{base}/property-case/line-share/{cid}/{kind}/{token}'
+    def render_pdf_bytes(cid):
+        doc=db.collection('property_cases').document(cid).get()
+        if not doc.exists: abort(404)
+        fields=(doc.to_dict() or {}).get('fields',{})
+        src=fitz.open(pdf_template);page=src[0]
+        label_map={'property_name':'物件名稱','community':'社區名稱','total_ping':'建物總面積','main_ping':'主建','aux_ping':'附屬','shared_ping':'公設','land_ping':'土地總面積','price':'售價','rent':'月租金','age':'屋齡','management_fee':'管 理 費','rooms':'物件格局','total_floors':'地上樓層','completed_date':'竣工日期','features':'案件特色詳細說明','notes':'產權特別注意事項'}
+        font_path=os.getenv('PROPERTY_CJK_FONT','/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc')
+        if os.path.exists(font_path):
+            try: page.insert_font(fontname='casefont',fontfile=font_path); font='casefont'
+            except Exception: font='china-s'
+        else: font='china-s'
+        for key,label in label_map.items():
+            value=str(fields.get(key,'')).strip()
+            if not value: continue
+            hits=page.search_for(label)
+            if not hits: continue
+            box=hits[0];x=box.x1+5;y=box.y1-2
+            if key in ('features','notes'): x=box.x0+2;y=box.y1+9;value=value[:90]
+            elif key=='property_name':value=value[:12]
+            else:value=value[:24]
+            try:page.insert_text((x,y),value,fontname=font,fontsize=7,color=(0.05,0.2,0.65),overlay=True)
+            except Exception:app.logger.exception('PDF field failed: %s',key)
+        out=src.tobytes(garbage=4,deflate=True);src.close()
+        return out
+    @bp.route('/property-case/line-share/<cid>/<kind>/<token>')
+    def line_share(cid,kind,token):
+        if kind not in ('pdf','png'):abort(404)
+        try:
+            data=signer().loads(token,max_age=1800)
+            if data.get('cid')!=cid or data.get('kind')!=kind:abort(403)
+        except (BadSignature,SignatureExpired):abort(403)
+        pdfbytes=render_pdf_bytes(cid)
+        if kind=='pdf':
+            return send_file(BytesIO(pdfbytes),mimetype='application/pdf',as_attachment=True,download_name=f'案件輸入表_{cid[:8]}.pdf',max_age=0)
+        doc=fitz.open(stream=pdfbytes,filetype='pdf')
+        pix=doc[0].get_pixmap(matrix=fitz.Matrix(1.7,1.7),alpha=False)
+        data=pix.tobytes('png');doc.close()
+        return send_file(BytesIO(data),mimetype='image/png',max_age=0)
+
     def current(user):
         docs=list(db.collection('property_case_sessions').where('user_id','==',user).limit(1).stream())
         if docs:
@@ -78,9 +152,11 @@ def register_property_case_v1(app, db, pdf_template, access_token):
             if raw=='#完成案件':
                 db.collection('property_cases').document(cid).update({'status':'已確認'})
                 return {'handled':True,'ok':True,'reply_text':'✅ 案件已標記確認。輸入 #案件PDF 可取得下載連結。'}
-            base=os.getenv('PUBLIC_BASE_URL','').rstrip('/')
-            if not base: base=request.host_url.rstrip('/')
-            return {'handled':True,'ok':True,'reply_text':f'📄 PDF 下載：{base}/property-case/pdf/{cid}\n（需要登入後台並有案件存取權）'}
+            pdf_url=share_url(cid,'pdf')
+            png_url=share_url(cid,'png')
+            return {'handled':True,'ok':True,'reply_messages':[
+                {'type':'image','originalContentUrl':png_url,'previewImageUrl':png_url},
+                {'type':'text','text':'📄 案件輸入表已產生（上方圖片可直接在群組查看）。\n下載原格式 PDF（連結有效 30 分鐘）：\n'+pdf_url+'\n⚠️ LINE Bot API 不支援直接傳送 PDF 附件。'}]}
         if typ=='image':
             mid=msg.get('id')
             try:
@@ -92,8 +168,13 @@ def register_property_case_v1(app, db, pdf_template, access_token):
                 return {'handled':True,'ok':True,'reply_text':'✅ 截圖辨識完成\n'+(summary or '沒有辨識出可確認的欄位')+('\n⚠️ '+str(warnings[0]) if warnings else '')+'\n\n可繼續傳截圖或文字補充。'}
             except Exception as e:
                 app.logger.exception('property screenshot failed')
-                return {'handled':True,'ok':False,'reply_text':f'⚠️ 截圖處理失敗：{str(e)[:150]}'}
-        if typ=='text' and raw.startswith(('#補充案件','補充案件')):
+                err=str(e)
+                if 'RESOURCE_EXHAUSTED' in err or '429' in err or '402' in err or 'credits are depleted' in err:
+                    msg='⚠️ 圖片 AI 辨識額度已用完，目前無法自動讀取截圖。\n案件草稿仍在，請改傳「#補充案件 地址：...、租金：...」等文字；額度恢復後可重新傳圖片。'
+                else:
+                    msg='⚠️ 截圖辨識失敗，案件草稿已保留。請稍後重試或使用 #補充案件 文字輸入。'
+                return {'handled':True,'ok':False,'reply_text':msg}
+        if typ=='text' and (raw.startswith(('#補充案件','補充案件')) or (not raw.startswith('#') and any(w in raw for w in ('地址','租金','開價','售價','格局','管理費','房','屋齡')))):
             fields=parse_text(raw.replace('#補充案件','',1).replace('補充案件','',1))
             if not fields: return {'handled':True,'ok':False,'reply_text':'未找到可辨識欄位，請使用「開價1588萬，3房2廳2衛」或「地址：...」等格式。'}
             save_case(cid,fields,user)
@@ -102,30 +183,8 @@ def register_property_case_v1(app, db, pdf_template, access_token):
     @bp.route('/property-case/pdf/<cid>')
     def pdf(cid):
         if not session.get('user_id'): return redirect(url_for('login',next=request.path))
-        doc=db.collection('property_cases').document(cid).get()
-        if not doc.exists: abort(404)
-        # 初版：僅限後台已登入人員；部署前應再補細緻的案件權限規則
-        fields=(doc.to_dict() or {}).get('fields',{})
-        src=fitz.open(pdf_template); page=src[0]
-        # 以原表欄位標籤位置為定位基準，避開原有文字
-        label_map={'property_name':'物件名稱','community':'社區名稱','total_ping':'建物總面積','main_ping':'主建','aux_ping':'附屬','shared_ping':'公設','land_ping':'土地總面積','price':'售價','rent':'月租金','age':'屋齡','management_fee':'管 理 費','rooms':'物件格局','total_floors':'地上樓層','completed_date':'竣工日期','features':'案件特色詳細說明','notes':'產權特別注意事項'}
-        font_path=os.getenv('PROPERTY_CJK_FONT','/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc')
-        if os.path.exists(font_path): page.insert_font(fontname='casefont',fontfile=font_path); font='casefont'
-        else: font='china-s'
-        for key,label in label_map.items():
-            value=str(fields.get(key,'')).strip()
-            if not value: continue
-            hits=page.search_for(label)
-            if not hits: continue
-            box=hits[0]; x=box.x1+5; y=box.y1-2
-            # 欄位寬度依原表保守限制；太長則截斷並保留原資料庫全文
-            if key in ('features','notes'): x=box.x0+2; y=box.y1+9; value=value[:90]
-            elif key=='property_name': value=value[:12]
-            else: value=value[:24]
-            try: page.insert_text((x,y),value,fontname=font,fontsize=7,color=(0.05,0.2,0.65),overlay=True)
-            except Exception: app.logger.exception('PDF field failed: %s',key)
-        buf=BytesIO(src.tobytes(garbage=4,deflate=True));src.close();buf.seek(0)
-        return send_file(buf,mimetype='application/pdf',as_attachment=True,download_name=f'案件輸入表_{cid[:8]}.pdf')
+        pdfbytes=render_pdf_bytes(cid)
+        return send_file(BytesIO(pdfbytes),mimetype='application/pdf',as_attachment=True,download_name=f'案件輸入表_{cid[:8]}.pdf')
     @bp.route('/property-case')
     def list_cases():
         if not session.get('user_id'): return redirect(url_for('login'))
