@@ -79,7 +79,8 @@ def register_property_case_v1(app, db, pdf_template, access_token):
         return URLSafeTimedSerializer(app.secret_key, salt='property-case-line-v12')
     def share_url(cid,kind):
         token=signer().dumps({'cid':cid,'kind':kind})
-        base=os.getenv('PUBLIC_BASE_URL','').rstrip('/') or request.host_url.rstrip('/')
+        # LINE 伺服器必須能以公開 HTTPS 直接讀取圖片，不能走後台登入。
+        base=os.getenv('PUBLIC_BASE_URL','https://teamme.onrender.com').rstrip('/')
         return f'{base}/property-case/line-share/{cid}/{kind}/{token}'
     def render_pdf_bytes(cid):
         doc=db.collection('property_cases').document(cid).get()
@@ -105,20 +106,41 @@ def register_property_case_v1(app, db, pdf_template, access_token):
             except Exception:app.logger.exception('PDF field failed: %s',key)
         out=src.tobytes(garbage=4,deflate=True);src.close()
         return out
-    @bp.route('/property-case/line-share/<cid>/<kind>/<token>')
+    @bp.route('/property-case/line-share/<cid>/<kind>/<token>', methods=['GET','HEAD'])
     def line_share(cid,kind,token):
-        if kind not in ('pdf','png'):abort(404)
+        # JPG 專供 LINE Messaging API，原圖和縮圖分別產生。
+        if kind not in ('pdf','png','jpg','preview'): abort(404)
         try:
-            data=signer().loads(token,max_age=1800)
-            if data.get('cid')!=cid or data.get('kind')!=kind:abort(403)
-        except (BadSignature,SignatureExpired):abort(403)
+            data=signer().loads(token,max_age=86400 if kind in ('jpg','preview') else 1800)
+            if data.get('cid')!=cid or data.get('kind')!=kind: abort(403)
+        except (BadSignature,SignatureExpired): abort(403)
         pdfbytes=render_pdf_bytes(cid)
         if kind=='pdf':
             return send_file(BytesIO(pdfbytes),mimetype='application/pdf',as_attachment=True,download_name=f'案件輸入表_{cid[:8]}.pdf',max_age=0)
         doc=fitz.open(stream=pdfbytes,filetype='pdf')
-        pix=doc[0].get_pixmap(matrix=fitz.Matrix(1.7,1.7),alpha=False)
-        data=pix.tobytes('png');doc.close()
-        return send_file(BytesIO(data),mimetype='image/png',max_age=0)
+        try:
+            # A4 300DPI 2480x3508，縮圖約 600px 寬。
+            dpi=300 if kind=='jpg' else 72 if kind=='preview' else 122
+            pix=doc[0].get_pixmap(dpi=dpi,alpha=False,colorspace=fitz.csRGB)
+            if kind in ('jpg','preview'):
+                from PIL import Image
+                im=Image.frombytes('RGB',(pix.width,pix.height),pix.samples)
+                if kind=='preview':
+                    im.thumbnail((600,850),Image.Resampling.LANCZOS)
+                out=BytesIO()
+                im.save(out,format='JPEG',quality=86 if kind=='jpg' else 75,optimize=True)
+                blob=out.getvalue()
+                if len(blob)>10*1024*1024: abort(500,'A4 圖片超過 LINE 10MB 限制')
+                if kind=='preview' and len(blob)>1024*1024: abort(500,'縮圖超過 LINE 1MB 限制')
+                mime='image/jpeg'
+            else:
+                blob=pix.tobytes('png');mime='image/png'
+        finally:
+            doc.close()
+        response=send_file(BytesIO(blob),mimetype=mime,as_attachment=False,max_age=300)
+        response.headers['X-Content-Type-Options']='nosniff'
+        response.headers['Cache-Control']='public, max-age=300'
+        return response
 
     def current(user):
         docs=list(db.collection('property_case_sessions').where('user_id','==',user).limit(1).stream())
@@ -143,7 +165,7 @@ def register_property_case_v1(app, db, pdf_template, access_token):
             return {'handled':True,'ok':True,'reply_text':'✅ 已建立案件草稿\n請直接傳送物件資料截圖（可多張），或文字補充。\n輸入 #案件資料 查看，#案件PDF 產生表格。'}
         cid=current(user)
         if not cid: return None
-        if typ=='text' and raw in ('#案件資料','#案件PDF','#完成案件'):
+        if typ=='text' and raw in ('#案件資料','#案件PDF','#案件圖片','#完成案件'):
             doc=db.collection('property_cases').document(cid).get().to_dict() or {}
             fields=doc.get('fields') or {}
             if raw=='#案件資料':
@@ -152,11 +174,11 @@ def register_property_case_v1(app, db, pdf_template, access_token):
             if raw=='#完成案件':
                 db.collection('property_cases').document(cid).update({'status':'已確認'})
                 return {'handled':True,'ok':True,'reply_text':'✅ 案件已標記確認。輸入 #案件PDF 可取得下載連結。'}
-            pdf_url=share_url(cid,'pdf')
-            png_url=share_url(cid,'png')
+            original_url=share_url(cid,'jpg')
+            preview_url=share_url(cid,'preview')
             return {'handled':True,'ok':True,'reply_messages':[
-                {'type':'image','originalContentUrl':png_url,'previewImageUrl':png_url},
-                {'type':'text','text':'📄 案件輸入表已產生（上方圖片可直接在群組查看）。\n下載原格式 PDF（連結有效 30 分鐘）：\n'+pdf_url+'\n⚠️ LINE Bot API 不支援直接傳送 PDF 附件。'}]}
+                {'type':'image','originalContentUrl':original_url,'previewImageUrl':preview_url},
+                {'type':'text','text':'🖼️ A4 案件輸入表已產生（300 DPI JPG）。點上方圖片即可放大、儲存或轉傳。\n如顯示空白，請檢查 Render 是否可公開存取圖片網址及部署日誌。'}]}
         if typ=='image':
             mid=msg.get('id')
             try:

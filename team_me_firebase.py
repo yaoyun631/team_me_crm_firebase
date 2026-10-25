@@ -43636,7 +43636,7 @@ _CASE_PLANNED_COMMANDS = [
     ("#補充案件", "以文字更新欄位"),
     ("#案件表單", "開啟手機填寫表單"),
     ("#完成案件", "確認並儲存案件"),
-    ("#案件PDF", "產生原格式 PDF"),
+    ("#案件PDF", "傳送 A4 案件圖片"),
     ("#查詢案件", "依地址或編號查詢"),
 ]
 
@@ -43756,7 +43756,7 @@ print('✅ LINE 指令管理中心已載入：/line-command-center')
 
 # ===== 案件輸入表 V1：LINE 圖片辨識、Firestore 草稿、原 PDF =====
 try:
-    from property_case_v1 import register_property_case_v1
+    from property_case_v13 import register_property_case_v1
     register_property_case_v1(
         app=app, db=db,
         pdf_template=os.path.join(BASE_DIR, "案件輸入表-使用中.pdf"),
@@ -43772,13 +43772,13 @@ except Exception as _case_error:
 # 必須在檔案最末尾載入：Webhook 以全域名稱查找 line_access_gate。
 PROPERTY_CASE_COMMAND_KEY = "property_case"
 if not any(key == PROPERTY_CASE_COMMAND_KEY for key, _ in LINE_COMMAND_TYPE_OPTIONS):
-    LINE_COMMAND_TYPE_OPTIONS.append((PROPERTY_CASE_COMMAND_KEY, "案件輸入表：#新增案件、#案件資料、#補充案件、#案件PDF、#完成案件；傳截圖辨識"))
+    LINE_COMMAND_TYPE_OPTIONS.append((PROPERTY_CASE_COMMAND_KEY, "案件輸入表：#新增案件、#案件資料、#補充案件、#案件圖片、#案件PDF、#完成案件；傳截圖辨識"))
 
 _property_original_detect = detect_line_command_type
 def detect_line_command_type(text, event=None):
     t = (text or "").strip().replace("＃", "#")
     first = t.splitlines()[0].strip() if t else ""
-    if first in ("#新增案件", "#案件資料", "#案件PDF", "#完成案件") or first.startswith("#補充案件"):
+    if first in ("#新增案件", "#案件資料", "#案件PDF", "#案件圖片", "#完成案件") or first.startswith("#補充案件"):
         return PROPERTY_CASE_COMMAND_KEY
     return _property_original_detect(text, event)
 
