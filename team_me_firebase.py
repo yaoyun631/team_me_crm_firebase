@@ -43758,13 +43758,13 @@ print('✅ LINE 指令管理中心已載入：/line-command-center')
 
 # ===== 案件輸入表 V1：LINE 圖片辨識、Firestore 草稿、原 PDF =====
 try:
-    from property_case_v22 import register_property_case_v1
+    from property_case_v23 import register_property_case_v1
     register_property_case_v1(
         app=app, db=db,
         pdf_template=os.path.join(BASE_DIR, "案件輸入表-使用中.pdf"),
         access_token=LINE_CHANNEL_ACCESS_TOKEN,
     )
-    print("✅ 案件輸入表 V1.9 已載入：#新增案件 / #案件資料 / #補充案件 / #案件圖片 / #案件PDF")
+    print("✅ 案件輸入表 V2.3 已載入：#新增案件 / #案件資料 / #補充案件 / #案件圖片 / #案件PDF")
 except Exception as _case_error:
     print("⚠️ 案件輸入表 V1 載入失敗：", _case_error)
 
@@ -43896,7 +43896,7 @@ def process_line_message_event(event):
     handler = app.config.get("PROPERTY_CASE_V15_HANDLER")
     if not callable(handler):
         return {"handled": True, "ok": False,
-                "reply_text": "案件功能尚未成功載入，請檢查 property_case_v22.py 與 Render 日誌。"}
+                "reply_text": "案件功能尚未成功載入，請檢查 property_case_v23.py 與 Render 日誌。"}
 
     event_key = _case_v15_event_key(event)
     if event_key:
