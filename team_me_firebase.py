@@ -43631,7 +43631,8 @@ _LINE_COMMAND_GROUPS = [
     ("房產查詢", "直接傳地址、樂屋網址、591 網址、房屋照片"),
 ]
 _CASE_PLANNED_COMMANDS = [
-    ("#新增案件", "建立草稿、收集圖片"),
+    ("#新增案件", "建立同一草稿，合併多張建坪截圖及新接文案"),
+    ("#文案建檔", "貼上整篇新接文案建立草稿，之後可繼續傳建坪截圖"),
     ("#案件資料", "顯示草稿資料"),
     ("#補充案件", "以文字更新欄位"),
     ("#案件圖片", "直接傳送 A4 案件輸入表圖片"),
@@ -43701,7 +43702,7 @@ def line_command_center():
     parts.append('<div class="table-scroll"><table class="filter-table"><thead><tr><th>LINE 指令</th><th>用途</th><th>狀態</th></tr></thead><tbody>')
     for command, desc in _CASE_PLANNED_COMMANDS:
         parts.append(f'<tr><td>{_command_escape(command)}</td><td>{_command_escape(desc)}</td><td>已整合</td></tr>')
-    parts.append('</tbody></table></div><p class="muted">傳送圖片：先輸入 #新增案件，再傳送物件截圖；輸入 #案件圖片 或 #案件PDF，會在 LINE 直接顯示 A4 圖片。注意：#案件表單、#查詢案件目前尚未實作。</p></section>')
+    parts.append('</tbody></table></div><p class="muted">傳送圖片：先輸入 #新增案件，再傳建坪截圖和新接文案（順序不限）；輸入 #案件圖片 或 #案件PDF，會在 LINE 直接顯示 A4 圖片。注意：#案件表單、#查詢案件目前尚未實作。</p></section>')
     parts.append('''</main><script>
 function filterCommands(){
  const q=document.getElementById('command-search').value.trim().toLowerCase();
@@ -43757,13 +43758,13 @@ print('✅ LINE 指令管理中心已載入：/line-command-center')
 
 # ===== 案件輸入表 V1：LINE 圖片辨識、Firestore 草稿、原 PDF =====
 try:
-    from property_case_v15 import register_property_case_v1
+    from property_case_v19 import register_property_case_v1
     register_property_case_v1(
         app=app, db=db,
         pdf_template=os.path.join(BASE_DIR, "案件輸入表-使用中.pdf"),
         access_token=LINE_CHANNEL_ACCESS_TOKEN,
     )
-    print("✅ 案件輸入表 V1.4 已載入：#新增案件 / #案件資料 / #補充案件 / #案件圖片 / #案件PDF")
+    print("✅ 案件輸入表 V1.9 已載入：#新增案件 / #案件資料 / #補充案件 / #案件圖片 / #案件PDF")
 except Exception as _case_error:
     print("⚠️ 案件輸入表 V1 載入失敗：", _case_error)
 
@@ -43773,13 +43774,13 @@ except Exception as _case_error:
 # 必須在檔案最末尾載入：Webhook 以全域名稱查找 line_access_gate。
 PROPERTY_CASE_COMMAND_KEY = "property_case"
 if not any(key == PROPERTY_CASE_COMMAND_KEY for key, _ in LINE_COMMAND_TYPE_OPTIONS):
-    LINE_COMMAND_TYPE_OPTIONS.append((PROPERTY_CASE_COMMAND_KEY, "案件輸入表：#新增案件、#案件資料、#補充案件、#案件圖片、#案件PDF、#完成案件；傳截圖辨識"))
+    LINE_COMMAND_TYPE_OPTIONS.append((PROPERTY_CASE_COMMAND_KEY, "案件輸入表：#新增案件、#文案建檔、#案件資料、#補充案件、#案件圖片、#案件PDF、#完成案件；傳截圖辨識"))
 
 _property_original_detect = detect_line_command_type
 def detect_line_command_type(text, event=None):
     t = (text or "").strip().replace("＃", "#")
     first = t.splitlines()[0].strip() if t else ""
-    if first in ("#新增案件", "#案件資料", "#案件PDF", "#案件圖片", "#完成案件") or first.startswith("#補充案件"):
+    if first in ("#新增案件", "#案件資料", "#案件PDF", "#案件圖片", "#完成案件") or first.startswith("#補充案件") or first.startswith("#文案建檔"):
         return PROPERTY_CASE_COMMAND_KEY
     return _property_original_detect(text, event)
 
@@ -43848,11 +43849,11 @@ print("✅ 案件建檔權限 V1.1 已載入：property_case / 截圖辨識 / �
 # 保留既有 LINE CRM 及權限設定，不再讓舊文字內容去重攔截案件指令。
 # =============================================================================
 _CASE_V15_PREVIOUS_PROCESSOR = process_line_message_event
-_CASE_V15_COMMANDS = frozenset(("#新增案件", "#案件資料", "#案件圖片", "#案件PDF", "#完成案件"))
+_CASE_V15_COMMANDS = frozenset(("#新增案件", "#文案建檔", "#案件資料", "#案件圖片", "#案件PDF", "#完成案件"))
 
 def _case_v15_is_command(text):
     text = str(text or "").strip().replace("＃", "#")
-    return text in _CASE_V15_COMMANDS or text.startswith("#補充案件")
+    return text in _CASE_V15_COMMANDS or text.startswith("#補充案件") or text.startswith("#文案建檔")
 
 def _case_v15_event_key(event):
     msg = (event or {}).get("message") or {}
@@ -43895,7 +43896,7 @@ def process_line_message_event(event):
     handler = app.config.get("PROPERTY_CASE_V15_HANDLER")
     if not callable(handler):
         return {"handled": True, "ok": False,
-                "reply_text": "案件功能尚未成功載入，請檢查 property_case_v15.py 與 Render 日誌。"}
+                "reply_text": "案件功能尚未成功載入，請檢查 property_case_v19.py 與 Render 日誌。"}
 
     event_key = _case_v15_event_key(event)
     if event_key:
