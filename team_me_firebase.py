@@ -43758,13 +43758,13 @@ print('✅ LINE 指令管理中心已載入：/line-command-center')
 
 # ===== 案件輸入表 V1：LINE 圖片辨識、Firestore 草稿、原 PDF =====
 try:
-    from property_case_v23 import register_property_case_v1
+    from property_case_v24 import register_property_case_v1
     register_property_case_v1(
         app=app, db=db,
-        pdf_template=os.path.join(BASE_DIR, "案件輸入表-使用中.pdf"),
+        pdf_template=os.path.join(BASE_DIR, "案件輸入表-115.11.06(新版).pdf"),
         access_token=LINE_CHANNEL_ACCESS_TOKEN,
     )
-    print("✅ 案件輸入表 V2.3 已載入：#新增案件 / #案件資料 / #補充案件 / #案件圖片 / #案件PDF")
+    print("✅ 案件輸入表 V2.4 新版已載入：#新增案件 / #案件資料 / #補充案件 / #案件圖片 / #案件PDF")
 except Exception as _case_error:
     print("⚠️ 案件輸入表 V1 載入失敗：", _case_error)
 
@@ -43924,6 +43924,14 @@ def process_line_message_event(event):
                 "reply_text": "案件處理暫時失敗，請查看 Render 日誌後再試。"}
 
 print("✅ 案件 V1.5：優先路由、事件 ID 去重、保留群組權限與 A4 圖片回覆")
+
+# PRIM CSV 與舊愛屋 CSV 共用 Firebase properties 物件庫，快搜不需換集合。
+try:
+    from prim_csv_adapter import install as _install_prim_adapter
+    _install_prim_adapter(globals())
+    print('✅ PRIM/愛屋 CSV 兼容匯入已載入：物件快搜共用 properties')
+except Exception as _prim_error:
+    print('⚠️ PRIM CSV 兼容層載入失敗：', _prim_error)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or 5000)
