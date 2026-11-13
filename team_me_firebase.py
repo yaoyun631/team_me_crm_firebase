@@ -29273,7 +29273,7 @@ PROPERTY_CSV_BACKEND_UPLOAD_HTML = r"""
   <div class="top">
     <div>
       <h1>後台上傳 CSV 到 Firebase</h1>
-      <div class="muted">直接把愛屋 / 樂屋整理好的 CSV 匯入 Firestore properties，並建立最新 CSV 批次紀錄。</div>
+      <div class="muted">支援 PRIM 完整物件 CSV／愛屋 CSV，匯入 Firestore properties 並更新物件快搜。</div>
     </div>
     <div class="actions">
       <a class="btn btn-secondary" href="/line-card-settings#property-library">回設定中心</a>
@@ -29282,7 +29282,7 @@ PROPERTY_CSV_BACKEND_UPLOAD_HTML = r"""
   </div>
 
   <div class="hint">
-    第一次測試請不要勾「只保留最新 CSV」。確認成功後，如果上傳的是完整出售/出租清單，再勾選清理舊 CSV。
+    可使用 PRIM30 的「樂屋工作檔」完整 CSV（約 46MB）；不可使用只有上架狀態的「591 出售狀態表」。標示「未完整／請核對」的清單不得用來刪除舊物件。首次請先選檢查模式。
   </div>
 
   {% if error_message %}
@@ -29370,6 +29370,17 @@ PROPERTY_CSV_BACKEND_UPLOAD_HTML = r"""
 {% endfor %}</div>
     {% endif %}
 
+    {% if result.source_is_prim %}
+      <div class="info" style="margin-top:14px;">
+        <strong>PRIM 欄位檢查</strong><br>
+        本批可辨識 {{ result.imported_count }} 筆；各欄未取得資料的筆數（可能是原始 CSV 本來空白）：<br>
+        {% for key, count in result.missing_fields_count.items() %}
+          {{ key }}：{{ count }} 筆{% if not loop.last %}、{% endif %}
+        {% endfor %}
+        <br><strong>請先確認這些數值，再取消「只讀取 CSV 檢查」正式匯入。</strong>
+      </div>
+    {% endif %}
+
     {% if cleanup_result %}
       <div class="info" style="margin-top:14px;">最新 CSV 清理：
 刪除 {{ cleanup_result.deleted_docs or 0 }} 筆，保留 {{ cleanup_result.kept_docs or 0 }} 筆。
@@ -29415,6 +29426,46 @@ def _property_backend_csv_import_bytes(
     """
     headers, rows, encoding = _property_csv_read_rows(csv_bytes)
 
+    # V2.7：檔案種類預檢必須發生在任何 Firestore 寫入之前。
+    # PRIM 的「591 出售狀態.csv」只含 obj_no + 上架狀態，不是物件明細。
+    header_set = {str(h or "").strip().lower() for h in headers}
+    status_columns = {"upload_to_591", "house591_status", "house591_priority",
+                      "house591_batch", "house591_note", "house591_post_url",
+                      "house591_last_error", "house591_uploaded_at"}
+    id_columns = {"obj_no", "raw_物件編號", "物件編號", "案件編號", "案號"}
+    # 至少要有核心可展示物件欄位；編號不能代替案名/地址/售價/坪數。
+    substance_columns = {
+        "rakuya_物件名稱", "raw_標題", "物件名稱", "案件名稱", "案名", "標題", "title",
+        "rakuya_地址全文", "raw_完整地址", "完整地址", "物件地址", "地址", "address",
+        "rakuya_總價_萬", "raw_委託總價", "售價", "開價", "總價", "price_wan",
+        "rakuya_租金_元", "租金", "月租金", "rent_price",
+        "rakuya_建物登記", "建坪", "建物面積", "building_area", "地坪", "land_area",
+        "house_name", "object_name", "object_title", "address_full", "total_price",
+        "obj_name", "address_public", "build_ping", "land_ping", "price", "ping",
+    }
+    has_substance = bool(header_set & {x.lower() for x in substance_columns})
+    is_status_only = (
+        bool(header_set & status_columns)
+        and bool(header_set & id_columns)
+        and not has_substance
+        and header_set.issubset(status_columns | {x.lower() for x in id_columns})
+    )
+    if is_status_only:
+        raise ValueError(
+            f"這是『591 上架狀態表』，不是完整物件 CSV（{len(rows)} 筆、{len(headers)} 欄）。"
+            "內容只有 obj_no／上架狀態，缺少案名、地址、價格與坪數。"
+            "系統已安全阻止匯入，Firebase 既有物件與快搜資料不會被覆蓋。"
+            "請改用 PRIM 抓取的『完整物件明細 CSV』。"
+        )
+    if not has_substance:
+        raise ValueError(
+            "CSV 缺少可辨識的物件名稱、地址、價格及坪數欄位。"
+            "系統不會把只有案件編號的列當作可搜尋物件匯入；"
+            "若這確實是完整 PRIM 明細，請提供 CSV 以加入欄位對應。"
+        )
+    if not rows:
+        raise ValueError("CSV 只有欄名沒有物件資料，已阻止匯入。")
+
     if deal_type_override in ("sale", "rent"):
         deal_type = deal_type_override
     else:
@@ -29432,6 +29483,19 @@ def _property_backend_csv_import_bytes(
     skipped = 0
     errors = []
     touched_ids = []
+    missing_fields_count = {k: 0 for k in ('title', 'address', 'price_wan', 'rent_price', 'building_area', 'land_area', 'source_case_no')}
+    source_is_prim = 'prim' in filename.lower() or any('prim' in str(h).lower() for h in headers)
+    if source_is_prim:
+        try:
+            from prim_csv_adapter import ALIASES, norm
+            normalized_headers = {norm(h) for h in headers}
+            has_property_id = any(norm(x) in normalized_headers for x in ALIASES['case'])
+            has_title = any(norm(x) in normalized_headers for x in ALIASES['title'])
+            has_address = any(norm(x) in normalized_headers for x in ALIASES['address'])
+            if not (has_property_id or has_title or has_address):
+                raise ValueError('PRIM CSV 欄位無法辨識：未找到案件編號、案名或地址。請提供實際 CSV 欄名進行對照，已阻止匯入，避免把空白資料寫入 Firebase。')
+        except ImportError:
+            raise ValueError('PRIM 轉換模組 prim_csv_adapter.py 不存在，請與主程式放在同一資料夾並一起部署。')
 
     batch = db.batch()
     batch_count = 0
@@ -29453,9 +29517,18 @@ def _property_backend_csv_import_bytes(
                 continue
 
             prop = _property_csv_row_to_property(row, deal_type, safe_filename)
+            # 舊匯入器會把沒有案名的資料寫成「未命名物件」；PRIM 禁止只憑預設文字通過。
+            if source_is_prim and (not prop.get('source_case_no') and not prop.get('address') and not prop.get('url') and prop.get('title') in ('', '未命名物件')):
+                skipped += 1
+                if len(errors) < 8:
+                    errors.append(f'第{idx}列：案件編號、案名、地址及網址均無法辨識，已略過')
+                continue
             if not (prop.get("title") or prop.get("address") or prop.get("url")):
                 skipped += 1
                 continue
+            for field in missing_fields_count:
+                if not prop.get(field) and prop.get(field) != 0:
+                    missing_fields_count[field] += 1
 
             doc_id = _property_csv_doc_id(row, deal_type)
             prop.update({
@@ -29487,6 +29560,9 @@ def _property_backend_csv_import_bytes(
                 errors.append(f"第{idx}列：{exc}")
 
     commit_if_needed(force=True)
+    # 未辨識到任何有效的 PRIM 案件時，絕不把此批次當成功匯入。
+    if source_is_prim and imported == 0:
+        raise ValueError('PRIM CSV 沒有任何可匯入的完整物件，已停止更新最新批次及快搜狀態。')
 
     log_data = {
         "deal_type": deal_type,
@@ -29505,6 +29581,8 @@ def _property_backend_csv_import_bytes(
         "touched_count": len(touched_ids),
         "touched_ids_sample": touched_ids[:20],
         "dry_run": bool(dry_run),
+        "source_is_prim": source_is_prim,
+        "missing_fields_count": missing_fields_count,
         "uploaded_by_id": session.get("user_id") or "",
         "uploaded_by_name": session.get("user_name") or "",
     }
@@ -29532,6 +29610,8 @@ def _property_backend_csv_import_bytes(
         "error_samples": errors,
         "import_batch_id": import_batch_id,
         "dry_run": bool(dry_run),
+        "source_is_prim": source_is_prim,
+        "missing_fields_count": missing_fields_count,
     }
 
 
@@ -29660,6 +29740,8 @@ def debug_property_csv_upload_check():
 @app.route("/tools/property-csv-upload", methods=["GET", "POST"])
 @login_required
 def property_csv_backend_upload():
+    # 只有這個需要匯入 PRIM 大型 CSV 的端點提高上限；其餘端點維持 5MB。
+    request.max_content_length = 80 * 1024 * 1024
     result = None
     cleanup_result = None
     error_message = ""
@@ -29703,7 +29785,18 @@ def property_csv_backend_upload():
                     # 這不是主要匯入流程，不能讓它造成 500。
                     print("⚠️ CSV 已匯入，但快速狀態快取失敗：", exc)
 
-                if keep_latest_only:
+                # 未完整檔、核對中檔、略過資料或零筆，禁止以最新批次清除舊物件。
+                cleanup_unsafe = (
+                    result.get("imported_count", 0) == 0 or
+                    result.get("skipped_count", 0) > 0 or
+                    any(k in filename for k in ("未完整", "請核對"))
+                )
+                if keep_latest_only and cleanup_unsafe:
+                    cleanup_result = {
+                        "ok": False, "deleted_docs": 0, "kept_docs": result.get("imported_count", 0),
+                        "errors": ["已阻止刪除舊物件：此 CSV 可能不是完整清單，或有物件略過匯入。"],
+                    }
+                elif keep_latest_only:
                     try:
                         cleanup_result = _property_import_auto_cleanup_keep_latest(
                             deal_type=result.get("deal_type", ""),

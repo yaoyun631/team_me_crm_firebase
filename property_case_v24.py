@@ -20,8 +20,6 @@ FIELDS = {
 }
 FIELDS.update({'agent': '承辦人', 'points': '點數分配', 'case_no': '案件編號', 'key_location': '鑰匙位置', 'showing_method': '帶看方式', 'sale_reason': '售屋動機', 'customer_source': '客戶來源', 'no_web': '不上網', 'property_form': '案件型式', 'land_type': '土地型態', 'occupancy': '現況', 'lighting': '採光面數', 'frontage': '面寬', 'depth': '深度', 'road_width': '路寬', 'sitting_direction': '坐向', 'facing_direction': '朝向', 'elevator_count': '電梯數', 'units_per_floor': '每層戶數', 'floor_from': '所在樓別起', 'floor_to': '所在樓別迄', 'min_price': '底價', 'rent_identity': '租客身分要求', 'rent_gender': '租客性別要求', 'rent_rules': '租屋守則', 'rent_equipment': '房東提供設備'})
 
-CHECKBOX_GROUPS = {'委託類別': ('listing_type', ['出售', '出租']), '委託性質': ('contract_type', ['專任', '一般']), '鑰匙位置': ('key_location', ['1店', '2店', '春天', '幸福領航店', '4店', '5店', '7店']), '帶看方式': ('showing_method', ['洽專員', 'KEY', '管理室', '其他']), '客戶來源': ('customer_source', ['踩線', '來店', '來電', '謄本開發', '親友', '其他']), '不上網': ('no_web', ['不上網']), '案件型態': ('property_type', ['公寓', '華廈', '大樓', '透天', '別墅', '土地', '其他']), '案件型式': ('property_form', ['住家', '店面', '套房', '辦公', '廠辦', '廠房', '農舍', '其他']), '土地型態': ('land_type', ['建地', '商業用地', '工業用地', '農業用地', '保護地', '其他用地']), '現況': ('occupancy', ['空屋', '自用', '出租', '結構體', '空地', '其他']), '租客身分要求': ('rent_identity', ['不限', '學生', '上班族', '家庭']), '租客性別要求': ('rent_gender', ['限女生', '限男生', '不限']), '租屋守則': ('rent_rules', ['開伙', '飼養寵物', '房東同住', '可短期租賃', '可供奉神明', '可入籍']), '房東提供設備': ('rent_equipment', ['網路', '第四台', '洗衣機', '脫水機', '濾水器', '傳統電視', '液晶電視', '烘衣機', '飲水機', '冰箱', '瓦斯爐', '微波爐', '冷氣', '電話', '烤箱', '電熱水器', '天然瓦斯', '電磁爐', '電風扇', '中央空調', '排油煙機', '衣櫥', '餐桌', '餐椅', '單人床', '雙人床', '書桌', '茶几', '置物櫃', '書架', '椅子', '單人沙發', '雙人（以上）沙發', '窗簾', '流理台', '電梯', '公用陽台', '休閒設施', '滅火器', '緩降梯', '緊急照明', '監視系統'])}
-
 PROMPT = '''你是台灣房仲案件輸入表辨識助手。從圖片擷取明確看得到的資訊，輸出純 JSON object，key 僅可用以下名稱：
 ''' + ', '.join(FIELDS.keys()) + '''。
 所有值必須是字串，坪數只留數字，日期用 YYYY-MM-DD，無法確認的欄位不要輸出。不可猜測。土地資料截圖中「地坪」對應 land_ping；「建築面積」對應 building_footprint_ping；「可用建坪」對應 allowable_building_ping，不可誤當建物總面積。地段對應 land_section，地號對應 land_no，多筆地號完整保留。土地持分不明時不得推測。截圖如有「車位：44.067坪」等異常，保留原值但在 _warnings 陣列說明疑慮；_warnings 可為字串陣列。圖片中建號、地號可以擷取但不應硬填入原PDF沒有的欄位。租屋守則與設備等多選資料請以頓號、逗號分隔。'''
@@ -79,7 +77,7 @@ def parse_text(s):
     title_lines=[x for x in lines if not re.search(r'新接|^#|^地址\s*[:：]',x)]
     if title_lines:
         title=title_lines[0].lstrip('❤️❤✨🏠🏡 ').strip()
-        if not re.match(r'^(格局|租金|租期|押金|備註|車位|管理費|電|水)\s*[:：]',title) and not re.match(r'^【',title):
+        if not re.match(r'^(格局|租金|租期|押金|備註|車位|管理費|電|水)\s*[:：]',title):
             out['property_name']=title[:12]
     # V2.4：可直接從 LINE「#補充案件」的逐行鍵值文字更新新版 PDF 欄位。
     field_aliases = {label:key for key,label in FIELDS.items()}
@@ -101,26 +99,6 @@ def parse_text(s):
                 amount=float(n.group(0).replace(',',''))*(10000 if '萬' in value else 1)
                 value=str(int(amount)) if amount.is_integer() else str(amount)
         out[key]=value
-    # V2.5：解析 TXT 勾選表；在選項後填 v/V/✓/✔/勾 即視為選取。
-    # 【委託類別】/【房東提供設備】等標題決定欄位，避免「不限」「出租」混淆。
-    groups = CHECKBOX_GROUPS
-    section = None
-    selected = {}
-    for raw_line in t.splitlines():
-        line = raw_line.strip()
-        heading = re.fullmatch(r'[【\[]\s*([^】\]]+)\s*[】\]]', line)
-        if heading:
-            section = heading.group(1).strip() if heading.group(1).strip() in groups else None
-            continue
-        if section is None:
-            continue
-        m = re.match(r'^([^：:\[\]□☐]+?)\s*(?:[：:]\s*([vV✓✔勾])|[\[［(（]\s*([vV✓✔勾])\s*[\]］)）])\s*$', line)
-        if m:
-            option = re.sub(r'\s+', '', m.group(1))
-            if option in groups[section][1]:
-                selected.setdefault(groups[section][0], []).append(option)
-    for key, vals in selected.items():
-        out[key] = '、'.join(dict.fromkeys(vals))
     if out.get('floor_from') and not out.get('floor'):out['floor']=out['floor_from']
     # 將原文中沒有專用欄位的資訊完整保留在備註，不遺失可寵、租補、帶看、垃圾車等細節。
     skip_prefix=('地址：','地址:')
@@ -130,7 +108,7 @@ def parse_text(s):
         if re.fullmatch(r'[—─━\-_= ]{4,}',line):continue
         detail.append(line)
     if '_rent_range' in out:detail.insert(0,'租金範圍：'+out.pop('_rent_range'))
-    if detail and not selected and 'features' not in out:out['features']='；'.join(detail)
+    if detail:out['features']='；'.join(detail)
     out['listing_type']='出租' if rent and '售價' not in t and '開價' not in t else out.get('listing_type','')
     return {k:v for k,v in out.items() if k in FIELDS and v not in ('',None)}
 
@@ -305,52 +283,53 @@ def register_property_case_v1(app, db, pdf_template, access_token):
             if key=='case_no' and value: value=str(value)[:9]
             if value: put(key,rect,size=8 if key not in ('features','notes') else 7,val=value)
 
-        # V2.5 checkbox markings; y-bands ensure the duplicate words (出租/其他/不限)
-        # are marked in the correct section rather than at first occurrence.
-        bands = {
-          'listing_type':(40,60), 'contract_type':(40,60),
-          'key_location':(62,79), 'showing_method':(78,95),
-          'customer_source':(94,112),'no_web':(130,150),
-          'property_type':(145,164),'property_form':(162,182),
-          'land_type':(179,198),'occupancy':(193,214),
-          'rent_identity':(468,487),'rent_gender':(468,487),
-          'rent_rules':(484,505),'rent_equipment':(518,590),
-        }
-        # Labels are from the printed page. Group-specific options such as 1店
-        # have spaces in PDF text, so compare normalized characters.
-        def selected_options(value):
-            if isinstance(value,(list,tuple,set)):return list(value)
-            return [v.strip() for v in re.split(r'[,，、;；/\n]+',str(value or '')) if v.strip()]
-        raw_lines = []
-        for block in page.get_text('rawdict')['blocks']:
-            for line in block.get('lines',[]):
-                chars=[c for span in line.get('spans',[]) for c in span.get('chars',[])]
-                if chars: raw_lines.append(chars)
-        def mark_printed(key, option):
-            lo,hi=bands[key]
-            opt_norm=re.sub(r'\s+','',option)
-            symbol='○' if key in ('rent_identity','rent_gender') else '□'
-            for chars in raw_lines:
-                text=''.join(c['c'] for c in chars)
-                ys=[c['bbox'][1] for c in chars]
-                if not any(lo<=y<=hi for y in ys): continue
-                # The PDF stores multi-character checkboxes in one extracted line.
-                for match in re.finditer(re.escape(symbol)+r'\s*'+re.escape(option).replace('\\ ',r'\s*'),text):
-                    i=match.start()
-                    x0,y0,x1,y1=chars[i]['bbox']
-                    if lo<=y0<=hi and (key!='rent_gender' or x0>380) and (key!='rent_identity' or x0<350):
-                        page.insert_text((x0+0.5,y1-1.4),'X',fontname=font,fontsize=8,
-                                         color=(.04,.18,.5),overlay=True)
-                        return True
-            return False
-        # Only entries explicitly marked in LINE/TXT are filled, all others remain blank.
-        for group, (key, options) in CHECKBOX_GROUPS.items():
-            values=selected_options(fields.get(key))
+        # 勾選：尋找新版 PDF 印刷文字中的方框，在框正中央寫入 ✓。
+        # 以字元實際 bbox 追蹤，不假定不同欄位有相同 x。
+        def checked(value, label):
+            if isinstance(value, (list,tuple,set)): return label in value
+            x=str(value or '').strip()
+            return label in [v.strip() for v in re.split(r'[,，、;；/\n]+',x)] or x==label
+        def mark_checkbox(label, occurrence=0):
+            targets=[]
+            for block in page.get_text('rawdict')['blocks']:
+                for line in block.get('lines',[]):
+                    chars=[c for span in line.get('spans',[]) for c in span.get('chars',[])]
+                    value=''.join(c['c'] for c in chars)
+                    for match in re.finditer('□'+re.escape(label),value):
+                        targets.append(chars[match.start()]['bbox'])
+            if occurrence>=len(targets):return
+            x0,y0,x1,y1=targets[occurrence]
+            page.insert_text((x0+0.5,y1-1.3),'X',fontname=font,fontsize=8,color=(.04,.18,.5),overlay=True)
+        def mark_options(key, options, occurrence=0):
             for option in options:
-                if option in values:
-                    label={'1店':'1 店','2店':'2 店','4店':'4 店','5店':'5 店','7店':'7 店','不上網':'不上網請勾選'}.get(option, option)
-                    mark_printed(key,label)
-        # Top-level checkbox '身分要求/性別要求' also gets selected if a value is present.
+                if checked(fields.get(key),option):mark_checkbox(option,occurrence)
+        # 出售/出租與專任/一般在同一列；使用標籤辨識正確方框。
+        mark_options('listing_type',['出售','出租'])
+        mark_options('contract_type',['專任','一般'])
+        mark_options('key_location',['1 店','2 店','春天','幸福領航店','4 店','5 店','7 店'])
+        mark_options('showing_method',['洽專員','KEY','管理室'])
+        mark_options('customer_source',['踩線','來店','來電','謄本開發','親友'])
+        mark_options('property_type',['公寓','華廈','大樓','透天','別墅','土地'])
+        mark_options('property_form',['住家','店面','套房','辦公','廠辦','廠房','農舍'])
+        mark_options('land_type',['建地','商業用地','工業用地','農業用地','保護地','其他用地'])
+        mark_options('occupancy',['空屋','自用','出租','結構體','空地'])
+        mark_options('no_web',['不上網請勾選'])
+        mark_options('rent_rules',['開伙','飼養寵物','房東同住','可短期租賃','可供奉神明','可入籍'])
+        equipment=['網路','第四台','洗衣機','脫水機','濾水器','傳統電視','液晶電視','烘衣機','飲水機','冰箱','瓦斯爐','微波爐','冷氣','電話','烤箱','電熱水器','天然瓦斯','電磁爐','電風扇','中央空調','排油煙機','衣櫥','餐桌','餐椅','單人床','雙人床','書桌','茶几','置物櫃','書架','椅子','單人沙發','雙人（以上）沙發','窗簾','流理台','電梯','公用陽台','休閒設施','滅火器','緩降梯','緊急照明','監視系統']
+        mark_options('rent_equipment',equipment)
+        # 租客身分/性別是圓形選項，不對其他欄位誤勾。
+        def mark_circle(label, y_min, y_max):
+            for block in page.get_text('rawdict')['blocks']:
+                for line in block.get('lines',[]):
+                    chars=[c for span in line.get('spans',[]) for c in span.get('chars',[])]
+                    value=''.join(c['c'] for c in chars)
+                    for m in re.finditer('○'+re.escape(label),value):
+                        x0,y0,x1,y1=chars[m.start()]['bbox']
+                        if y_min<=y0<=y_max:
+                            page.insert_text((x0+.5,y1-1.4),'X',fontname=font,fontsize=8,color=(.04,.18,.5))
+                            return
+        if fields.get('rent_identity'):mark_circle(str(fields['rent_identity']),470,487)
+        if fields.get('rent_gender'):mark_circle(str(fields['rent_gender']),487,500)
         # 其他沒有固定方框的長文字只保留在案件資料庫，避免破壞原稿。
         out=src.tobytes(garbage=4,deflate=True);src.close()
         return out
